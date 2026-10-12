@@ -1,56 +1,42 @@
 import Foundation
 
-enum APIError: LocalizedError {
-    case invalidResponse, unauthorized, server(Int, String, String?)
-    var errorDescription: String? {
-        switch self {
-        case .invalidResponse: "服务器响应无效"
-        case .unauthorized: "登录已失效"
-        case let .server(status, message, code):
-            Self.codeTitles[code ?? ""] ?? (message.isEmpty ? "请求失败（\(status)）" : message)
-        }
-    }
-
-    /// S72：这两个 409 固定写中文，不看服务端 message。
-    static let codeTitles: [String: String] = [
-        "SAME_DEVICE_INTERNAL": "同一设备上的两张卡不能互打",
-        "OWN_OUTGOING_CALL": "这是你正在拨出的通话",
-    ]
-
-    /// Dial path: Control's validation / fallback messages are English ("Request validation failed"); show Chinese.
-    static func dialMessage(for error: Error) -> String {
-        guard case let .server(status, _, code)? = error as? APIError else { return error.localizedDescription }
-        if code == "INVALID_REQUEST" { return "号码格式不正确，无法拨打" }
-        let text = error.localizedDescription
-        return text.contains(where: { ("\u{4E00}"..."\u{9FFF}").contains($0) }) ? text : "拨打失败（\(code ?? String(status))）"
-    }
-
-    var serverCode: String? {
-        if case let .server(_, _, code) = self { return code }
-        return nil
-    }
-
-    /// S36 C3: the HTTP status a diagnostic records; `0` for a response that never parsed.
-    var diagCode: Int {
-        switch self {
-        case .invalidResponse: 0
-        case .unauthorized: 401
-        case let .server(status, _, _): status
-        }
-    }
-}
-
 struct APIClient: Sendable {
     static var baseURL: URL { AppRuntimeConfiguration.apiBaseURL }
     let token: String?
     var session: URLSession = .shared
+    var endpoint: ClientEndpoint = .shared
 
+    /// S99 §4: the base comes from `ClientEndpoint`; an idempotent request that fails at the network layer (no
+    /// HTTP response at all) retries once on the other base, which is then learned for this network. With no
+    /// relay configured the endpoint is disabled and this is a single direct request.
     func request<Response: Decodable & Sendable, Body: Encodable & Sendable>(
         _ path: String, method: String = "GET", body: Body? = Optional<String>.none,
         idempotencyKey: String? = nil, timeoutInterval: TimeInterval? = nil,
         queryItems: [URLQueryItem] = [], headers: [String: String] = [:]
     ) async throws -> Response {
-        let url = try Self.url(path, queryItems: queryItems)
+        let relay = endpoint.relay()
+        let attempt = { (relay: Bool) async throws -> Response in
+            try await request(
+                path, base: endpoint.baseURL(relay: relay), method: method, body: body,
+                idempotencyKey: idempotencyKey, timeoutInterval: timeoutInterval, queryItems: queryItems,
+                headers: headers
+            )
+        }
+        do {
+            return try await attempt(relay)
+        } catch where endpoint.enabled && ClientEndpointPolicy.switchesEndpoint(after: error)
+            && ClientEndpointPolicy.retriesOnAlternate(method: method, path: path, idempotencyKey: idempotencyKey) {
+            let response = try await attempt(!relay)
+            endpoint.learn(workingRelay: !relay)
+            return response
+        }
+    }
+
+    private func request<Response: Decodable & Sendable, Body: Encodable & Sendable>(
+        _ path: String, base: URL, method: String, body: Body?, idempotencyKey: String?,
+        timeoutInterval: TimeInterval?, queryItems: [URLQueryItem], headers: [String: String]
+    ) async throws -> Response {
+        let url = try Self.url(path, queryItems: queryItems, base: base)
         var request = URLRequest(url: url)
         request.httpMethod = method
         if let timeoutInterval { request.timeoutInterval = timeoutInterval }
@@ -151,41 +137,6 @@ struct APIClient: Sendable {
             code = try container.decodeIfPresent(String.self, forKey: .code)
             message = try container.decodeIfPresent(String.self, forKey: .message) ?? ""
         }
-    }
-}
-
-enum AppRuntimeConfiguration {
-    static let productionAPIBaseURL = URL(string: "https://\(Bundle.main.object(forInfoDictionaryKey: "VoDogDomain") as? String ?? "vodog.example.com")/api/v1")!
-    static let productionKeychainService = "org.vodog"
-    static let isolatedSimulatorKeychainService = "org.vodog.s33-local-ui"
-
-    /// S33's real-backend UI suite is allowed to target one isolated loopback service. The compiler removes this
-    /// branch from device and Release builds, and strict equality keeps an injected value from becoming an
-    /// arbitrary clear-text endpoint.
-    static func simulatorUITestAPIBaseURL(environment: [String: String]) -> URL? {
-        #if DEBUG && targetEnvironment(simulator)
-        guard environment["VODOG_UI_TEST_API_BASE_URL"] == "http://127.0.0.1:16880/api/v1" else { return nil }
-        return URL(string: "http://127.0.0.1:16880/api/v1")
-        #else
-        return nil
-        #endif
-    }
-
-    static var isolatedSimulatorUITestEnabled: Bool {
-        simulatorUITestAPIBaseURL(environment: ProcessInfo.processInfo.environment) != nil
-    }
-
-    static var apiBaseURL: URL {
-        simulatorUITestAPIBaseURL(environment: ProcessInfo.processInfo.environment) ?? productionAPIBaseURL
-    }
-
-    static var keychainService: String {
-        keychainService(environment: ProcessInfo.processInfo.environment)
-    }
-
-    static func keychainService(environment: [String: String]) -> String {
-        simulatorUITestAPIBaseURL(environment: environment) == nil
-            ? productionKeychainService : isolatedSimulatorKeychainService
     }
 }
 

@@ -340,9 +340,15 @@ struct CallHistoryRow: View {
         let value = call.shownNumber(in: sims)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? ContactDisplay.unknownNumber : value
     }
+    /// S96：简短归属地，内部通话不带。
+    private var location: String? { call.isInternal ? nil : ContactDisplay.locationShort(call.remoteLocation) }
     private var subline: String {
-        ([name.isEmpty ? nil : number, call.rowKindTitle, CallDurationLabel.text(answeredAt: call.answeredAt, endedAt: call.endedAt)]
-            + [call.s38BadgeTitle]).compactMap { $0 }.joined(separator: " · ")
+        Self.subline(location: location, number: name.isEmpty ? nil : number, kind: call.rowKindTitle,
+                     duration: CallDurationLabel.text(answeredAt: call.answeredAt, endedAt: call.endedAt), badge: call.s38BadgeTitle)
+    }
+    /// S96b：简短归属地放最前，单行截断时不会被吃掉。
+    static func subline(location: String?, number: String?, kind: String?, duration: String?, badge: String?) -> String {
+        [location, number, kind, duration, badge].compactMap { $0 }.joined(separator: " · ")
     }
 
     var body: some View {
@@ -368,7 +374,7 @@ struct CallHistoryRow: View {
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(unseen ? "未查看，" : "")\(call.showsBlockedMark ? "已屏蔽，" : "")\(ContactDisplay.numberWithName(number: call.shownNumber(in: sims), contactName: call.shownContactName))，\(call.rowStateTitle)\(call.s38BadgeTitle.map { "，\($0)" } ?? "")\(callLineTitle(call.simId, in: sims).map { "，\($0)" } ?? "")"
+            "\(unseen ? "未查看，" : "")\(call.showsBlockedMark ? "已屏蔽，" : "")\(ContactDisplay.numberWithName(number: call.shownNumber(in: sims), contactName: call.shownContactName))\(location.map { "，归属地 \($0)" } ?? "")，\(call.rowStateTitle)\(call.s38BadgeTitle.map { "，\($0)" } ?? "")\(callLineTitle(call.simId, in: sims).map { "，\($0)" } ?? "")"
         )
     }
 
@@ -590,7 +596,8 @@ extension RecordsView {
                             simLabel: item.sim.label,
                             direction: item.direction,
                             duration: CallDurationLabel.text(answeredAt: item.answeredAt, endedAt: item.endedAt),
-                            answerMethod: item.answerMethod
+                            answerMethod: item.answerMethod,
+                            location: item.isInternal ? nil : item.remoteLocation
                         ))
                         .font(.caption).foregroundStyle(.secondary)
                         reportBadges(item)
@@ -1058,6 +1065,9 @@ struct RecordDetailView: View {
                     LabeledContent("号码", value: ContactDisplay.numberWithName(
                         number: call.shownNumber(in: availability.sims), contactName: call.shownContactName
                     ))
+                    if !call.isInternal, let location = ContactDisplay.locationFull(call.remoteLocation) {
+                        LabeledContent("归属地", value: location)
+                    }
                     if call.showsBlockedMark {
                         Label("已屏蔽", systemImage: ContactDisplay.blockedSymbol)
                             .font(.footnote).foregroundStyle(Color.callerDanger)
@@ -1091,6 +1101,25 @@ struct RecordDetailView: View {
                 }
             } else {
                 Section { HStack { ProgressView(); Text("正在读取通话详情…") } }
+            }
+            // S101: 通话 → 录音 → 报告 → 对话, the same order on every client.
+            if !deletedElsewhere {
+                Section("录音") {
+                    if let call, RecordingAvailabilityPolicy.hasNoRecording(recordingStatus: call.recordingStatus, state: call.state) {
+                        Label("无录音", systemImage: "waveform.slash")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .accessibilityIdentifier("records.noRecording")
+                    } else {
+                        Button {
+                            showingRecording = true
+                        } label: {
+                            Label("播放录音", systemImage: "waveform")
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        }
+                        .accessibilityIdentifier("records.viewRecording")
+                    }
+                }
             }
             if !deletedElsewhere, report != nil {
                 Section("报告") {
@@ -1129,21 +1158,14 @@ struct RecordDetailView: View {
                 }
             }
             if !deletedElsewhere {
-                Section {
-                Button {
-                    showingTranscript = true
-                } label: {
-                    Label("查看转录", systemImage: "text.bubble")
-                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                }
-                .accessibilityIdentifier("records.viewTranscript")
-                Button {
-                    showingRecording = true
-                } label: {
-                    Label("查看录音", systemImage: "waveform")
-                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                }
-                .accessibilityIdentifier("records.viewRecording")
+                Section("对话") {
+                    Button {
+                        showingTranscript = true
+                    } label: {
+                        Label("查看对话", systemImage: "text.bubble")
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    }
+                    .accessibilityIdentifier("records.viewTranscript")
                 }
             }
             // §E: the AI's live transcript, which exists only for calls an AI run answered. The recorded
@@ -1468,6 +1490,7 @@ private struct TranscriptRecordView: View {
     @State private var transcript: TranscriptJob?
     @State private var transcriptLoaded = false
     @State private var transcriptError: String?
+    @State private var selectingText: SelectableTurnText?
 
     var body: some View {
         List {
@@ -1500,6 +1523,7 @@ private struct TranscriptRecordView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { recordSheetDoneButton }
         .task(id: callID) { await loadTranscript() }
+        .sheet(item: $selectingText) { MessageTextSelectionSheet(text: $0.text) }
     }
 
     private var recordSheetDoneButton: some ToolbarContent {
@@ -1525,13 +1549,13 @@ private struct TranscriptRecordView: View {
                 Label("转录失败", systemImage: "xmark.circle").foregroundStyle(Color.callerDanger)
             }
         case "succeeded":
-            if let result = job.result { transcriptResult(result) }
+            if let result = job.result { transcriptResult(result, dialog: TranscriptDialogPolicy.dialog(for: job)) }
             else { Label("转录结果无效", systemImage: "exclamationmark.triangle").foregroundStyle(Color.callerDanger) }
         default: LabeledContent("转录状态", value: TranscriptDisplayPolicy.unknownStatusTitle)
         }
     }
 
-    @ViewBuilder private func transcriptResult(_ result: TranscriptResult) -> some View {
+    @ViewBuilder private func transcriptResult(_ result: TranscriptResult, dialog: TranscriptDialog?) -> some View {
         // S22 decision 10: every call has a report row now, so there is no 纳入/排除 status left to print. The
         // classifier's verdict is shown as 推荐拦截 on the report card instead of as a report-membership line.
         if let summary = result.summary, !summary.isEmpty {
@@ -1543,7 +1567,23 @@ private struct TranscriptRecordView: View {
                 ForEach(result.actionItems, id: \.self) { Label($0, systemImage: "checklist") }
             }
         }
-        if result.segments.isEmpty {
+        if let dialog {
+            // S101: one row so the 4 / 12 pt turn spacing is not fought by list row insets.
+            VStack(alignment: .leading, spacing: 0) {
+                if TranscriptDialogPolicy.showsEstimateNote(maxSkewMs: dialog.maxSkewMs) {
+                    Text(TranscriptDialogPolicy.estimateNote).font(.caption).foregroundStyle(Signal.ink3)
+                        .padding(.bottom, 8)
+                }
+                ForEach(Array(dialog.turns.enumerated()), id: \.offset) { index, turn in
+                    TranscriptTurnBubble(turn: turn) { selectingText = SelectableTurnText(text: turn.text) }
+                        .padding(.top, TranscriptDialogPolicy.spacing(
+                            previousRole: index > 0 ? dialog.turns[index - 1].role : nil, role: turn.role
+                        ))
+                }
+            }
+            .padding(.vertical, 4)
+            .accessibilityIdentifier("records.transcriptDialog")
+        } else if result.segments.isEmpty {
             Text(result.text).textSelection(.enabled)
         } else {
             ForEach(TranscriptText.blocks(from: result.segments)) { block in
@@ -1589,6 +1629,46 @@ private struct TranscriptRecordView: View {
                 transcriptError = error.localizedDescription
                 return
             }
+        }
+    }
+}
+
+private struct SelectableTurnText: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+/// S101: one transcript turn as a chat bubble — the other party on the left, me / AI on the right.
+private struct TranscriptTurnBubble: View {
+    let turn: TranscriptTurn
+    let onSelectText: () -> Void
+
+    var body: some View {
+        let style = TranscriptDialogPolicy.style(role: turn.role)
+        let trailing = style.side == .trailing
+        HStack {
+            if trailing { Spacer(minLength: 50) }
+            VStack(alignment: trailing ? .trailing : .leading, spacing: 3) {
+                if let tag = style.tag {
+                    HStack(spacing: 3) {
+                        Image(systemName: "sparkle").font(.caption2.weight(.bold))
+                        Text(tag).font(.caption2.weight(.semibold)).tracking(0.2)
+                    }
+                    .foregroundStyle(Signal.ai)
+                    .accessibilityHidden(true)
+                }
+                Text(turn.text)
+                    .foregroundStyle(TranscriptDialogPolicy.foreground(style))
+                    .signalBubble(TranscriptDialogPolicy.background(style))
+                    .contextMenu {
+                        Button("复制", systemImage: "doc.on.doc") { UIPasteboard.general.string = turn.text }
+                        Button("选择文字", systemImage: "selection.pin.in.out", action: onSelectText)
+                    }
+                    .accessibilityLabel("\(style.label)：\(turn.text)")
+                Text(TranscriptDialogPolicy.timestamp(ms: turn.atMs))
+                    .font(.caption2).monospacedDigit().foregroundStyle(Signal.ink3)
+            }
+            if !trailing { Spacer(minLength: 50) }
         }
     }
 }

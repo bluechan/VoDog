@@ -160,7 +160,7 @@ struct SMSContactPicker: View {
                 }
             }
             nextOffset = offset + response.items.count
-            hasMore = response.items.count == ContactLookupPolicy.listLimit
+            hasMore = ContactLookupPolicy.hasMorePages(response.items.count)
             loaded = true
             error = nil
         } catch SessionLifecycleError.staleSession {

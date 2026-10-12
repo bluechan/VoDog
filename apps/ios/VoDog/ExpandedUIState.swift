@@ -66,6 +66,8 @@ struct MessageConversation: Identifiable, Sendable {
     var contactName: String? { contact.contactName }
     var blocked: Bool { contact.blocked }
     var blockedEntryId: String? { contact.blockedEntryId }
+    /// S96：会话归属地 = 最新一条消息的 `remoteLocation`（完整形态，可缺省）。
+    var location: String? { ContactDisplay.locationFull(latest?.remoteLocation) }
     /// §F: `186…1768 · 张三` for the thread row and the thread title.
     var displayTitle: String {
         ContactDisplay.numberWithName(number: displayNumber, contactName: contactName)
@@ -208,7 +210,17 @@ enum CallAvailabilityPolicy {
     static func canUseMedia(for call: CallRecord, currentMediaCallID: String?) -> Bool {
         guard call.claimedByCurrentSession == true,
               ["connecting", "active"].contains(call.state ?? "") else { return false }
-        return currentMediaCallID == nil || currentMediaCallID == call.id
+        if currentMediaCallID == call.id { return true }
+        // S105: a watch-held call is joined only through the watch's explicit handoff, never this button.
+        if call.answeredByPlatform == "watchos" || call.originatingPlatform == "watchos" { return false }
+        return currentMediaCallID == nil
+    }
+
+    /// S105e: the watch carries this connected call's audio and the phone has none, so the iPhone call page states
+    /// 「音频在手表」 and still offers the DTMF keypad (digits go through Control, not through local media).
+    static func watchHoldsAudio(_ call: CallRecord, currentMediaCallID: String?) -> Bool {
+        call.state == "active" && currentMediaCallID != call.id
+            && (call.answeredByPlatform == "watchos" || call.originatingPlatform == "watchos")
     }
 
     static func canStartOutbound(currentMediaCallID: String?) -> Bool {
@@ -231,6 +243,9 @@ enum CallAvailabilityPolicy {
 enum CallRefreshCadencePolicy {
     static let responsive: Duration = .seconds(2)
     static let steady: Duration = .seconds(5)
+    /// S99 §2: request timeout for the list poll and the remote-end / reconcile `GET calls/<id>`. A timeout is one
+    /// failed poll — the loop retries on its normal cadence and never logs out.
+    static let pollRequestTimeout: TimeInterval = 8
     /// Non-terminal and not yet `active`: 拨号中 / 振铃 / 接听中 / 结束中.
     static let transitionalStates: Set<String> = ["outgoing_pending", "incoming_ringing", "connecting", "ending"]
 
@@ -254,6 +269,7 @@ enum CallRefreshCadencePolicy {
 }
 
 /// S20 decision 6: what the occupancy strip says, and whether it may offer a release.
+#if !os(watchOS) // S104: needs callPlatformTitle (Components.swift, iOS only).
 enum SIMOccupancyDisplayPolicy {
     static let releaseTitle = "结束该通话"
     static let declineConfirmTitle = "拒接这通来电？"
@@ -321,6 +337,7 @@ enum SIMOccupancyDisplayPolicy {
         isRinging(call) ? declineActionTitle : endActionTitle
     }
 }
+#endif
 
 /// S20 decision 6: the body for the one-shot `POST /calls/{id}/end` behind "结束该通话".
 ///
@@ -329,6 +346,7 @@ enum SIMOccupancyDisplayPolicy {
 /// That also means the request carries no guard at all, which is precisely why it must never be retried: between
 /// a failure and a retry another device can answer, and the retry would hang that call up. The ringing case keeps
 /// `onlyIfRinging` because 拒接 is only meaningful while nobody has answered.
+#if !os(watchOS) // S104: needs ReliableCallEndQueue (iOS only).
 enum OccupancyReleaseActionPolicy {
     static func body(for call: CallRecord) -> GuardedCallEndBody {
         SIMOccupancyDisplayPolicy.isRinging(call)
@@ -336,6 +354,7 @@ enum OccupancyReleaseActionPolicy {
             : GuardedCallEndBody(onlyIfCurrentSessionOwner: nil, onlyIfRinging: nil)
     }
 }
+#endif
 
 /// SwiftUI ignores `.disabled()` on a `Picker` row, so an unusable SIM has to be rejected after the fact.
 enum SIMPickerFallbackPolicy {
@@ -396,6 +415,7 @@ enum ComposeMessagePrefillPolicy {
     }
 }
 
+#if !os(watchOS) // S104: needs ContactCardActionPolicy / CallMediaSession (iOS only).
 enum HistoryRowActionPolicy {
     /// S22 decision 10 / R3 §6: the app used to say 拉黑 here and 屏蔽 on the contact card for the same action.
     /// S21 §F froze 屏蔽 as the contract wording, so the history row now borrows the card's copy verbatim
@@ -434,3 +454,4 @@ enum HistoryRowActionPolicy {
         return true
     }
 }
+#endif

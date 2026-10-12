@@ -8,7 +8,7 @@ final class S81ClientPolicyTests: XCTestCase {
         contact: String? = nil, number: String? = nil, isInternal: Bool = false, peer: String? = nil, sim: String? = nil
     ) -> String? {
         IncomingCallerName.text(
-            contactName: contact, remoteNumber: number, isInternal: isInternal, peerSimLabel: peer, simLabel: sim
+            contactName: contact, remoteNumber: number, isInternal: isInternal, peerSimLabel: peer, simLabel: sim, location: nil
         )
     }
 

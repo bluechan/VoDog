@@ -144,6 +144,33 @@ final class ExpandedUIStateTests: XCTestCase {
         XCTAssertNil(CallAvailabilityPolicy.primaryOwnedCall([calls.items[1]], currentMediaCallID: nil))
     }
 
+    func testMediaPolicyExcludesWatchHeldCallsUnlessPhoneAlreadyHasMedia() throws {
+        let calls: ItemEnvelope<CallRecord> = try JSONDecoder().decode(
+            ItemEnvelope<CallRecord>.self,
+            from: Data(#"{"items":[{"id":"answered","state":"active","claimedByCurrentSession":true,"answeredByPlatform":"watchos"},{"id":"dialed","state":"connecting","claimedByCurrentSession":true,"originatingPlatform":"watchos"}]}"#.utf8)
+        )
+        for call in calls.items {
+            XCTAssertFalse(CallAvailabilityPolicy.canUseMedia(for: call, currentMediaCallID: nil))
+            XCTAssertTrue(CallAvailabilityPolicy.canUseMedia(for: call, currentMediaCallID: call.id))
+            XCTAssertFalse(CallAvailabilityPolicy.canUseMedia(for: call, currentMediaCallID: "different"))
+        }
+    }
+
+    func testWatchHoldsAudioOnlyForConnectedWatchCallWithoutPhoneMedia() throws {
+        let calls: ItemEnvelope<CallRecord> = try JSONDecoder().decode(
+            ItemEnvelope<CallRecord>.self,
+            from: Data(#"{"items":[{"id":"answered","state":"active","claimedByCurrentSession":true,"answeredByPlatform":"watchos"},{"id":"dialed","state":"active","claimedByCurrentSession":true,"originatingPlatform":"watchos"},{"id":"ringing","state":"incoming_ringing","claimedByCurrentSession":true,"answeredByPlatform":"watchos"},{"id":"phone","state":"active","claimedByCurrentSession":true,"answeredByPlatform":"ios"}]}"#.utf8)
+        )
+        XCTAssertTrue(CallAvailabilityPolicy.watchHoldsAudio(calls.items[0], currentMediaCallID: nil))
+        XCTAssertTrue(CallAvailabilityPolicy.watchHoldsAudio(calls.items[1], currentMediaCallID: nil))
+        XCTAssertFalse(CallAvailabilityPolicy.watchHoldsAudio(calls.items[0], currentMediaCallID: "answered"))
+        XCTAssertFalse(CallAvailabilityPolicy.watchHoldsAudio(calls.items[2], currentMediaCallID: nil))
+        XCTAssertFalse(CallAvailabilityPolicy.watchHoldsAudio(calls.items[3], currentMediaCallID: nil))
+        // The keypad gate is unchanged: no media is started for a watch-held call.
+        XCTAssertFalse(CallAvailabilityPolicy.canUseMedia(for: calls.items[0], currentMediaCallID: nil))
+        XCTAssertEqual(CallAvailabilityPolicy.primaryOwnedCall(calls.items, currentMediaCallID: nil)?.id, "answered")
+    }
+
     @MainActor
     func testDraftsSurviveNumberSwitchAndClearOnlySelectedConversation() {
         let store = MessageDraftStore()

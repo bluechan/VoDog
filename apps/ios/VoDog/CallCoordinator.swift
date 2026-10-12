@@ -40,6 +40,19 @@ final class CallCoordinator: NSObject, CXProviderDelegate, @unchecked Sendable {
         }
     }
 
+    /// S99 §3: PushKit's rule for a push that carries no usable call. Never tracked: it is over before it rings.
+    func reportPlaceholderIncomingCall(completion: @escaping @Sendable (Error?) -> Void) {
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: IncomingCallReportPolicy.placeholderCallerName)
+        update.localizedCallerName = IncomingCallReportPolicy.placeholderCallerName
+        update.hasVideo = false
+        provider.reportNewIncomingCall(with: uuid, update: update) { [provider] error in
+            if error == nil { provider.reportCall(with: uuid, endedAt: nil, reason: .failed) }
+            completion(error)
+        }
+    }
+
     /// S36 C1: the reconciliation poll knows the authoritative number and name even when the push carried
     /// neither (an older Control). Refreshing the CallKit screen in place is what makes them appear; an empty
     /// field is skipped so a blank never overwrites what the push already showed.

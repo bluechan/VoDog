@@ -355,7 +355,12 @@ struct ContactCardView: View {
             Section("电话") {
                 ForEach(contact.phones) { phone in
                     LabeledContent(ContactLabelDisplay.text(phone.label, fallback: "电话")) {
-                        Text(phone.displayNumber).monospacedDigit().textSelection(.enabled)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(phone.displayNumber).monospacedDigit().textSelection(.enabled)
+                            if let location = ContactDisplay.locationFull(phone.location) {
+                                Text(location).font(.caption).foregroundStyle(Signal.ink3)
+                            }
+                        }
                     }
                 }
             }
@@ -631,12 +636,9 @@ struct ContactPickerView: View {
             do { try await Task.sleep(for: ContactLookupPolicy.debounce) } catch { return }
         }
         do {
-            let response: ItemEnvelope<Contact> = try await session.request(
-                "contacts", requiredSessionIdentity: identity,
-                queryItems: ContactLookupPolicy.listQuery(query: query)
-            )
+            let items = try await session.fetchContacts(query: query, identity: identity)
             guard !Task.isCancelled, session.isCurrentSession(identity) else { return }
-            contacts = response.items
+            contacts = items
             error = nil
             loaded = true
         } catch SessionLifecycleError.staleSession {
@@ -678,21 +680,23 @@ struct ContactRowLabel: View {
     }
 }
 
-enum ContactLookupPolicy {
-    /// Long enough that a full number typed on the dialpad costs one request, short enough to feel immediate.
-    static let debounce: Duration = .milliseconds(350)
-    /// `phoneMatchKeys` needs something to work with; a 2-digit prefix would match half the address book.
-    static let minimumLookupDigits = 3
-    static let listLimit = 200
-
-    static func shouldLookup(_ number: String) -> Bool {
-        PhoneNumberText.normalized(number).filter(\.isNumber).count >= minimumLookupDigits
-    }
-
-    static func listQuery(query: String) -> [URLQueryItem] {
-        var items = [URLQueryItem(name: "limit", value: String(listLimit))]
+extension SessionStore {
+    /// A search is one request; the unfiltered list walks every page, because C.UTF-8 order puts
+    /// Latin names first and a single page hides most CJK names.
+    func fetchContacts(query: String, identity: UUID) async throws -> [Contact] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { items.insert(URLQueryItem(name: "query", value: trimmed), at: 0) }
-        return items
+        guard trimmed.isEmpty else {
+            let response: ItemEnvelope<Contact> = try await request(
+                "contacts", requiredSessionIdentity: identity, queryItems: ContactLookupPolicy.listQuery(query: trimmed))
+            return response.items
+        }
+        var all: [Contact] = []
+        for _ in 0..<ContactLookupPolicy.maxBrowsePages {
+            let page: ItemEnvelope<Contact> = try await request(
+                "contacts", requiredSessionIdentity: identity, queryItems: SMSContactPagePolicy.query(query: "", offset: all.count))
+            all += page.items
+            if !ContactLookupPolicy.hasMorePages(page.items.count) || Task.isCancelled { break }
+        }
+        return all
     }
 }

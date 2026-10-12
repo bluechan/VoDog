@@ -62,7 +62,13 @@ struct MessagesView: View {
                         .accessibilityIdentifier("messages.conversation")
                         // A sibling of the link (like the old (i)) so the tap copies instead of opening the thread.
                         if let code = VerificationCodeText.code(in: conversation.latest?.body) {
-                            Button { UIPasteboard.general.string = code } label: {
+                            Button {
+                                UIPasteboard.general.string = code
+                                // S97: copying the code from the row counts as reading it.
+                                if let latest = conversation.latest, latest.direction == "incoming", !latest.id.isEmpty {
+                                    Task { await BadgeStore.shared.markSMSRead([latest.id], simID: conversation.id.simID, session: session) }
+                                }
+                            } label: {
                                 Label("复制验证码 \(code)", systemImage: "doc.on.doc")
                                     .font(.footnote.weight(.semibold)).monospacedDigit()
                                     .frame(minHeight: 32)
@@ -335,6 +341,10 @@ private struct ConversationRow: View {
                 .font(.body.weight(unread ? .bold : .semibold))
                 .monospacedDigit().foregroundStyle(Signal.ink)
                 .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 1)
+            // S96：简短归属地，标题后的次要文字；很短，不让它被截断。
+            if let location = ContactDisplay.locationShort(conversation.location) {
+                Text(location).font(.subheadline).foregroundStyle(Signal.ink3).lineLimit(1).fixedSize()
+            }
         }
     }
 
@@ -378,7 +388,9 @@ private struct ConversationRow: View {
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(([unread ? "未读" : nil, conversation.displayTitle, conversation.latest?.body,
+        .accessibilityLabel(([unread ? "未读" : nil, conversation.displayTitle,
+                              ContactDisplay.locationShort(conversation.location).map { "归属地 \($0)" },
+                              conversation.latest?.body,
                               conversation.latest.map { displayDate($0.statusDate) },
                               conversation.latest.map(\.directionTitle),
                               conversation.latest.map { simTitle($0.simId, in: sims) },
@@ -386,16 +398,6 @@ private struct ConversationRow: View {
             .compactMap { $0 }.joined(separator: "，"))
     }
 }
-
-/// S95: client-side only — a 4–8 digit run in a message that says 验证码 / 校验码 / 动态码 / code. Copy only.
-enum VerificationCodeText {
-    static func code(in body: String?) -> String? {
-        guard let body, body.range(of: #"验证码|校验码|动态码|确认码|code"#, options: [.regularExpression, .caseInsensitive]) != nil,
-              let match = body.range(of: #"(?<![0-9])[0-9]{4,8}(?![0-9])"#, options: .regularExpression) else { return nil }
-        return String(body[match])
-    }
-}
-
 
 struct ConversationView: View {
     @Environment(SessionStore.self) private var session
@@ -527,13 +529,18 @@ struct ConversationView: View {
                             Text(String(conversation.displayTitle.prefix(1)))
                                 .font(.subheadline.weight(.semibold)).foregroundStyle(Signal.ink2)
                                 .frame(width: 30, height: 30).background(Signal.surface3, in: Circle())
-                            Text(conversation.displayTitle).font(.headline).monospacedDigit()
-                                .foregroundStyle(Signal.ink).lineLimit(1)
+                            VStack(spacing: 0) {
+                                Text(conversation.displayTitle).font(.headline).monospacedDigit()
+                                    .foregroundStyle(Signal.ink).lineLimit(1)
+                                if let location = conversation.location {
+                                    Text(location).font(.caption2).foregroundStyle(Signal.ink3).lineLimit(1)
+                                }
+                            }
                             Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(Signal.ink3)
                         }
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("联系人卡片，\(conversation.displayTitle)")
+                    .accessibilityLabel("联系人卡片，\(conversation.displayTitle)\(conversation.location.map { "，归属地 \($0)" } ?? "")")
                     .accessibilityIdentifier("conversation.contactCard")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -828,12 +835,10 @@ private struct MessageBubble: View {
                         pendingLink = url
                         return .handled
                     })
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(message.direction == "outgoing" ? Signal.bubbleOut : Signal.surface3, in: RoundedRectangle(cornerRadius: 18))
+                    .signalBubble(message.direction == "outgoing" ? Signal.bubbleOut : Signal.surface3)
                     .foregroundStyle(textColor)
                     // S83: the menu sits on the bubble itself so the lift preview is just the bubble. Selection
                     // mode leaves the builder empty, which shows no menu, so the tap toggle is the only gesture.
-                    .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 18))
                     .contextMenu { if !selecting { menuItems } }
                 // S95: time and line live in the separators; the bubble keeps its own delivery state.
                 if let status = message.statusTitleForRow {
@@ -876,7 +881,7 @@ private struct MessageBubble: View {
 
 /// S83: SwiftUI `textSelection(.enabled)` on iOS only copies the whole text, so partial selection with native
 /// handles needs a read-only `UITextView`.
-private struct MessageTextSelectionSheet: View {
+struct MessageTextSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let text: String
 
@@ -1177,12 +1182,6 @@ struct ComposeMessageView: View {
 }
 
 private struct SMSResponse: Decodable { let sms: SMSMessage }
-
-func simTitle(_ simID: String?, in sims: [SIMChannel]) -> String {
-    guard let simID else { return "SIM 未知" }
-    guard let sim = sims.first(where: { $0.id == simID }) else { return "SIM \(simID.prefix(6))" }
-    return sim.label ?? sim.phoneLabel ?? "SIM \((sim.slotIndex ?? 0) + 1)"
-}
 
 /// 通话行上“用的是自己哪条线”：号码（或名称）· 网关短标识。未接来电就是被叫的那条线。
 func callLineTitle(_ simID: String?, in sims: [SIMChannel]) -> String? {

@@ -33,7 +33,7 @@ final class S48SMSRecipientTests: XCTestCase {
         let items = SMSContactPagePolicy.query(query: " 小明 ", offset: 200)
         XCTAssertEqual(items.first { $0.name == "query" }?.value, "小明")
         XCTAssertEqual(items.first { $0.name == "offset" }?.value, "200")
-        XCTAssertEqual(items.first { $0.name == "limit" }?.value, "200")
+        XCTAssertEqual(items.first { $0.name == "limit" }?.value, "500")
     }
 
     func testSingleNumberKeepsExistingPayloadAndMultipleNumbersAreOneBatch() throws {

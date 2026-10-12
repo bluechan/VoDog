@@ -110,13 +110,10 @@ struct ContactsView: View {
         loadGeneration += 1
         let generation = loadGeneration
         do {
-            let response: ItemEnvelope<Contact> = try await session.request(
-                "contacts", requiredSessionIdentity: identity,
-                queryItems: ContactLookupPolicy.listQuery(query: requestedQuery)
-            )
+            let items = try await session.fetchContacts(query: requestedQuery, identity: identity)
             guard !Task.isCancelled, generation == loadGeneration,
                   query == requestedQuery, session.isCurrentSession(identity) else { return }
-            contacts = response.items
+            contacts = items
             error = nil
             loaded = true
         } catch SessionLifecycleError.staleSession {
@@ -188,7 +185,8 @@ struct ContactDetailView: View {
                 Section("号码") {
                     ForEach(contact.phones) { phone in
                         ContactNumberRow(label: ContactLabelDisplay.text(phone.label, fallback: "电话"),
-                                         number: phone.displayNumber, navigation: navigation) { dismiss() }
+                                         number: phone.displayNumber, navigation: navigation,
+                                         location: phone.location) { dismiss() }
                     }
                 }
             }
@@ -415,6 +413,8 @@ struct ContactNumberRow: View {
     let label: String
     let number: String
     let navigation: AppNavigation
+    /// S96：完整归属地，号码下一行；无值不占位。
+    var location: String?
     var dismiss: (() -> Void)?
 
     private var normalized: String { PhoneNumberText.normalized(number) }
@@ -425,6 +425,10 @@ struct ContactNumberRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(label).font(.footnote).foregroundStyle(Signal.ink2)
                 Text(number).font(.title3).monospacedDigit().foregroundStyle(Signal.ink).textSelection(.enabled)
+                if let location = ContactDisplay.locationFull(location) {
+                    Text(location).font(.caption).foregroundStyle(Signal.ink3)
+                        .accessibilityLabel("归属地 \(location)")
+                }
             }
             Spacer(minLength: 8)
             Button { navigation.requestSMS(normalized, simID: nil); dismiss?() } label: {

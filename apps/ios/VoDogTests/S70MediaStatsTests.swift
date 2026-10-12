@@ -96,4 +96,51 @@ final class S70MediaStatsTests: XCTestCase {
     func testCallPeerCapsJitterBufferAt25Packets() {
         XCTAssertEqual(MediaReceivePolicy.audioJitterBufferMaxPackets, 25)
     }
+
+    /// S99 §5: RTT and candidate types from the selected pair, and the bridge's view of our audio.
+    func testCarriesRttRemoteInboundAndCandidateTypesWithoutAddresses() {
+        let fields = MediaRtpStats.fields([
+            (type: "transport", values: ["id": "T1" as NSString, "selectedCandidatePairId": "CP2" as NSString]),
+            (type: "candidate-pair", values: [
+                "id": "CP1" as NSString, "nominated": NSNumber(value: true), "currentRoundTripTime": NSNumber(value: 0.9),
+                "localCandidateId": "L1" as NSString, "remoteCandidateId": "R1" as NSString
+            ]),
+            (type: "candidate-pair", values: [
+                "id": "CP2" as NSString, "currentRoundTripTime": NSNumber(value: 0.2534),
+                "localCandidateId": "L2" as NSString, "remoteCandidateId": "R2" as NSString
+            ]),
+            (type: "local-candidate", values: [
+                "id": "L2" as NSString, "candidateType": "relay" as NSString, "address": "10.0.0.1" as NSString
+            ]),
+            (type: "remote-candidate", values: ["id": "R2" as NSString, "candidateType": "host" as NSString]),
+            (type: "remote-inbound-rtp", values: [
+                "kind": "audio" as NSString, "fractionLost": NSNumber(value: 0.0625),
+                "roundTripTime": NSNumber(value: 0.2611), "jitter": NSNumber(value: 0.00412)
+            ])
+        ])
+        XCTAssertEqual(fields["rttMs"] as? Double, 253.4)
+        XCTAssertEqual(fields["localCandidateType"] as? String, "relay")
+        XCTAssertEqual(fields["remoteCandidateType"] as? String, "host")
+        let remote = fields["txRemote"] as? [String: Any]
+        XCTAssertEqual(remote?["fractionLost"] as? Double, 0.0625)
+        XCTAssertEqual(remote?["roundTripTimeMs"] as? Double, 261.1)
+        XCTAssertEqual(remote?["jitterMs"] as? Double, 4.1)
+        XCTAssertEqual(remote?.count, 3)
+        XCTAssertNil(fields["rx"])
+        XCTAssertFalse(String(describing: fields).contains("10.0.0.1"))
+        XCTAssertEqual(Diag.encode(fields, limit: 200)["rttMs"], .double(253.4))
+    }
+
+    func testFallsBackToNominatedPairAndDropsUnknownCandidateTypes() {
+        let fields = MediaRtpStats.fields([
+            (type: "candidate-pair", values: [
+                "id": "CP1" as NSString, "nominated": NSNumber(value: true), "currentRoundTripTime": NSNumber(value: 0.05),
+                "localCandidateId": "L1" as NSString
+            ]),
+            (type: "local-candidate", values: ["id": "L1" as NSString, "candidateType": "weird" as NSString])
+        ])
+        XCTAssertEqual(fields["rttMs"] as? Double, 50)
+        XCTAssertNil(fields["localCandidateType"])
+        XCTAssertNil(fields["txRemote"])
+    }
 }

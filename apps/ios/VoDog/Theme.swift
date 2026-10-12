@@ -1,6 +1,13 @@
 import SwiftUI
 import UIKit
 
+#if os(watchOS)
+/// S104: watchOS has no `UIColor(dynamicProvider:)` and is always dark, so the watch takes the dark column.
+private func signal(_ light: UInt32, _ dark: UInt32) -> Color {
+    Color(red: Double((dark >> 16) & 0xFF) / 255, green: Double((dark >> 8) & 0xFF) / 255,
+          blue: Double(dark & 0xFF) / 255)
+}
+#else
 /// Signal semantic tokens (S95). Light mode is a tinted ground, never large pure white.
 private func signal(_ light: UInt32, _ dark: UInt32) -> Color {
     func color(_ value: UInt32) -> UIColor {
@@ -10,6 +17,7 @@ private func signal(_ light: UInt32, _ dark: UInt32) -> Color {
     let lightColor = color(light), darkColor = color(dark)
     return Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? darkColor : lightColor })
 }
+#endif
 
 enum Signal {
     static let bg         = signal(0xEEEFF3, 0x0B0E13)
@@ -85,6 +93,13 @@ enum SIMPalette {
                        blue: CGFloat(value & 0xFF) / 255, alpha: 1)
     }
 
+    #if os(watchOS)
+    static func color(for sim: SIMChannel, in sims: [SIMChannel]) -> Color {
+        Color(uiColor: uiColor(hex: hex(index: index(of: sim, in: sims), dark: true)))
+    }
+
+    static let onColor = Color(uiColor: uiColor(hex: "#0B1220"))
+    #else
     static func color(for sim: SIMChannel, in sims: [SIMChannel]) -> Color {
         let index = index(of: sim, in: sims)
         return Color(uiColor: UIColor { uiColor(hex: hex(index: index, dark: $0.userInterfaceStyle == .dark)) })
@@ -93,6 +108,7 @@ enum SIMPalette {
     static let onColor = Color(uiColor: UIColor { trait in
         trait.userInterfaceStyle == .dark ? uiColor(hex: "#0B1220") : .white
     })
+    #endif
 }
 
 enum CallerTheme {

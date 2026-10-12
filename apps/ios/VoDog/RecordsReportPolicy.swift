@@ -142,10 +142,14 @@ enum ReportCardFacts {
     }
 
     static func line(
-        simLabel: String?, direction: String?, duration: String?, answerMethod: CallAnswerMethod
+        simLabel: String?, direction: String?, duration: String?, answerMethod: CallAnswerMethod,
+        location: String? = nil
     ) -> String {
         let sim = (simLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        var parts = [sim.isEmpty ? unknownSIM : sim, directionTitle(direction)]
+        var parts = [sim.isEmpty ? unknownSIM : sim]
+        // S96：简短归属地紧跟首项。
+        if let short = ContactDisplay.locationShort(location) { parts.append(short) }
+        parts.append(directionTitle(direction))
         if let duration, !duration.isEmpty { parts.append(duration) }
         parts.append(answerMethod.title)
         return parts.joined(separator: separator)

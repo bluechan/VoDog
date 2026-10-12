@@ -48,6 +48,9 @@ struct VoDogApp: App {
     @State private var navigation = AppNavigation.shared
     @AppStorage(AppAppearance.storageKey) private var appearanceRawValue = AppAppearance.dark.rawValue
 
+    /// S104: at launch, so a watch message that wakes the app in the background finds the delegate.
+    init() { WatchBridge.shared.activate() }
+
     /// S33 UI acceptance needs a deterministic light/dark window while iOS 27 simulators may ignore
     /// `XCUIDevice.appearance` and process-wide interface-style arguments. The compiler removes this
     /// hook from Release and devices, and both real-backend guards must match the one fixed local API.

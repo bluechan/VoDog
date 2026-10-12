@@ -180,6 +180,8 @@ struct CallRecord: Codable, Identifiable, Sendable {
     var peerSimLabel: String?
     /// S81：被叫 SIM 显示名（备注，缺省号码）。pre-S81 Control 不发。
     var simLabel: String?
+    /// S96：对端号码归属地（`广东 深圳 · 移动`）。查不到或 pre-S96 Control 不发。
+    var remoteLocation: String?
 
     var isInternal: Bool { `internal` == true }
     var directionTitle: String { direction == "incoming" ? "呼入" : "呼出" }
@@ -288,6 +290,8 @@ struct SMSMessage: Codable, Identifiable, Sendable {
     let blockedEntryId: String?
     /// S67c：未读来信。pre-S67c Control 不发，按 false 处理。
     var unread: Bool?
+    /// S96：对端号码归属地，可缺省。
+    var remoteLocation: String?
 }
 
 struct EmptyResponse: Codable, Sendable {}
@@ -322,6 +326,26 @@ struct TranscriptJob: Codable, Identifiable, Sendable {
     let createdAt: String
     let updatedAt: String
     let completedAt: String?
+    /// S101: time-ordered conversation synthesised by Control. Absent on an older Control; never decoded strictly
+    /// (string roles, numeric times as Double) so a new value cannot sink the whole envelope.
+    var dialog: TranscriptDialog? = nil
+}
+
+/// S101: `timebase` is `end_aligned` or `ai_realtime`; times are ms from call start.
+struct TranscriptDialog: Codable, Equatable, Sendable {
+    let timebase: String
+    let maxSkewMs: Double
+    let turns: [TranscriptTurn]
+}
+
+/// S101: `role` is `remote` / `me` / `ai`; `source` is `asr` / `ai_realtime`.
+struct TranscriptTurn: Codable, Equatable, Sendable {
+    let role: String
+    let text: String
+    let atMs: Double
+    let endAtMs: Double?
+    let source: String
+    let track: String?
 }
 
 struct TranscriptFailure: Codable, Sendable {
@@ -522,6 +546,8 @@ struct CallReportItem: Decodable, Identifiable, Sendable {
     let isInternal: Bool
     let peerSimLabel: String?
     let failureReason: String?
+    /// S96：对端号码归属地，可缺省。
+    let remoteLocation: String?
 
     var isBlocked: Bool { blocked == true }
     /// 报告卡首行：内部通话写「内部通话 A → B」。
@@ -544,7 +570,7 @@ struct CallReportItem: Decodable, Identifiable, Sendable {
         case transcriptState, transcriptError, summary, actionItems, classification
         case blockRecommended, blockCategory, blockReason, hasAiTranscript, transcriptCompletedAt
         case callUrl, transcriptUrl, recordingUrl, aiTranscriptUrl, advertisingClassification, originatingPlatform, ownerJoinedLocal, gatewayKind, unseen
-        case `internal`, peerSimLabel, failureReason
+        case `internal`, peerSimLabel, failureReason, remoteLocation
     }
 
     init(from decoder: Decoder) throws {
@@ -586,6 +612,7 @@ struct CallReportItem: Decodable, Identifiable, Sendable {
         isInternal = try c.decodeIfPresent(Bool.self, forKey: .`internal`) ?? false
         peerSimLabel = try c.decodeIfPresent(String.self, forKey: .peerSimLabel)
         failureReason = try c.decodeIfPresent(String.self, forKey: .failureReason)
+        remoteLocation = try c.decodeIfPresent(String.self, forKey: .remoteLocation)
     }
 }
 
@@ -661,9 +688,11 @@ struct RecordingManifest: Decodable, Sendable {
         return [remote.playbackArtifact, uplink.playbackArtifact]
     }
 
+    #if !os(watchOS) // S104: playback is iOS only.
     var defaultTogetherMode: RecordingPlaybackController.TogetherMode {
         ownerJoinedPlaybackArtifacts.isEmpty ? .originals : .ownerJoined
     }
+    #endif
 
     /// A WAV header is 44 bytes and the Ogg/Opus header pages the media node writes are 95; anything at or below
     /// this never carries a single audio frame. S22 decision 7 needs the distinction because "the capture flag is
@@ -921,6 +950,8 @@ enum MediaTransport: String, Codable, Sendable {
 struct MediaOptionsRequest: Codable, Sendable {
     let transport: MediaTransport
     let networkGeneration: String
+    /// S99 §4: same decision as the API base; with `transport: tls` Control answers with the relay TURN URL.
+    var relay = false
 }
 
 struct MediaProbeOptionsRequest: Codable, Sendable { let networkGeneration: String }
@@ -960,6 +991,8 @@ struct MediaIceServer: Codable, Sendable {
     let urls: [String]
     let username: String
     let credential: String
+    /// S99 §4: TLS SNI and certificate name for the relay's IP-form `turns:` URL; absent otherwise.
+    var hostname: String?
 }
 
 struct MediaOptionsResponse: Codable, Sendable {
@@ -1050,6 +1083,8 @@ struct ContactPhone: Codable, Identifiable, Sendable, Equatable {
     /// number and a clean one. Optional — a Control that predates the addendum omits both.
     let blocked: Bool?
     let blockedEntryId: String?
+    /// S96：号码归属地（服务端写入时查询），可缺省。
+    let location: String?
 
     /// What a row prints: the dialable E.164 when the server could parse one, else exactly what was imported.
     var displayNumber: String {
@@ -1058,10 +1093,11 @@ struct ContactPhone: Codable, Identifiable, Sendable, Equatable {
     }
 
     init(id: String, rawNumber: String, e164: String? = nil, canonicalKey: String? = nil,
-         label: String? = nil, isPrimary: Bool? = nil, blocked: Bool? = nil, blockedEntryId: String? = nil) {
+         label: String? = nil, isPrimary: Bool? = nil, blocked: Bool? = nil, blockedEntryId: String? = nil,
+         location: String? = nil) {
         self.id = id; self.rawNumber = rawNumber; self.e164 = e164
         self.canonicalKey = canonicalKey; self.label = label; self.isPrimary = isPrimary
-        self.blocked = blocked; self.blockedEntryId = blockedEntryId
+        self.blocked = blocked; self.blockedEntryId = blockedEntryId; self.location = location
     }
 }
 
@@ -1171,8 +1207,8 @@ struct Contact: Codable, Identifiable, Sendable, Equatable {
 }
 
 struct ContactEnvelope: Codable, Sendable { let item: Contact }
-/// `GET /contacts/lookup?number=` answers `{item: ContactDto|null}`.
-struct ContactLookupEnvelope: Codable, Sendable { let item: Contact? }
+/// `GET /contacts/lookup?number=` answers `{item: ContactDto|null, location?}` (S96 `location` 可缺省)。
+struct ContactLookupEnvelope: Codable, Sendable { let item: Contact?; var location: String? = nil }
 
 // MARK: 写入体
 
@@ -1333,6 +1369,8 @@ struct Interception: Codable, Identifiable, Sendable, Equatable {
     let blockedEntryId: String?
     /// `gateway` | `control` | `phone`（S38：拦截猫在手机上直接拦下的来电）。
     let source: String?
+    /// S96：对端号码归属地，可缺省。
+    var remoteLocation: String?
 
     var isSMS: Bool { kind == "sms" }
 

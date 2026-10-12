@@ -86,6 +86,7 @@ enum RecordsPagingPolicy {
 /// lost), so the store is owned by `RecordsView` and handed down — leaving the segment and coming back keeps
 /// the page instead of silently snapping to the first one. 全部通话 and 报告 use the same type so `PagerBar`
 /// has exactly one signature.
+#if !os(watchOS) // S104: needs InterceptionKindFilter (iOS only).
 @MainActor @Observable
 final class RecordsPagingStore {
     var page: Int
@@ -147,3 +148,4 @@ final class RecordsPagingStore {
 
     func goToFirstPage() { page = RecordsPagingPolicy.firstPage }
 }
+#endif

@@ -8,6 +8,12 @@ enum IncomingCallReportPolicy {
 
     static func shouldReportSynchronouslyOnPushCallback() -> Bool { true }
 
+    /// S99 §3: a VoIP push that is not a parsable `call.incoming` (`event` nil = the payload did not parse) still
+    /// reports a CallKit call — a placeholder under this name that is ended as `.failed` right away.
+    static let placeholderCallerName = "未知来电"
+
+    static func needsPlaceholderReport(event: String?) -> Bool { event != "call.incoming" }
+
     static func ringDecision(applicationState: UIApplication.State) -> RingDecision {
         applicationState == .active ? .localRingtone : .callKitOnly
     }

@@ -161,6 +161,13 @@ final class S38ClientPolicyTests: XCTestCase {
         )
     }
 
+    func testWatchPlatformWording() throws {
+        XCTAssertEqual(callPlatformTitle("watchos"), "手表端")
+        let call = try decodeCall(#"{"id":"c9","state":"active","answeredByPlatform":"watchos"}"#)
+        XCTAssertEqual(callOwnerTitle(call), "手表端")
+        XCTAssertEqual(SIMOccupancyDisplayPolicy.occupantTitle(call), "手表端")
+    }
+
     // MARK: - 拦截来源
 
     func testInterceptionSourceTitles() throws {

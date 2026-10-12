@@ -326,9 +326,16 @@ final class IncomingCallManager {
         // S36 C3: the push arrival is the clock every incoming-call complaint is measured from.
         let receivedAt = ContinuousClock.now
         let completion = SendableCallback(completion)
-        guard let payload = PushCallPayload(userInfo), payload.event == "call.incoming" else {
-            Diag.shared.log("push.voip", ["parsed": false])
-            completion.call()
+        let parsed = PushCallPayload(userInfo)
+        guard let payload = parsed, !IncomingCallReportPolicy.needsPlaceholderReport(event: parsed?.event) else {
+            // S99 §3: PushKit terminates the app (and throttles later VoIP pushes) for any push without a CallKit
+            // report, so even an unusable payload shows — and immediately ends — a placeholder call.
+            CallCoordinator.shared.reportPlaceholderIncomingCall { error in
+                Task { @MainActor in
+                    Diag.shared.log("push.voip", ["parsed": false, "reportedPlaceholder": error == nil])
+                    completion.call()
+                }
+            }
             return
         }
         // S42 decision 5: read the native calls before the CallKit report, so this call's own leg is not in the
@@ -346,7 +353,7 @@ final class IncomingCallManager {
         Diag.shared.log("push.voip", [
             "parsed": true, "hasNumber": payload.remoteNumber?.isEmpty == false,
             "hasName": payload.contactName?.isEmpty == false, "hasSimLabel": payload.simLabel != nil,
-            "deviceBusy": deviceBusy
+            "hasLocation": payload.remoteLocation != nil, "deviceBusy": deviceBusy
         ], callId: payload.callId)
         PushRegistrationManager.shared.recordIncomingStatus("已收到来电通知")
         // S72 B3：内部来电的另一条腿往往就是本机正在拨的那通，不能拿它报忙线。
@@ -495,11 +502,17 @@ final class IncomingCallManager {
             return false
         }
         do {
-            let response = try await claim(callID: callID, session: session, sessionIdentity: sessionIdentity, timeout: 3)
+            let response = try await claim(callID: callID, session: session, sessionIdentity: sessionIdentity, timeout: 5)
             return resolveClaimedCall(response.call, callID: callID, session: session, sessionIdentity: sessionIdentity)
         } catch let APIError.server(_, _, code) where code == "OWN_OUTGOING_CALL" {
             // S72 B4：这是本会话自己拨出的内部通话的被叫腿。只收起本机 CallKit，不能发 end——那会挂掉自己的通话。
             Diag.shared.log("call.answer.failed", ["reason": "own_outgoing_call"], callId: callID)
+            stopReconciling(callID: callID)
+            CallCoordinator.shared.endCall(id: callID, reason: .answeredElsewhere)
+            return false
+        } catch let APIError.server(_, _, code) where code == "ALREADY_CLAIMED" {
+            // S105: another device (e.g. the watch) answered first. Only fold the local CallKit call; no end.
+            Diag.shared.log("call.answer.failed", ["reason": "already_claimed"], callId: callID)
             stopReconciling(callID: callID)
             CallCoordinator.shared.endCall(id: callID, reason: .answeredElsewhere)
             return false
@@ -544,6 +557,14 @@ final class IncomingCallManager {
     private func resolveClaimedCall(
         _ call: CallRecord, callID: String, session: SessionStore, sessionIdentity: UUID
     ) -> Bool {
+        // S105: a same-session claim replay after the watch answered names the watch; it holds the audio, so the
+        // phone neither starts media nor sends end (failAnswer would hang up the watch's call).
+        if let device = call.answeredByDevice, device != UIDevice.current.name {
+            Diag.shared.log("call.answer.failed", ["reason": "answered_by_other_device"], callId: callID)
+            stopReconciling(callID: callID)
+            CallCoordinator.shared.endCall(id: callID, reason: .answeredElsewhere)
+            return false
+        }
         guard beginClaimedCall(call, session: session, sessionIdentity: sessionIdentity) else {
             failAnswer(callID: callID, session: session, sessionIdentity: sessionIdentity, error: nil)
             return false
@@ -647,7 +668,8 @@ final class IncomingCallManager {
         let state: String?
         do {
             let response: CallEnvelope = try await session.request(
-                "calls/\(callID)", requiredSessionIdentity: identity
+                "calls/\(callID)", timeoutInterval: CallRefreshCadencePolicy.pollRequestTimeout,
+                requiredSessionIdentity: identity
             )
             state = response.call.state
         } catch SessionLifecycleError.staleSession {
@@ -669,7 +691,8 @@ final class IncomingCallManager {
         guard let session, session.isAuthenticated, let identity = session.sessionIdentity else { return }
         do {
             let response: CallEnvelope = try await session.request(
-                "calls/\(callID)", requiredSessionIdentity: identity
+                "calls/\(callID)", timeoutInterval: CallRefreshCadencePolicy.pollRequestTimeout,
+                requiredSessionIdentity: identity
             )
             guard session.isCurrentSession(identity), offeredCalls.contains(callID) else { return }
             if OfferedCallReconciliation.decision(for: response.call.state) == .endLocalOffer {
@@ -686,7 +709,7 @@ final class IncomingCallManager {
                     id: callID, handle: call.remoteNumber,
                     contactName: IncomingCallerName.text(
                         contactName: call.contactName, remoteNumber: call.remoteNumber, isInternal: call.isInternal,
-                        peerSimLabel: call.peerSimLabel, simLabel: call.simLabel
+                        peerSimLabel: call.peerSimLabel, simLabel: call.simLabel, location: call.remoteLocation
                     )
                 )
             }
@@ -809,11 +832,13 @@ struct PushCallPayload: Sendable {
     let peerSimLabel: String?
     /// S81：被叫 SIM 的显示名。pre-S81 Control 不发 → nil，来电名保持旧样子。
     let simLabel: String?
+    /// S96：对端号码归属地（完整形态）。pre-S96 Control 不发 → nil。
+    let remoteLocation: String?
 
     var callerDisplayName: String? {
         IncomingCallerName.text(
             contactName: contactName, remoteNumber: remoteNumber, isInternal: isInternal,
-            peerSimLabel: peerSimLabel, simLabel: simLabel
+            peerSimLabel: peerSimLabel, simLabel: simLabel, location: remoteLocation
         )
     }
 
@@ -835,19 +860,27 @@ struct PushCallPayload: Sendable {
         simLabel = (value["simLabel"] as? String)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { $0.isEmpty ? nil : String($0.prefix(60)) }
+        remoteLocation = (value["remoteLocation"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : String($0.prefix(60)) }
     }
 }
 
 /// CallKit 上的来电名，推送首报与 S36 C1 对账共用，响铃中文字不回退。内部来电写「{主叫卡}（内部）」，否则是
 /// 联系人名；S81 有被叫卡名时再接「 → {被叫卡}」，此时主叫缺名就用号码、再缺用「未知号码」。无被叫卡名 = 旧行为。
+/// S96：外线来电有归属地时主叫写「{主叫} · {简短归属地}」（主叫缺名同样退到号码）；内部来电不带归属地。
 enum IncomingCallerName {
     static func text(
-        contactName: String?, remoteNumber: String?, isInternal: Bool, peerSimLabel: String?, simLabel: String?
+        contactName: String?, remoteNumber: String?, isInternal: Bool, peerSimLabel: String?, simLabel: String?,
+        location: String?
     ) -> String? {
         func clean(_ value: String?) -> String? {
             value.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         }
-        let base = isInternal ? "\(clean(peerSimLabel) ?? "内部来电")（内部）" : clean(contactName)
+        var base = isInternal ? "\(clean(peerSimLabel) ?? "内部来电")（内部）" : clean(contactName)
+        if !isInternal, let short = ContactDisplay.locationShort(location) {
+            base = "\(base ?? clean(remoteNumber) ?? "未知号码") · \(short)"
+        }
         guard let simLabel = clean(simLabel) else { return base }
         if isInternal { return "\(base ?? "")→ \(simLabel)" }
         return "\(base ?? clean(remoteNumber) ?? "未知号码") → \(simLabel)"

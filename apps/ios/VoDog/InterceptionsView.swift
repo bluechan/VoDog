@@ -245,6 +245,9 @@ struct InterceptionsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(ContactDisplay.numberWithName(number: item.remoteNumber, contactName: item.contactName))
                     .font(.body.weight(.medium)).monospacedDigit().lineLimit(1)
+                if let location = ContactDisplay.locationShort(item.remoteLocation) {
+                    Text(location).font(.caption).foregroundStyle(Signal.ink3)
+                }
                 Text(interceptionContext(item))
                     .font(.caption).foregroundStyle(.secondary)
                     .accessibilityIdentifier("interceptions.simContext")
@@ -262,6 +265,7 @@ struct InterceptionsView: View {
         .accessibilityLabel(
             [
                 ContactDisplay.numberWithName(number: item.remoteNumber, contactName: item.contactName),
+                ContactDisplay.locationShort(item.remoteLocation).map { "归属地 \($0)" } ?? "",
                 interceptionContext(item),
             ].filter { !$0.isEmpty }.joined(separator: "，")
         )

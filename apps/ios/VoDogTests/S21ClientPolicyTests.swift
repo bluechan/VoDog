@@ -283,6 +283,8 @@ final class S21ClientPolicyTests: XCTestCase {
         let searched = ContactLookupPolicy.listQuery(query: " 张三 ")
         XCTAssertEqual(searched.map(\.name), ["query", "limit"])
         XCTAssertEqual(searched.first?.value, "张三")
+        XCTAssertFalse(ContactLookupPolicy.hasMorePages(499))
+        XCTAssertTrue(ContactLookupPolicy.hasMorePages(500))
     }
 
     // MARK: - §F 联系人卡片

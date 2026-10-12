@@ -173,6 +173,17 @@ final class RecordsUXTests: XCTestCase {
         )
     }
 
+    func testEndedCallWithoutMediaShowsNoRecording() {
+        typealias P = RecordingAvailabilityPolicy
+        XCTAssertTrue(P.hasNoRecording(recordingStatus: "none", state: "ended"))
+        XCTAssertTrue(P.hasNoRecording(recordingStatus: nil, state: "ended"))
+        XCTAssertTrue(P.hasNoRecording(recordingStatus: "", state: "ended"))
+        XCTAssertTrue(P.hasNoRecording(recordingStatus: nil, state: "failed"))
+        XCTAssertFalse(P.hasNoRecording(recordingStatus: "pending", state: "ended"))
+        XCTAssertFalse(P.hasNoRecording(recordingStatus: "ready", state: "ended"))
+        XCTAssertFalse(P.hasNoRecording(recordingStatus: "none", state: "active"))
+    }
+
     func testTranscriptBlocksKeepTracksAndSpeakersApart() {
         let segments = [
             TranscriptSegment(track: "remote_original", speaker: "remote", text: "你好", startMs: 0, endMs: 400),

@@ -1759,14 +1759,14 @@ final class ContractTests: XCTestCase {
         let context = Diag.contextFields(
             osVersion: "17.5", deviceModel: "iPhone16,1", appVersion: "1.4.0", appBuild: "42",
             locale: "zh_CN", timeZone: "Asia/Shanghai", pushRegistered: true, micPermission: "granted",
-            notificationPermission: "denied", installId: "00000000-0000-4000-8000-000000000023"
+            notificationPermission: "denied", installId: "00000000-0000-4000-8000-000000000023", relay: true
         )
         XCTAssertEqual(Diag.encode(context, limit: 200), [
             "platform": .string("ios"), "osVersion": .string("17.5"), "deviceModel": .string("iPhone16,1"),
             "appVersion": .string("1.4.0"), "appBuild": .string("42"), "locale": .string("zh_CN"),
             "timeZone": .string("Asia/Shanghai"), "pushRegistered": .bool(true),
             "micPermission": .string("granted"), "notificationPermission": .string("denied"),
-            "installId": .string("00000000-0000-4000-8000-000000000023")
+            "installId": .string("00000000-0000-4000-8000-000000000023"), "relay": .bool(true)
         ])
 
         var snapshot = DiagSnapshot()

@@ -111,6 +111,7 @@ final class SessionStore {
     func restore() async {
         guard token == nil, let saved = try? credentialStore.load() else { return }
         token = saved.token; user = saved.user; sessionIdentity = UUID()
+        WatchBridge.shared.sessionDidChange(self, expiresAt: saved.expiresAt)
         do {
             let response: MeResponse = try await request("auth/me")
             user = response.user
@@ -151,6 +152,7 @@ final class SessionStore {
         try credentialStore.save(StoredCredentials(token: response.token, refreshToken: response.refreshToken, expiresAt: response.expiresAt, user: response.user))
         token = response.token; user = response.user; sessionIdentity = UUID()
         PushRegistrationManager.shared.attach(session: self)
+        WatchBridge.shared.sessionDidChange(self, expiresAt: response.expiresAt)
     }
 
     func request<Response: Decodable & Sendable, Body: Encodable & Sendable>(
@@ -276,9 +278,20 @@ final class SessionStore {
         }
     }
 
+    /// S105k: a watch-held call never hits the phone's 401 path, so the bridge refreshes ahead of expiry through the
+    /// same single-flight slot. Returns "fresh" | "no_expiry" | "refreshed" | "failed".
+    @discardableResult
+    func refreshIfExpiringSoon(within interval: TimeInterval) async -> String {
+        guard isAuthenticated else { return "failed" }
+        guard let raw = (try? credentialStore.load())?.expiresAt, let expiry = GatewayTimeDisplay.parseISO(raw) else { return "no_expiry" }
+        guard expiry.timeIntervalSinceNow < interval else { return "fresh" }
+        do { try await refreshAccessToken(); return "refreshed" } catch { return "failed" }
+    }
+
     private func persistCurrent(refreshToken: String?, expiresAt: String?) throws {
         guard let token, let user else { throw APIError.unauthorized }
         try credentialStore.save(StoredCredentials(token: token, refreshToken: refreshToken, expiresAt: expiresAt, user: user))
+        WatchBridge.shared.sessionDidChange(self, expiresAt: expiresAt)
     }
 
     private func clearLocalSession(cancelMediaProbe: Bool = true) {
@@ -291,6 +304,7 @@ final class SessionStore {
         ReliableCallEndQueue.shared.cancelAll()
         refreshSlot.cancelAndClear()
         try? credentialStore.delete(); token = nil; user = nil
+        WatchBridge.shared.sessionDidChange(self, expiresAt: nil)
     }
 
     private func endMediaProbeSession() {

@@ -50,6 +50,7 @@ final class MediaNetworkGenerationSource: MediaNetworkGenerationProviding, @unch
             candidateNetwork = choice
             pathLabel = label
         }
+        ClientEndpoint.shared.onPath(transport: type, key: label)
     }
 }
 

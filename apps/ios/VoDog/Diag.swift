@@ -442,7 +442,7 @@ final class Diag: @unchecked Sendable {
             pushRegistered: PushRegistrationManager.shared.serverRegistrationSucceeded,
             micPermission: Self.microphonePermission(),
             notificationPermission: await Self.notificationPermission(),
-            installId: lock.withLock { installId }
+            installId: lock.withLock { installId }, relay: ClientEndpoint.shared.relay()
         )
         let encoded = Self.encode(fields, limit: Self.fieldLimit)
         let changed: Bool = lock.withLock {
@@ -458,13 +458,13 @@ final class Diag: @unchecked Sendable {
     static func contextFields(
         osVersion: String, deviceModel: String, appVersion: String, appBuild: String, locale: String,
         timeZone: String, pushRegistered: Bool, micPermission: String, notificationPermission: String,
-        installId: String
+        installId: String, relay: Bool
     ) -> [String: Any] {
         [
             "platform": source, "osVersion": osVersion, "deviceModel": deviceModel, "appVersion": appVersion,
             "appBuild": appBuild, "locale": locale, "timeZone": timeZone, "pushRegistered": pushRegistered,
             "micPermission": micPermission, "notificationPermission": notificationPermission,
-            "installId": installId
+            "installId": installId, "relay": relay
         ]
     }
 

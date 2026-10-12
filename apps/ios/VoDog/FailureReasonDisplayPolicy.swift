@@ -45,3 +45,11 @@ enum FailureReasonDisplayPolicy {
         return false
     }
 }
+
+/// S118: Control marks an ended call whose gateway never joined media `none`; there is nothing to play.
+enum RecordingAvailabilityPolicy {
+    static func hasNoRecording(recordingStatus: String?, state: String?) -> Bool {
+        guard state == "ended" || state == "failed" else { return false }
+        return recordingStatus == nil || recordingStatus == "" || recordingStatus == "none"
+    }
+}

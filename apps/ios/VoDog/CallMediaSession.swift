@@ -211,17 +211,6 @@ final class CallMediaSession: NSObject {
             try configurePhoneAudioSession(managedByCallKit: managedByCallKit)
             // S73: an app-owned session resets the route on configure; a rejoin puts the speaker back.
             if !managedByCallKit, rejoin?.speaker == true { setSpeaker(true) }
-            if managedByCallKit {
-                let audioWaitStartedAt = ContinuousClock.now
-                await waitForCallKitAudioIfNeeded()
-                try ensureCurrent(attempt)
-                guard callKitAudioActive else {
-                    Diag.shared.log(
-                        "media.callkit_audio_timeout", ["ms": Diag.ms(since: audioWaitStartedAt)], callId: callID
-                    )
-                    throw MediaSessionError.callKitAudioTimedOut
-                }
-            }
             let peer = try makePeerConnection(relay: relay)
             peerConnection = peer
             Self.log.notice("peer created gathering=\(peer.iceGatheringState.logLabel, privacy: .public)")
@@ -267,6 +256,19 @@ final class CallMediaSession: NSObject {
             Self.log.notice("answer received \(answerFields, privacy: .public)")
             try ensureCurrent(attempt)
             guard answer.type == "answer", !answer.sdp.isEmpty else { throw MediaSessionError.invalidAnswer }
+            // S99 §6: the CallKit activation wait overlaps options/offer/gathering instead of preceding them;
+            // `useManualAudio` keeps the audio unit off until activation anyway. S52's 8 s cap is unchanged.
+            if managedByCallKit {
+                let audioWaitStartedAt = ContinuousClock.now
+                await waitForCallKitAudioIfNeeded()
+                try ensureCurrent(attempt)
+                guard callKitAudioActive else {
+                    Diag.shared.log(
+                        "media.callkit_audio_timeout", ["ms": Diag.ms(since: audioWaitStartedAt)], callId: callID
+                    )
+                    throw MediaSessionError.callKitAudioTimedOut
+                }
+            }
             try await setRemoteDescription(LKRTCSessionDescription(type: .answer, sdp: answer.sdp), on: peer)
             Self.log.notice("remote description set callID=\(callID, privacy: .public)")
             // Candidates alone never carried audio: the relay still has to connect. Waiting here routes a stuck
@@ -372,7 +374,7 @@ final class CallMediaSession: NSObject {
             // fallback emits without them so hangup never waits on stats.
             if let peerConnection {
                 peerConnection.statistics { @Sendable report in
-                    emitter.emit(MediaRtpStats.fields(report.statistics.values.map { ($0.type, $0.values as [String: Any]) }))
+                    emitter.emit(MediaRtpStats.fields(MediaRtpStats.entries(report)))
                 }
                 DispatchQueue.global().asyncAfter(deadline: .now() + 1) { emitter.emit([:]) }
             } else {
@@ -419,7 +421,7 @@ final class CallMediaSession: NSObject {
                 let muted = self.isMuted
                 let peerID = ObjectIdentifier(peer)
                 peer.statistics { @Sendable report in
-                    let stats = report.statistics.values.map { ($0.type, $0.values as [String: Any]) }
+                    let stats = MediaRtpStats.entries(report)
                     var fields = MediaRtpStats.fields(stats)
                     if var rx = fields["rx"] as? [String: Any] {
                         rx.merge(window.fields(stats, peerID: peerID)) { _, new in new }
@@ -710,7 +712,8 @@ final class CallMediaSession: NSObject {
             return try await session.request(
                 "calls/\(callID)/media/options", method: "POST",
                 body: MediaOptionsRequest(
-                    transport: transport, networkGeneration: MediaNetworkGenerationSource.shared.currentGeneration()
+                    transport: transport, networkGeneration: MediaNetworkGenerationSource.shared.currentGeneration(),
+                    relay: ClientEndpoint.shared.relay()
                 ),
                 timeoutInterval: 6, requiredSessionIdentity: sessionIdentity
             )
@@ -721,7 +724,9 @@ final class CallMediaSession: NSObject {
             )
             return try await session.request(
                 "calls/\(callID)/media/options", method: "POST",
-                body: MediaOptionsRequest(transport: transport, networkGeneration: generation),
+                body: MediaOptionsRequest(
+                    transport: transport, networkGeneration: generation, relay: ClientEndpoint.shared.relay()
+                ),
                 timeoutInterval: 6, requiredSessionIdentity: sessionIdentity
             )
         } catch APIError.server(409, _, _) {
@@ -731,7 +736,9 @@ final class CallMediaSession: NSObject {
             )
             return try await session.request(
                 "calls/\(callID)/media/options", method: "POST",
-                body: MediaOptionsRequest(transport: transport, networkGeneration: generation),
+                body: MediaOptionsRequest(
+                    transport: transport, networkGeneration: generation, relay: ClientEndpoint.shared.relay()
+                ),
                 timeoutInterval: 6, requiredSessionIdentity: sessionIdentity
             )
         }
@@ -756,7 +763,10 @@ final class CallMediaSession: NSObject {
         let candidateNetwork = MediaNetworkGenerationSource.shared.candidateNetworkChoice()
         configuration.candidateNetworkPolicy = candidateNetwork == .lowCost ? .lowCost : .all
         candidateNetworkLabel = candidateNetwork.label
-        configuration.iceServers = [LKRTCIceServer(urlStrings: relay.urls, username: relay.username, credential: relay.credential)]
+        configuration.iceServers = [LKRTCIceServer(
+            urlStrings: relay.urls, username: relay.username, credential: relay.credential,
+            tlsCertPolicy: .secure, hostname: relay.hostname
+        )]
         let peerConstraints = LKRTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
         guard let peer = factory.peerConnection(with: configuration, constraints: peerConstraints, delegate: self) else {
             throw MediaSessionError.peerCreationFailed
@@ -1324,14 +1334,32 @@ enum MediaRtpStats {
         "insertedSamplesForDeceleration", "removedSamplesForAcceleration"
     ]
 
-    /// `stats`: (type, values) per stats object. Returns `rx`/`tx` only when present.
+    /// S99 §5: candidate types are reported only from this set — never an address.
+    static let candidateTypes: Set<String> = ["host", "srflx", "prflx", "relay"]
+
+    /// The report as (type, values), with the stats object's id copied into `values["id"]` so `fields` can follow
+    /// `selectedCandidatePairId` / `localCandidateId` / `remoteCandidateId`.
+    static func entries(_ report: LKRTCStatisticsReport) -> [(type: String, values: [String: Any])] {
+        report.statistics.map { id, stat in
+            (stat.type, (stat.values as [String: Any]).merging(["id": id]) { current, _ in current })
+        }
+    }
+
+    /// `stats`: (type, values) per stats object. Returns `rx`/`tx` only when present; S99 adds `rttMs` and
+    /// `local`/`remoteCandidateType` from the selected candidate pair and `txRemote` from `remote-inbound-rtp`.
     static func fields(_ stats: [(type: String, values: [String: Any])]) -> [String: Any] {
         var rx: [String: Any] = [:]
         var tx: [String: Any] = [:]
+        var txRemote: [String: Any] = [:]
         for (type, values) in stats {
             guard (values["kind"] ?? values["mediaType"]) as? String == "audio" else { continue }
             let number = { (key: String) in values[key] as? NSNumber }
-            if type == "inbound-rtp", rx.isEmpty {
+            if type == "remote-inbound-rtp", txRemote.isEmpty {
+                // Read as a floor of 0.05 while the bridge runs CC_MEDIA_RR_LOSS_FLOOR_PCT=5 (S70).
+                if let value = number("fractionLost") { txRemote["fractionLost"] = value.doubleValue }
+                if let value = number("roundTripTime") { txRemote["roundTripTimeMs"] = tenth(value.doubleValue * 1000) }
+                if let value = number("jitter") { txRemote["jitterMs"] = tenth(value.doubleValue * 1000) }
+            } else if type == "inbound-rtp", rx.isEmpty {
                 for key in rxCounts { if let value = number(key) { rx[key] = value.intValue } }
                 if let jitter = number("jitter") { rx["jitterMs"] = tenth(jitter.doubleValue * 1000) }
                 if let delay = number("jitterBufferDelay"), let emitted = number("jitterBufferEmittedCount"),
@@ -1349,7 +1377,27 @@ enum MediaRtpStats {
         var out: [String: Any] = [:]
         if !rx.isEmpty { out["rx"] = rx }
         if !tx.isEmpty { out["tx"] = tx }
+        if !txRemote.isEmpty { out["txRemote"] = txRemote }
+        if let pair = selectedPair(stats) {
+            if let rtt = pair["currentRoundTripTime"] as? NSNumber { out["rttMs"] = tenth(rtt.doubleValue * 1000) }
+            for (side, key) in [("localCandidateId", "localCandidateType"), ("remoteCandidateId", "remoteCandidateType")] {
+                guard let id = pair[side] as? String,
+                      let type = stats.first(where: { $0.values["id"] as? String == id })?.values["candidateType"] as? String,
+                      candidateTypes.contains(type) else { continue }
+                out[key] = type
+            }
+        }
         return out
+    }
+
+    /// Same order as Web: `transport.selectedCandidatePairId`, then a pair flagged `selected`, then `nominated`.
+    private static func selectedPair(_ stats: [(type: String, values: [String: Any])]) -> [String: Any]? {
+        let pairs = stats.filter { $0.type == "candidate-pair" }.map(\.values)
+        let selectedID = stats.lazy.filter { $0.type == "transport" }
+            .compactMap { $0.values["selectedCandidatePairId"] as? String }.first
+        if let selectedID, let pair = pairs.first(where: { $0["id"] as? String == selectedID }) { return pair }
+        return pairs.first { ($0["selected"] as? NSNumber)?.boolValue == true }
+            ?? pairs.first { ($0["nominated"] as? NSNumber)?.boolValue == true }
     }
 
     static func tenth(_ value: Double) -> Double { (value * 10).rounded() / 10 }

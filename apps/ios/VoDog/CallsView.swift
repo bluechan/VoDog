@@ -20,11 +20,15 @@ struct CallsView<Content: View>: View {
     @State private var error: String?
     @State private var loading = false
     @State private var loaded = false
+    /// S99 §1: bumped before media starts, so a refresh already in flight cannot stop the media it never saw.
+    @State private var mediaStartGeneration = 0
     @State private var showingKeypad = true
     /// S36 C5-b / C2: the confirm-then-dial sheet, and the in-call DTMF keypad on the active-call card.
     @State private var confirmingDial = false
     @State private var showingDTMFKeypad = false
     @State private var dtmfError: String?
+    @State private var pullingCallID: String?
+    @State private var pullError: (callID: String, message: String)?
     @State private var media = CallMediaSession.shared
     @State private var answerFeedback = 0
     @State private var endFeedback = 0
@@ -32,6 +36,8 @@ struct CallsView<Content: View>: View {
     /// §F: the dialer echoes the matched name. `lookupNumber` records which number the answer belongs to, so a
     /// late response for an older prefix can never label the number now on screen.
     @State private var lookupContact: Contact?
+    /// S96：`contacts/lookup` 顶层 `location`（完整形态），与 `lookupContact` 同一 `lookupNumber`。
+    @State private var lookupLocation: String?
     @State private var lookupNumber = ""
 
     private var activeCalls: [CallRecord] { CallAvailabilityPolicy.activeCalls(calls) }
@@ -282,6 +288,28 @@ struct CallsView<Content: View>: View {
         return name.isEmpty ? nil : name
     }
 
+    /// S96：拨号盘提示区的归属地（完整形态），同样只属于屏上当前号码。
+    private var dialerLocation: String? {
+        guard lookupNumber == PhoneNumberText.normalized(number) else { return nil }
+        return ContactDisplay.locationFull(lookupLocation)
+    }
+
+    /// 提示区：`{联系人} · {归属地}`、只有其一，或保留一行空白。
+    private var dialerHint: Text {
+        switch (dialerContactName, dialerLocation) {
+        case let (name?, location?):
+            Text(name).foregroundStyle(Signal.brand) + Text(" · \(location)").font(.subheadline).foregroundStyle(Signal.ink3)
+        case let (name?, nil): Text(name).foregroundStyle(Signal.brand)
+        case let (nil, location?): Text(location).font(.subheadline).foregroundStyle(Signal.ink3)
+        case (nil, nil): Text(" ")
+        }
+    }
+
+    private var dialerHintAccessibility: String {
+        [dialerContactName.map { "通讯录匹配到 \($0)" }, dialerLocation.map { "归属地 \($0)" }]
+            .compactMap { $0 }.joined(separator: "，")
+    }
+
     private var dialer: some View {
         VStack(spacing: 10) {
             Button { showingKeypad = true } label: {
@@ -297,12 +325,11 @@ struct CallsView<Content: View>: View {
             .accessibilityHint("打开数字键盘")
 
             // A real, font-scaled line stays in layout when the asynchronous match is absent.
-            Text(dialerContactName ?? " ")
+            dialerHint
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Signal.brand)
                 .lineLimit(1)
-                .accessibilityHidden(dialerContactName == nil)
-                .accessibilityLabel("通讯录匹配到 \(dialerContactName ?? "")")
+                .accessibilityHidden(dialerHintAccessibility.isEmpty)
+                .accessibilityLabel(dialerHintAccessibility)
                 .accessibilityIdentifier("calls.dialerContactName")
 
             if showingKeypad {
@@ -383,6 +410,11 @@ struct CallsView<Content: View>: View {
                 Text(number).font(.title3).monospacedDigit().foregroundStyle(Signal.ink2)
                     .accessibilityHidden(true)
             }
+            if !call.isInternal, let location = ContactDisplay.locationFull(call.remoteLocation) {
+                Text(location).font(.subheadline).foregroundStyle(Signal.ink3)
+                    .multilineTextAlignment(.center)
+                    .accessibilityLabel("归属地 \(location)")
+            }
             HStack(spacing: 8) {
                 if !ending { Circle().fill(Signal.call).frame(width: 8, height: 8).accessibilityHidden(true) }
                 CallUIStatusLabel(call: call, requestedAt: requestedAt)
@@ -436,12 +468,40 @@ struct CallsView<Content: View>: View {
                     .reportsError(dtmfError, screen: "calls", site: "dtmf")
             }
         }
-        Text(mediaFailureMessage(for: call) != nil
+        Text(CallAvailabilityPolicy.watchHoldsAudio(call, currentMediaCallID: media.callID)
+             ? "音频在手表"
+             : mediaFailureMessage(for: call) != nil
              ? "通话声音暂不可用，仍可结束通话。"
              : (!audioReady ? "通话声音尚未就绪。"
                 : (media.isMuted ? "麦克风已静音，对方听不到你的声音。" : "通话声音已连接。")))
             .font(.footnote).foregroundStyle(Signal.ink2).multilineTextAlignment(.center)
             .frame(maxWidth: .infinity)
+        // S105i: the watch's own transfer is unreachable behind watchOS's modal call UI, so the phone pulls it.
+        if CallAvailabilityPolicy.watchHoldsAudio(call, currentMediaCallID: media.callID) {
+            let pulling = pullingCallID == call.id
+            Button {
+                Task {
+                    guard availability.canMutate, pullingCallID == nil else { return }
+                    pullingCallID = call.id
+                    pullError = nil
+                    pullError = await WatchBridge.shared.pullCall(callId: call.id).map { (call.id, $0) }
+                    pullingCallID = nil
+                }
+            } label: {
+                Label(pulling ? "正在转移…" : "转到 iPhone", systemImage: "iphone")
+                    .frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Signal.brand)
+            .disabled(ending || pulling || !availability.canMutate)
+            .accessibilityIdentifier("calls.pullFromWatch")
+            if let pullError, pullError.callID == call.id {
+                Text(pullError.message)
+                    .font(.footnote).foregroundStyle(Signal.danger)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .reportsError(pullError.message, screen: "calls", site: "watch_pull")
+            }
+        }
     }
 
     /// 76 pt round in-call control; active state is inverted (ink disc, ground-colored glyph).
@@ -579,6 +639,10 @@ struct CallsView<Content: View>: View {
             Label("当前通话", systemImage: "phone.connection.fill").font(.headline).foregroundStyle(.tint)
             Text(ContactDisplay.numberWithName(number: call.shownNumber(in: sims), contactName: call.shownContactName))
                 .font(.title2).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
+            if !call.isInternal, let location = ContactDisplay.locationFull(call.remoteLocation) {
+                Text(location).font(.subheadline).foregroundStyle(Signal.ink3)
+                    .accessibilityLabel("归属地 \(location)")
+            }
             HStack {
                 Text(callStateTitle(call.state)).foregroundStyle(.secondary)
                 Spacer()
@@ -685,11 +749,13 @@ struct CallsView<Content: View>: View {
         let normalized = PhoneNumberText.normalized(number)
         guard let identity = session.sessionIdentity else {
             lookupContact = nil
+            lookupLocation = nil
             lookupNumber = ""
             return
         }
         guard ContactLookupPolicy.shouldLookup(normalized) else {
             lookupContact = nil
+            lookupLocation = nil
             lookupNumber = ""
             return
         }
@@ -703,6 +769,7 @@ struct CallsView<Content: View>: View {
             guard !Task.isCancelled, session.isCurrentSession(identity),
                   PhoneNumberText.normalized(number) == normalized else { return }
             lookupContact = response.item
+            lookupLocation = response.location
             lookupNumber = normalized
         } catch SessionLifecycleError.staleSession {
             return
@@ -711,21 +778,29 @@ struct CallsView<Content: View>: View {
                   PhoneNumberText.normalized(number) == normalized else { return }
             // Never surface this: an unmatched number is the normal case and a failed lookup must not block dialling.
             lookupContact = nil
+            lookupLocation = nil
             lookupNumber = normalized
         }
     }
 
     private func load(requiredIdentity identity: UUID?) async {
         guard let identity, session.isCurrentSession(identity) else { return }
+        let loadGeneration = mediaStartGeneration
         do {
-            async let simResult: ItemEnvelope<SIMChannel> = session.request("sims", requiredSessionIdentity: identity)
-            async let callResult: ItemEnvelope<CallRecord> = session.request("calls", requiredSessionIdentity: identity)
+            // S99 §2: a half-dead connection costs one 8 s poll, not URLSession's 60 s default.
+            async let simResult: ItemEnvelope<SIMChannel> = session.request(
+                "sims", timeoutInterval: CallRefreshCadencePolicy.pollRequestTimeout, requiredSessionIdentity: identity
+            )
+            async let callResult: ItemEnvelope<CallRecord> = session.request(
+                "calls", timeoutInterval: CallRefreshCadencePolicy.pollRequestTimeout, requiredSessionIdentity: identity
+            )
             let (newSims, newCalls) = try await (simResult, callResult)
             guard session.isCurrentSession(identity) else { return }
             sims = newSims.items
             calls = newCalls.items
             callsSnapshotSessionID = identity
             availability.didRefreshSIMs(newSims.items)
+            WatchBridge.shared.didLoad(sims: newSims.items, calls: newCalls.items)
             syncPresentation()
             // S41 decision 3: the remote party's hangup reaches the device as a list state, and until S41
             // nothing here took the system call down — only `media.stop()` below.
@@ -737,7 +812,9 @@ struct CallsView<Content: View>: View {
                 reason: "poll"
             )
             selectedSIM = SIMSelectionPolicy.preferredID(in: sims, current: selectedSIM)
-            if media.callID != nil, !newCalls.items.contains(where: { $0.id == media.callID && !["ended", "failed"].contains($0.state ?? "") }) {
+            if CallStartSequencePolicy.mayStopMedia(
+                loadGeneration: loadGeneration, currentGeneration: mediaStartGeneration
+            ), media.callID != nil, !newCalls.items.contains(where: { $0.id == media.callID && !["ended", "failed"].contains($0.state ?? "") }) {
                 media.stop()
             }
             error = nil
@@ -781,9 +858,7 @@ struct CallsView<Content: View>: View {
             guard session.isCurrentSession(identity) else { return }
             OutboundCallIdempotencyStore.shared.markSucceeded(accountID: accountID, payload: payload, idempotencyKey: key)
             number = ""
-            await load(requiredIdentity: identity)
-            guard session.isCurrentSession(identity) else { return }
-            await startMedia(callID: response.call.id, sessionIdentity: identity)
+            await refreshAndStartMedia(callID: response.call.id, sessionIdentity: identity)
         } catch SessionLifecycleError.staleSession {
             return
         } catch {
@@ -838,9 +913,7 @@ struct CallsView<Content: View>: View {
             Diag.shared.log("call.claim", ["ms": Diag.ms(since: startedAt), "code": 200], callId: call.id)
             guard session.isCurrentSession(identity) else { return }
             _ = response.call // Claiming enters connecting; Telecom ACTIVE remains authoritative.
-            await load(requiredIdentity: identity)
-            guard session.isCurrentSession(identity) else { return }
-            await startMedia(callID: response.call.id, sessionIdentity: identity)
+            await refreshAndStartMedia(callID: response.call.id, sessionIdentity: identity)
         } catch SessionLifecycleError.staleSession {
             return
         } catch {
@@ -923,6 +996,17 @@ struct CallsView<Content: View>: View {
                 mediaRecoveryControls(call)
             }
         }
+    }
+
+    /// S99 §1 (`CallStartSequencePolicy`): the list refresh runs alongside media instead of in front of it. An
+    /// unstructured `Task`, not `async let`: the latter is cancelled when media returns first, and `load` drops a
+    /// cancelled result.
+    private func refreshAndStartMedia(callID: String, sessionIdentity identity: UUID) async {
+        mediaStartGeneration += 1
+        let refresh = Task { await load(requiredIdentity: identity) }
+        if CallStartSequencePolicy.mediaWaitsForRefresh { await refresh.value }
+        guard session.isCurrentSession(identity) else { return }
+        await startMedia(callID: callID, sessionIdentity: identity)
     }
 
     private func startMedia(callID: String, sessionIdentity identity: UUID?) async {

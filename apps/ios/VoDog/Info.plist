@@ -47,5 +47,7 @@
 	</array>
 	<key>VoDogDomain</key>
 	<string>$(VODOG_DOMAIN)</string>
+	<key>VoDogRelayDomain</key>
+	<string>$(VODOG_RELAY_DOMAIN)</string>
 </dict>
 </plist>
