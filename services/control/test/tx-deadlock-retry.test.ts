@@ -209,7 +209,7 @@ test('claimAiRun retries a deadlock victim on the preparing update', async () =>
     ['WHERE lease_owner=$1', []],
     ['SELECT run.* FROM ai_call_runs run', [{id: aiIds.runId}]],
     ["UPDATE ai_call_runs SET state='preparing'", [{...leased, state: 'preparing', mode_snapshot: 'ai', trigger_at: new Date()}]],
-  ], "UPDATE ai_call_runs SET state='preparing'");
+  ], "UPDATE ai_call_runs SET state='preparing'", [[') claimable', [{worker: true, claimable: true}]]]);
   const value = await claimAiRun(h.db, {enabled: true, instanceId: aiIds.instanceId, bootId: aiIds.bootId});
   assert.equal(value?.run.id, aiIds.runId);
   assert.equal(typeof value?.leaseToken, 'string');

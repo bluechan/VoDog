@@ -1,6 +1,7 @@
 import type {PoolClient,QueryResult} from 'pg';
 import {isEmergencyServiceNumber,phoneCandidateKeys,phoneDigitKey,smsAddress} from '../phone-address.js';
 import {blockedEntryFor as matchBlockedEntry,loadBlockedCandidates,type BlocklistScope} from '../blocklist.js';
+import {locateNumbers} from '../phone-location.js';
 
 type Queryable={query:(sql:string,params?:unknown[])=>Promise<QueryResult<any>>};
 
@@ -22,7 +23,7 @@ export type ImportEntry=ContactInput&{sourceContactId?:string|null};
 export type ContactDto={
  id:string;version:number;displayName:string;givenName:string|null;familyName:string|null;organization:string|null;notes:string|null;
  source:ContactSource;sourceDeviceId:string|null;sourceContactId:string|null;
- phones:{id:string;rawNumber:string;e164:string|null;canonicalKey:string;label:string|null;isPrimary:boolean;blocked:boolean;blockedEntryId:string|null}[];
+ phones:{id:string;rawNumber:string;e164:string|null;canonicalKey:string;label:string|null;isPrimary:boolean;blocked:boolean;blockedEntryId:string|null;location?:string}[];
  emails:{id:string;address:string;label:string|null}[];
  addresses:{id:string;formatted:string|null;label:string|null;street:string|null;city:string|null;region:string|null;postalCode:string|null;country:string|null}[];
  /** Contact level: true when any number is blocked; the entry id is the first blocked phone's. */
@@ -79,7 +80,7 @@ async function hydrate(db:Queryable,ownerUserId:string,rows:any[]):Promise<Conta
  if(!rows.length)return [];
  const ids=rows.map(row=>row.id);
  const [phones,emails,addresses]=await Promise.all([
-  db.query(`SELECT id,contact_id,raw_number,canonical_key,e164,label,is_primary FROM contact_phones WHERE contact_id=ANY($1::uuid[]) ORDER BY sort,id`,[ids]),
+  db.query(`SELECT id,contact_id,raw_number,canonical_key,e164,label,is_primary,location FROM contact_phones WHERE contact_id=ANY($1::uuid[]) ORDER BY sort,id`,[ids]),
   db.query(`SELECT id,contact_id,address,label FROM contact_emails WHERE contact_id=ANY($1::uuid[]) ORDER BY sort,id`,[ids]),
   db.query(`SELECT id,contact_id,formatted,label,street,city,region,postal_code,country FROM contact_addresses WHERE contact_id=ANY($1::uuid[]) ORDER BY sort,id`,[ids]),
  ]);
@@ -99,7 +100,7 @@ async function hydrate(db:Queryable,ownerUserId:string,rows:any[]):Promise<Conta
   const rowPhones=(phoneMap.get(row.id)??[]).map((phone:any)=>{
    const blockedEntryId=blockedEntryFor(phone.canonical_key);
    return {id:phone.id,rawNumber:phone.raw_number,e164:phone.e164??null,canonicalKey:phone.canonical_key,
-    label:phone.label??null,isPrimary:phone.is_primary===true,blocked:blockedEntryId!==null,blockedEntryId};
+    label:phone.label??null,isPrimary:phone.is_primary===true,blocked:blockedEntryId!==null,blockedEntryId,...(phone.location?{location:phone.location as string}:{})};
   });
   return {
    id:row.id,
@@ -164,7 +165,8 @@ export async function lookupContact(db:Queryable,ownerUserId:string,number:strin
 // DTO enrichment (S21 §A): page-driven, never the whole address book
 // ---------------------------------------------------------------------------
 
-export type NumberAnnotation={contactId:string|null;contactName:string|null;blocked:boolean;blockedEntryId:string|null};
+/** S96: `remoteLocation` is present only when the number resolves. */
+export type NumberAnnotation={contactId:string|null;contactName:string|null;blocked:boolean;blockedEntryId:string|null;remoteLocation?:string};
 export const EMPTY_NUMBER_ANNOTATION:NumberAnnotation={contactId:null,contactName:null,blocked:false,blockedEntryId:null};
 export type AnnotationTarget={remoteNumber:unknown;countryIso?:unknown};
 
@@ -180,13 +182,16 @@ export async function annotateNumbers(db:Queryable,ownerUserId:string,targets:An
  if(!targets.length)return [];
  let fallback:string|null=null;
  const perTarget:string[][]=[];
+ const isos:string[]=[];
  for(const target of targets){
   const iso=typeof target.countryIso==='string'&&target.countryIso?target.countryIso:(fallback??=await ownerCountryIso(db,ownerUserId));
+  isos.push(iso);
   perTarget.push(phoneCandidateKeys(target.remoteNumber,iso));
  }
  const union=[...new Set(perTarget.flat())];
+ // No keys means emergency or unparseable: such a number has no location either.
  if(!union.length)return targets.map(()=>({...EMPTY_NUMBER_ANNOTATION}));
- const [contacts,blocked]=await Promise.all([
+ const [contacts,blocked,located]=await Promise.all([
   db.query(
    `SELECT p.canonical_key,c.id,c.display_name,c.updated_at FROM contact_phones p
       JOIN contacts c ON c.id=p.contact_id AND c.deleted_at IS NULL
@@ -195,6 +200,7 @@ export async function annotateNumbers(db:Queryable,ownerUserId:string,targets:An
    [ownerUserId,union],
   ),
   scope===null?[]:loadBlockedCandidates(db,ownerUserId,scope,union),
+  locateNumbers(db,targets.flatMap((target,index)=>typeof target.remoteNumber==='string'?[{number:target.remoteNumber,countryIso:isos[index]}]:[])),
  ]);
  const contactByKey=new Map<string,{id:string;name:string;updatedAt:number}>();
  for(const row of contacts.rows){
@@ -203,20 +209,38 @@ export async function annotateNumbers(db:Queryable,ownerUserId:string,targets:An
   // Several contacts may share a number; the most recently updated one wins.
   if(!current||updatedAt>current.updatedAt)contactByKey.set(row.canonical_key,{id:row.id,name:row.display_name,updatedAt});
  }
- return perTarget.map(keys=>{
+ return perTarget.map((keys,index)=>{
   let contact:{id:string;name:string;updatedAt:number}|undefined;
   const blockedEntryId=keys.length&&blocked.length?matchBlockedEntry(blocked,keys):null;
   for(const key of keys){
    const hit=contactByKey.get(key);
    if(hit&&(!contact||hit.updatedAt>contact.updatedAt))contact=hit;
   }
-  return {contactId:contact?.id??null,contactName:contact?.name??null,blocked:blockedEntryId!==null,blockedEntryId};
+  const remote=targets[index]!.remoteNumber;
+  const remoteLocation=typeof remote==='string'?located.get(remote):undefined;
+  return {contactId:contact?.id??null,contactName:contact?.name??null,blocked:blockedEntryId!==null,blockedEntryId,...(remoteLocation?{remoteLocation}:{})};
  });
 }
 
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
+
+/** S96: E.164 when known (unambiguous), else the raw number read with the owner country. */
+const phoneLocationNumber=(phone:{e164:string|null;rawNumber:string})=>phone.e164??phone.rawNumber;
+
+/**
+ * S96 lookup on a transaction client. `locateNumbers` swallows its own errors, but a failed statement
+ * has already aborted the transaction, so the savepoint keeps the contact write itself alive.
+ */
+async function locatePhonesInTx(c:PoolClient,phones:{e164:string|null;rawNumber:string}[],countryIso:string):Promise<Map<string,string>>{
+ if(!phones.length)return new Map();
+ await c.query('SAVEPOINT phone_location');
+ const located=await locateNumbers(c,phones.map(phone=>({number:phoneLocationNumber(phone),countryIso})));
+ try{await c.query('RELEASE SAVEPOINT phone_location');}
+ catch{await c.query('ROLLBACK TO SAVEPOINT phone_location');await c.query('RELEASE SAVEPOINT phone_location');return new Map();}
+ return located;
+}
 
 async function writeChildren(c:PoolClient,contactId:string,ownerUserId:string,input:ContactInput,countryIso:string,mode:'replace'|'merge'){
  let phonesSkipped=0;
@@ -238,11 +262,12 @@ async function writeChildren(c:PoolClient,contactId:string,ownerUserId:string,in
   ? Number((await c.query(`SELECT count(*)::int n FROM contact_phones WHERE contact_id=$1`,[contactId])).rows[0].n)
   : 0;
  let sort=existingCount;
+ const located=await locatePhonesInTx(c,phones,countryIso);
  for(const phone of phones){
   await c.query(
-   `INSERT INTO contact_phones(contact_id,owner_user_id,raw_number,canonical_key,e164,label,is_primary,sort)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(contact_id,canonical_key) DO NOTHING`,
-   [contactId,ownerUserId,phone.rawNumber,phone.canonicalKey,phone.e164,phone.label,sort===0,sort],
+   `INSERT INTO contact_phones(contact_id,owner_user_id,raw_number,canonical_key,e164,label,is_primary,sort,location)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(contact_id,canonical_key) DO NOTHING`,
+   [contactId,ownerUserId,phone.rawNumber,phone.canonicalKey,phone.e164,phone.label,sort===0,sort,located.get(phoneLocationNumber(phone))??null],
   );
   sort++;
  }
@@ -326,10 +351,11 @@ export async function addContactPhone(c:PoolClient,ownerUserId:string,contactId:
  const phone=normalizePhone(input,countryIso);
  if(!phone)return {found:true,created:false,invalid:true};
  const sort=Number((await c.query(`SELECT count(*)::int n FROM contact_phones WHERE contact_id=$1`,[contactId])).rows[0].n);
+ const located=await locatePhonesInTx(c,[phone],countryIso);
  const inserted=await c.query(
-  `INSERT INTO contact_phones(contact_id,owner_user_id,raw_number,canonical_key,e164,label,is_primary,sort)
-   VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(contact_id,canonical_key) DO NOTHING RETURNING id`,
-  [contactId,ownerUserId,phone.rawNumber,phone.canonicalKey,phone.e164,phone.label,sort===0,sort],
+  `INSERT INTO contact_phones(contact_id,owner_user_id,raw_number,canonical_key,e164,label,is_primary,sort,location)
+   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(contact_id,canonical_key) DO NOTHING RETURNING id`,
+  [contactId,ownerUserId,phone.rawNumber,phone.canonicalKey,phone.e164,phone.label,sort===0,sort,located.get(phoneLocationNumber(phone))??null],
  );
  if(inserted.rowCount)await c.query(`UPDATE contacts SET version=version+1,updated_at=now() WHERE id=$1`,[contactId]);
  return {found:true,created:inserted.rowCount!==0};
@@ -429,4 +455,41 @@ export async function importContacts(
   summary.created++;
  }
  return summary;
+}
+
+/**
+ * S96: fill `contact_phones.location` for rows that predate the import (or did not resolve then).
+ * Keyset over `id` so an unresolvable number stays NULL without looping; next run retries it.
+ * Never touches `contacts.version`: the field is derived and must not trigger a 409.
+ */
+export async function backfillContactPhoneLocations(db:Queryable,log:(message:string)=>void){
+ const batch=200;
+ let cursor:string|null=null,updated=0;
+ const ownerIso=new Map<string,string>();
+ for(let page=0;page<100;page++){
+  const rows=(await db.query(
+   `SELECT id,owner_user_id,raw_number,e164 FROM contact_phones WHERE location IS NULL AND ($1::uuid IS NULL OR id>$1) ORDER BY id LIMIT $2`,
+   [cursor,batch],
+  )).rows as {id:string;owner_user_id:string;raw_number:string;e164:string|null}[];
+  if(!rows.length)break;
+  cursor=rows[rows.length-1]!.id;
+  const items:{number:string;countryIso:string}[]=[];
+  for(const row of rows){
+   if(!ownerIso.has(row.owner_user_id))ownerIso.set(row.owner_user_id,await ownerCountryIso(db,row.owner_user_id));
+   items.push({number:phoneLocationNumber({e164:row.e164,rawNumber:row.raw_number}),countryIso:ownerIso.get(row.owner_user_id)!});
+  }
+  const located=await locateNumbers(db,items);
+  const ids:string[]=[],locations:string[]=[];
+  rows.forEach((row,index)=>{const location=located.get(items[index]!.number);if(location){ids.push(row.id);locations.push(location);}});
+  if(ids.length){
+   const applied=await db.query(
+    `UPDATE contact_phones p SET location=v.location FROM unnest($1::uuid[],$2::text[]) v(id,location) WHERE p.id=v.id AND p.location IS NULL`,
+    [ids,locations],
+   );
+   updated+=applied.rowCount??0;
+  }
+  if(rows.length<batch)break;
+ }
+ if(updated)log(`backfilled ${updated} contact_phones.location rows`);
+ return updated;
 }

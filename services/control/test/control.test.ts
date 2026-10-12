@@ -1228,6 +1228,57 @@ test('S18 decision 1: the media close worker mirrors the mediaReady debounce and
   assert.deepEqual(await callState(bound),{state:'unknown',failure_reason:'gateway_media_unavailable'});
 });
 
+test('GATEWAY_ACTIVE_CALL_GRACE_SECONDS: an active call on a pinned node rides out a heartbeat gap; everything else is torn down at once',async()=>{
+  const g=(await db.query(`INSERT INTO gateways(name,control_enabled,telephony_ready,media_ready,last_seen_at)
+    VALUES('grace-worker',true,true,true,now()-interval '60 seconds')RETURNING id,device_epoch`)).rows[0];
+  const s=(await db.query(`INSERT INTO sims(gateway_id,slot_index,label)VALUES($1,0,'grace sim')RETURNING id`,[g.id])).rows[0].id;
+  await db.query(`INSERT INTO sim_settings(sim_id)VALUES($1)`,[s]);
+  const insertCall=async(state:'active'|'connecting',nodeId:string|null)=>(await db.query(`INSERT INTO call_records(gateway_id,sim_id,snapshot_owner_id,direction,state,generation,mode_snapshot,answered_at,media_node_id)
+    VALUES($1,$2,$3,'incoming',$4,$5,'normal',now(),$6)RETURNING id`,[g.id,s,user1,state,g.device_epoch,nodeId])).rows[0].id as string;
+  const off=await insertCall('active','relay-primary');
+  await new MediaCloseWorker(db,{close:async()=>undefined},{concurrency:4,gatewayOfflineSeconds:30}).tickOnce();
+  assert.deepEqual(await callState(off),{state:'unknown',failure_reason:'gateway_media_unavailable'},'flag at 0: offline teardown stays immediate');
+  const pinned=await insertCall('active','relay-primary'),unpinned=await insertCall('active',null),connecting=await insertCall('connecting','relay-primary');
+  const graced=new MediaCloseWorker(db,{close:async()=>undefined},{concurrency:4,gatewayOfflineSeconds:30,activeCallGraceSeconds:90});
+  await graced.tickOnce();
+  assert.deepEqual(await callState(pinned),{state:'active',failure_reason:null},'a 60 s gap is inside the 90 s grace');
+  assert.deepEqual(await callState(unpinned),{state:'unknown',failure_reason:'gateway_media_unavailable'});
+  assert.deepEqual(await callState(connecting),{state:'unknown',failure_reason:'gateway_media_unavailable'});
+  await db.query(`UPDATE gateways SET last_seen_at=now()-interval '91 seconds' WHERE id=$1`,[g.id]);
+  await graced.tickOnce();
+  assert.deepEqual(await callState(pinned),{state:'unknown',failure_reason:'gateway_media_unavailable'},'past the grace the call is torn down');
+  await db.query(`UPDATE gateways SET last_seen_at=now(),control_enabled=false WHERE id=$1`,[g.id]);
+  const shutdown=await insertCall('active','relay-primary');await graced.tickOnce();
+  assert.deepEqual(await callState(shutdown),{state:'unknown',failure_reason:'gateway_media_unavailable'},'a control shutdown never waits for the grace');
+});
+
+test('idle-path writes: a device credential is stamped at most once a minute and an idle heartbeat writes no SMS pacing row',async()=>{
+  const fixture=await gatewayFixture(user1,'idle-writes');
+  const credential=()=>db.query(`SELECT xmin::text xmin,last_used_at FROM device_credentials WHERE secret_hash=$1`,[tokenHash(fixture.deviceToken)]).then(q=>q.rows[0]);
+  const beat=()=>app.inject({method:'POST',url:'/api/v1/gateway/heartbeat',headers:auth(fixture.deviceToken),payload:{controlEnabled:true,reportedSequence:0,capabilities:{telephonyReady:true,smsReady:true,mediaReady:true}}});
+  assert.equal((await beat()).statusCode,200);
+  const first=await credential();assert.ok(first.last_used_at,'the first request stamps the credential');
+  assert.equal((await beat()).statusCode,200);
+  assert.deepEqual(await credential(),first,'a second request within 60 s leaves the row unwritten');
+  assert.equal((await db.query(`SELECT count(*)::int n FROM gateway_sms_pacing WHERE gateway_id=$1`,[fixture.gatewayId])).rows[0].n,0,'nothing queued: releaseSms wrote nothing');
+  await db.query(`UPDATE device_credentials SET last_used_at=now()-interval '61 seconds' WHERE secret_hash=$1`,[tokenHash(fixture.deviceToken)]);
+  assert.equal((await beat()).statusCode,200);
+  assert.ok(Date.now()-new Date((await credential()).last_used_at).getTime()<10_000,'past a minute the request stamps it again');
+  const sms=await app.inject({method:'POST',url:'/api/v1/sms/outbound',headers:{...auth(token1),'idempotency-key':'idle-writes-sms'},payload:{simId:fixture.simId,remoteNumber:'+15556099',body:'released at once'}});
+  assert.equal(sms.statusCode,202,sms.body);assert.ok(sms.json().command?.id,'a queued SMS still releases immediately');
+  const delivered=await beat();assert.ok(delivered.json().commands.some((item:any)=>item.id===sms.json().command.id));
+  assert.ok((await db.query(`SELECT first_delivery_at FROM sms_dispatch_queue WHERE command_id=$1`,[sms.json().command.id])).rows[0].first_delivery_at);
+  await db.query(`UPDATE device_credentials SET revoked_at=now() WHERE secret_hash=$1`,[tokenHash(fixture.deviceToken)]);
+  assert.equal((await beat()).statusCode,401,'a revoked credential is still refused');
+});
+
+test('the hot idle-path partial indexes exist after the schema is applied',async()=>{
+  const q=await db.query(`SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' AND indexname IN ('commands_pending_idx','call_records_live_idx') ORDER BY indexname`);
+  assert.deepEqual(q.rows.map(row=>row.indexname),['call_records_live_idx','commands_pending_idx']);
+  assert.match(q.rows[0].indexdef,/\(gateway_id\) WHERE .*ending.*ended.*failed.*unknown/);
+  assert.match(q.rows[1].indexdef,/\(gateway_id, kind, sequence\) WHERE \(status = 'pending'::text\)/);
+});
+
 test('expired current-epoch call commands are delivered only for journal reconciliation before idle snapshot cleanup',async()=>{
   const fixture=await gatewayFixture(user1,'expired-call-reconciliation');
   const userToken=await login('one@example.test','correct horse battery staple');
@@ -1903,6 +1954,8 @@ test('S36 C4: mp3 export transcodes once, caches the result and serves it as aud
   const binDir=await mkdtemp(join(tmpdir(),'cc-control-ffmpeg-'));const spawns=join(binDir,'spawns');
   // The output path is ffmpeg's last argument (a file, so the Xing/VBR header can be written).
   await writeFile(join(binDir,'ffmpeg'),`#!/bin/sh\necho spawn >> ${spawns}\nfor a; do :; done\nexec /bin/cat > "$a"\n`,{mode:0o755});
+  // S100: ffmpeg runs as `nice -n 19 ffmpeg …`; this stand-in nice logs its argv and execs the rest from PATH.
+  await writeFile(join(binDir,'nice'),`#!/bin/sh\nprintf '%s\\n' "$*" >> ${join(binDir,'nice.log')}\nshift 2\nexec "$@"\n`,{mode:0o755});
   const cacheDir=join(root,'mp3-cache');
   const originalPath=process.env.PATH;
   process.env.PATH=binDir;
@@ -1920,11 +1973,17 @@ test('S36 C4: mp3 export transcodes once, caches the result and serves it as aud
     assert.equal(second.statusCode,200,second.body);assert.deepEqual(second.rawPayload,audio);
     assert.equal((await readFile(spawns,'utf8')).trim().split('\n').length,1,'the cached file is served without spawning ffmpeg again');
     assert.equal((await readFile(join(cacheDir,`${call.id}-media_node-remote_original.mp3`))).length,audio.length);
+    const niced=(await readFile(join(binDir,'nice.log'),'utf8')).trim().split('\n');
+    assert.equal(niced.length,1);assert.match(niced[0],/^-n 19 ffmpeg .*-codec:a libmp3lame -threads 1 /);
     const stranger=await mp3App.inject({method:'GET',url,headers:auth(token2)});assert.equal(stranger.statusCode,404);
     // No ffmpeg on PATH keeps the documented 501 instead of a truncated download.
     process.env.PATH=join(binDir,'absent');
     const missing=await mp3App.inject({method:'GET',url:`/api/v1/calls/${call.id}/recordings/caller_original?disposition=attachment&format=mp3`,headers:auth(token1)});
     assert.equal(missing.statusCode,501,missing.body);assert.equal(missing.json().error.code,'RECORDING_TRANSCODE_UNAVAILABLE');
+    // nice present but ffmpeg absent is nice's exit 127, still the documented 501.
+    process.env.PATH=binDir;await rm(join(binDir,'ffmpeg'));
+    const noFfmpeg=await mp3App.inject({method:'GET',url:`/api/v1/calls/${call.id}/recordings/caller_original?disposition=attachment&format=mp3`,headers:auth(token1)});
+    assert.equal(noFfmpeg.statusCode,501,noFfmpeg.body);assert.equal(noFfmpeg.json().error.code,'RECORDING_TRANSCODE_UNAVAILABLE');
   }finally{
     process.env.PATH=originalPath;
     await mp3App.close();await rm(root,{recursive:true,force:true});await rm(binDir,{recursive:true,force:true});
@@ -1936,6 +1995,8 @@ test('S36 C4: the conversation export mixes both tracks and delays whichever one
   // A stand-in ffmpeg that records its arguments and writes the output file named by the last one.
   const binDir=await mkdtemp(join(tmpdir(),'cc-control-mixer-'));const args=join(binDir,'args'),probes=join(binDir,'probes');
   await writeFile(join(binDir,'ffmpeg'),`#!/bin/sh\nprintf '%s\\n' "$*" >> ${args}\nfor last do :; done\nprintf mixed > "$last"\n`,{mode:0o755});
+  // S100: ffmpeg runs as `nice -n 19 ffmpeg …`; this stand-in nice logs its argv and execs the rest from PATH.
+  await writeFile(join(binDir,'nice'),`#!/bin/sh\nprintf '%s\\n' "$*" >> ${join(binDir,'nice.log')}\nshift 2\nexec "$@"\n`,{mode:0o755});
   // A stand-in ffprobe: the spooled tracks are 0.100 s (caller) and 0.300 s (remote).
   await writeFile(join(binDir,'ffprobe'),`#!/bin/sh\nfor last do :; done\nprintf '%s\\n' "$last" >> ${probes}\ncase "$last" in\n*.caller) printf '0.100\\n';;\n*.remote) printf '0.300\\n';;\nesac\n`,{mode:0o755});
   const makeCall=async(timeline:string,caller=Buffer.from('OggS-caller'.padEnd(48,'.')))=>{
@@ -1975,6 +2036,9 @@ test('S36 C4: the conversation export mixes both tracks and delays whichever one
     assert.match(invocations[1],/-i \S+\.caller -i \S+\.remote -filter_complex \[0:a\]adelay=200:all=1\[d\];\[d\]\[1:a\]amix=inputs=2:duration=longest:normalize=0 /);
     // Only the call without usable receive times is measured: the timeline stays the first source.
     assert.equal((await readFile(probes,'utf8')).trim().split('\n').length,2);
+    const niced=(await readFile(join(binDir,'nice.log'),'utf8')).trim().split('\n');
+    assert.deepEqual(niced.map(line=>line.split(' ').slice(0,3).join(' ')).sort(),['-n 19 ffmpeg','-n 19 ffmpeg','-n 19 ffprobe','-n 19 ffprobe']);
+    assert.ok(niced.filter(line=>line.includes(' ffmpeg ')).every(line=>line.includes('-codec:a libmp3lame -threads 1 ')));
     const silent=await mixApp.inject({method:'GET',url:url(empty),headers:auth(token1)});
     assert.equal(silent.statusCode,404,silent.body);assert.equal(silent.json().error.code,'NOT_FOUND');
     const stranger=await mixApp.inject({method:'GET',url:url(aligned),headers:auth(token2)});assert.equal(stranger.statusCode,404);
@@ -2138,6 +2202,73 @@ test('admin pairing code is one-time and rotates device epoch',async()=>{
   const changed=await app.inject({method:'POST',url:'/api/v1/gateway/sims/sync',headers:auth(pair.json().deviceToken),payload:{items:[{slotIndex:0,subscriptionId:8,phoneAccountHandle:'phone-account-8',iccidFingerprint:'device-protected-fingerprint-b'}]}});assert.equal(changed.statusCode,200,changed.body);assert.notEqual(changed.json().items[0].id,synced.json().items[0].id);assert.equal(changed.json().items[0].needsOwnerAssignment,true);
   const adminSims=await app.inject({method:'GET',url:'/api/v1/admin/sims',headers:auth(adminToken)});assert.equal(adminSims.statusCode,200);assert.ok(adminSims.json().items.some((x:any)=>x.gatewayId===gid&&x.ownerUserId===null));
   const replay=await app.inject({method:'POST',url:'/api/v1/gateway/pair',payload:{code,label:'Pixel'}});assert.equal(replay.statusCode,400);assert.equal(replay.json().error.code,'PAIRING_CODE_INVALID');
+});
+
+test('S130: pairing binds a module to its gateway row and refuses the wrong module without side effects',async()=>{
+  const hex=()=>Array.from({length:16},()=>'0123456789abcdef'[Math.floor(Math.random()*16)]).join('');
+  const keyA=hex(),keyB=hex(),keyC=hex();
+  const mkGateway=async(name:string)=>{const g=await app.inject({method:'POST',url:'/api/v1/admin/gateways',headers:auth(adminToken),payload:{name}});assert.equal(g.statusCode,201,g.body);return g.json().gateway.id as string;};
+  const mkCode=async(gid:string,replaceModule?:boolean)=>{const c=await app.inject({method:'POST',url:`/api/v1/admin/gateways/${gid}/pairing-codes`,headers:auth(adminToken),...(replaceModule===undefined?{}:{payload:{replaceModule}})});assert.equal(c.statusCode,201,c.body);return c.json().pairingCode.code as string;};
+  const pair=(code:string,extra:Record<string,unknown>={})=>app.inject({method:'POST',url:'/api/v1/gateway/pair',payload:{code,label:'CellDock',...extra}});
+  const row=async(gid:string)=>(await db.query(`SELECT module_key,module_label,device_epoch FROM gateways WHERE id=$1`,[gid])).rows[0];
+  const liveCreds=async(gid:string)=>(await db.query(`SELECT count(*)::int n FROM device_credentials WHERE gateway_id=$1 AND revoked_at IS NULL`,[gid])).rows[0].n;
+  const heartbeat=(token:string,extra:Record<string,unknown>={})=>app.inject({method:'POST',url:'/api/v1/gateway/heartbeat',headers:auth(token),payload:{controlEnabled:false,reportedSequence:0,capabilities:{telephonyReady:false,mediaReady:false},...extra}});
+
+  // Unbound row + moduleKey → bind; response and admin list carry only the label.
+  const gA=await mkGateway('s130-a');
+  const first=await pair(await mkCode(gA),{moduleKey:keyA,moduleLabel:'109525'});assert.equal(first.statusCode,201,first.body);
+  assert.equal(first.json().gateway.moduleLabel,'109525');
+  assert.deepEqual({...(await row(gA)),device_epoch:undefined},{module_key:keyA,module_label:'109525',device_epoch:undefined});
+  const list=await app.inject({method:'GET',url:'/api/v1/admin/gateways',headers:auth(adminToken)});const listed=list.json().items.find((x:any)=>x.id===gA);
+  assert.equal(listed.moduleLabel,'109525');assert.ok(!JSON.stringify(list.json()).includes(keyA),'module_key must never be listed');assert.ok(!('moduleKey' in listed));
+  assert.equal(list.json().items.find((x:any)=>x.name==='pair-test')?.moduleLabel,undefined);
+
+  // Same key re-pair succeeds.
+  const again=await pair(await mkCode(gA),{moduleKey:keyA,moduleLabel:'109525'});assert.equal(again.statusCode,201,again.body);
+  const epochBefore=Number((await row(gA)).device_epoch);assert.equal(await liveCreds(gA),1);
+
+  // Different key → 409 MODULE_MISMATCH; epoch, credentials and the code are untouched.
+  const code=await mkCode(gA);
+  const mismatch=await pair(code,{moduleKey:keyB,moduleLabel:'108507'});assert.equal(mismatch.statusCode,409,mismatch.body);
+  assert.equal(mismatch.json().error.code,'MODULE_MISMATCH');assert.equal(mismatch.json().error.boundModuleLabel,'109525');
+  // Bound row + no key → 409 MODULE_KEY_REQUIRED (old client cannot steal the row).
+  const noKey=await pair(code);assert.equal(noKey.statusCode,409,noKey.body);assert.equal(noKey.json().error.code,'MODULE_KEY_REQUIRED');assert.equal(noKey.json().error.boundModuleLabel,'109525');
+  assert.equal(Number((await row(gA)).device_epoch),epochBefore);assert.equal(await liveCreds(gA),1);assert.equal((await row(gA)).module_key,keyA);
+  // The same code still works for the right module.
+  const right=await pair(code,{moduleKey:keyA,moduleLabel:'109525'});assert.equal(right.statusCode,201,right.body);assert.equal(right.json().gateway.deviceEpoch,epochBefore+1);
+  const tokenA=right.json().deviceToken as string;
+
+  // Unbound row + no key behaves as today and stays unbound.
+  const gU=await mkGateway('s130-unbound');
+  const legacy=await pair(await mkCode(gU));assert.equal(legacy.statusCode,201,legacy.body);assert.equal(legacy.json().gateway.moduleLabel,undefined);assert.equal((await row(gU)).module_key,null);
+  // A module already bound to another row → 409 MODULE_BOUND_ELSEWHERE, nothing changes.
+  const uEpoch=Number((await row(gU)).device_epoch);
+  const elsewhere=await pair(await mkCode(gU),{moduleKey:keyA,moduleLabel:'109525'});assert.equal(elsewhere.statusCode,409,elsewhere.body);
+  assert.equal(elsewhere.json().error.code,'MODULE_BOUND_ELSEWHERE');assert.equal(elsewhere.json().error.boundGatewayName,'s130-a');
+  assert.equal(Number((await row(gU)).device_epoch),uEpoch);assert.equal((await row(gU)).module_key,null);
+
+  // replaceModule without a key → 409; with a key it releases the other row and rebinds this one.
+  const replaceCode=await mkCode(gU,true);
+  const replaceNoKey=await pair(replaceCode);assert.equal(replaceNoKey.statusCode,409,replaceNoKey.body);assert.equal(replaceNoKey.json().error.code,'MODULE_KEY_REQUIRED');
+  assert.equal(Number((await row(gU)).device_epoch),uEpoch);
+  const replaced=await pair(replaceCode,{moduleKey:keyA,moduleLabel:'109525'});assert.equal(replaced.statusCode,201,replaced.body);assert.equal(replaced.json().gateway.moduleLabel,'109525');
+  assert.equal((await row(gU)).module_key,keyA);assert.equal((await row(gA)).module_key,null);assert.equal((await row(gA)).module_label,null);
+  const audits=(await db.query(`SELECT action,resource_id FROM audit_events WHERE action IN ('gateway.module.released','gateway.module.bound','gateway.pairing_code.create') AND resource_id=ANY($1::uuid[])`,[[gA,gU]])).rows;
+  assert.ok(audits.some(a=>a.action==='gateway.module.released'&&a.resource_id===gA));assert.ok(audits.some(a=>a.action==='gateway.module.bound'&&a.resource_id===gU));
+  assert.ok((await db.query(`SELECT 1 FROM audit_events WHERE action='gateway.pairing_code.create' AND resource_id=$1 AND details->>'replaceModule'='true'`,[gU])).rowCount);
+  // replaceModule overrides the row's own existing binding too.
+  const swap=await pair(await mkCode(gU,true),{moduleKey:keyB,moduleLabel:'108507'});assert.equal(swap.statusCode,201,swap.body);assert.equal((await row(gU)).module_key,keyB);
+
+  // Heartbeat backfills an unbound row (gA was released above) — but never steals a key bound elsewhere.
+  const steal=await heartbeat(tokenA,{moduleKey:keyB,moduleLabel:'108507'});assert.equal(steal.statusCode,200,steal.body);assert.equal((await row(gA)).module_key,null);
+  const fill=await heartbeat(tokenA,{moduleKey:keyC,moduleLabel:'104962'});assert.equal(fill.statusCode,200,fill.body);
+  assert.deepEqual([(await row(gA)).module_key,(await row(gA)).module_label],[keyC,'104962']);
+  // Mismatch on heartbeat: no rejection, no change, a diagnostic row.
+  const mism=await heartbeat(tokenA,{moduleKey:keyA,moduleLabel:'109525'});assert.equal(mism.statusCode,200,mism.body);assert.equal((await row(gA)).module_key,keyC);
+  let diagRows:any[]=[];for(let i=0;i<40&&!diagRows.length;i++){diagRows=(await db.query(`SELECT fields FROM diag_events WHERE event='gateway.module_mismatch' AND fields->>'gatewayId'=$1`,[gA])).rows;if(!diagRows.length)await new Promise(r=>setTimeout(r,50));}
+  assert.equal(diagRows.length,1);assert.equal(diagRows[0].fields.boundModuleLabel,'104962');assert.equal(diagRows[0].fields.reportedModuleLabel,'109525');
+  // A malformed module field never fails a heartbeat.
+  const bad=await heartbeat(tokenA,{moduleKey:'NOT-HEX',moduleLabel:'x'});assert.equal(bad.statusCode,200,bad.body);
 });
 
 test('SIM snapshot rejects duplicate slots, disables omitted profiles, and isolates a replacement identity',async()=>{
@@ -2586,4 +2717,36 @@ test('ending an outgoing call whose dial was delivered keeps the hangup path unc
   assert.equal((await db.query(`SELECT status,expires_at>now() live FROM commands WHERE id=$1`,[dialId])).rows[0].live,true);
   assert.equal((await db.query(`SELECT 1 FROM gateway_call_locks WHERE call_id=$1`,[callId])).rowCount,1);
   await db.query(`DELETE FROM media_close_jobs WHERE call_id=$1`,[callId]);
+});
+
+test('S131: an admin renames a gateway (trimmed, case-insensitive unique, audited) and every read path shows the new name',async()=>{
+  const rename=(gid:string,payload:unknown,token=adminToken)=>app.inject({method:'PATCH',url:`/api/v1/admin/gateways/${gid}`,headers:auth(token),payload:payload as any});
+  const userToken=await login('one@example.test','correct horse battery staple'); // token1 may be revoked by earlier tests
+  const other=(await db.query(`INSERT INTO gateways(name)VALUES('S131 Other')RETURNING id`)).rows[0].id;
+  try{
+    const ok=await rename(gateway,{name:'  S131 Kitchen  '});
+    assert.equal(ok.statusCode,200,ok.body);
+    const listed=(await app.inject({method:'GET',url:'/api/v1/admin/gateways',headers:auth(adminToken)})).json().items.find((g:any)=>g.id===gateway);
+    assert.deepEqual(ok.json().gateway,listed,'PATCH returns one item of GET /admin/gateways');
+    assert.equal(listed.name,'S131 Kitchen');
+    const audit=(await db.query(`SELECT actor_user_id,details FROM audit_events WHERE action='gateway.rename' AND resource_id=$1`,[gateway])).rows;
+    assert.equal(audit.length,1);assert.equal(audit[0].actor_user_id,admin);assert.deepEqual(audit[0].details,{oldName:'real-test-gateway',newName:'S131 Kitchen'});
+    const same=await rename(gateway,{name:'S131 Kitchen'});assert.equal(same.statusCode,200,same.body);
+    assert.equal((await db.query(`SELECT 1 FROM audit_events WHERE action='gateway.rename' AND resource_id=$1`,[gateway])).rowCount,1,'same-name rename is a no-op');
+    const taken=await rename(gateway,{name:' s131 other '});assert.equal(taken.statusCode,409,taken.body);assert.equal(taken.json().error.code,'GATEWAY_NAME_TAKEN');
+    for(const name of ['','   ','x'.repeat(121)]){const bad=await rename(gateway,{name});assert.equal(bad.statusCode,400,bad.body);}
+    assert.equal((await rename(gateway,{})).statusCode,400);
+    assert.equal((await rename(crypto.randomUUID(),{name:'Ghost'})).statusCode,404);
+    const forbidden=await rename(gateway,{name:'Hijack'},userToken);assert.equal(forbidden.statusCode,403,forbidden.body);
+    assert.equal((await db.query(`SELECT name FROM gateways WHERE id=$1`,[gateway])).rows[0].name,'S131 Kitchen');
+    const sims=await app.inject({method:'GET',url:'/api/v1/sims',headers:auth(userToken)});
+    const onGateway=sims.json().items.filter((s:any)=>s.gatewayId===gateway);assert.ok(onGateway.length>0,sims.body);assert.ok(onGateway.every((s:any)=>s.gatewayName==='S131 Kitchen'));
+    const power=await app.inject({method:'GET',url:'/api/v1/gateways/power',headers:auth(userToken)});assert.equal(power.statusCode,200,power.body);
+    assert.equal(power.json().items.find((g:any)=>g.gatewayId===gateway).name,'S131 Kitchen');
+    const hb=await app.inject({method:'POST',url:'/api/v1/gateway/heartbeat',headers:auth(deviceToken),payload:{controlEnabled:true,reportedSequence:0,capabilities:{telephonyReady:true,mediaReady:true}}});
+    assert.equal(hb.statusCode,200,hb.body);assert.equal((await db.query(`SELECT name FROM gateways WHERE id=$1`,[gateway])).rows[0].name,'S131 Kitchen','heartbeat never overwrites the name');
+  }finally{
+    await db.query(`UPDATE gateways SET name='real-test-gateway' WHERE id=$1`,[gateway]);
+    await db.query(`DELETE FROM gateways WHERE id=$1`,[other]);
+  }
 });

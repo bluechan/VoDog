@@ -32,6 +32,11 @@ async function endedCall(endedAt:string,status='ready'){
   return (await db.query(`INSERT INTO call_records(gateway_id,sim_id,snapshot_owner_id,direction,state,generation,mode_snapshot,ended_at,recording_status,media_node_id,media_epoch)
     VALUES($1,$2,$3,'incoming','ended',1,'normal',$4,$5,'relay-secondary',7) RETURNING id`,[gatewayId,simId,ownerId,endedAt,status])).rows[0].id as string;
 }
+// A Pixel archive always hangs off a capture binding (S118 sweeps pending calls without one).
+async function bind(callId:string){
+  await db.query(`INSERT INTO recording_capture_bindings(call_id,gateway_id,snapshot_owner_id,device_call_id,telecom_creation_time_millis,capture_generation,media_node_id,media_epoch)
+    VALUES($1,$2,$3,$4,1,1,'gz',7)`,[callId,gatewayId,ownerId,callId]);
+}
 function recording(callId:string):{manifest:RecordingManifest;source:RecordingSource}{
   const remote=Buffer.from('OggSremote'.padEnd(256,'.')),caller=Buffer.from('OggScaller'.padEnd(256,'.')),timeline=Buffer.from('{}\n');
   const artifact=(name:string,value:Buffer)=>({name,bytes:value.length,sha256:createHash('sha256').update(value).digest('hex')});
@@ -218,7 +223,7 @@ test('the enqueue gate chooses the source once: a complete media copy, the AI tr
     [handover,recording(handover).manifest],[terminal,emptyMediaManifest(terminal)],[aiCall,emptyMediaManifest(aiCall)],
   ]);
   const pixelManifests=new Map<string,ReturnType<typeof emptyPixelDescriptor>>();
-  for(const id of [handover,terminal,aiCall])pixelManifests.set(id,emptyPixelDescriptor(id));
+  for(const id of [handover,terminal,aiCall]){pixelManifests.set(id,emptyPixelDescriptor(id));await bind(id);}
   const runId=(await db.query(`INSERT INTO ai_call_runs(call_id,gateway_id,snapshot_owner_id,device_generation,media_epoch,mode_snapshot,
       settings_version_snapshot,assignment_version_snapshot,timeout_seconds_snapshot,trigger_at)
     VALUES($1,$2,$3,1,7,'ai',1,1,45,now()) RETURNING id`,[aiCall,gatewayId,ownerId])).rows[0].id;
@@ -245,6 +250,7 @@ test('a Pixel capture that is still uploading or still holds audio is never writ
   const uploading=await endedCall('2026-09-09T04:00:01.000Z','pending');
   const partial=await endedCall('2026-09-09T04:00:02.000Z','pending');
   const finalizing=await endedCall('2026-09-09T04:00:03.000Z','pending');
+  for(const id of [uploading,partial,finalizing])await bind(id);
   const pixelManifests=new Map<string,any>([
     [uploading,{...emptyPixelDescriptor(uploading),archiveComplete:false}],
     [partial,{...emptyPixelDescriptor(partial),tracks:emptyPixelDescriptor(partial).tracks.map(track=>({...track,bytes:64_000}))}],
@@ -261,4 +267,19 @@ test('a Pixel capture that is still uploading or still holds audio is never writ
   // Only the partial capture has audio worth transcribing; the other two are retried next scan.
   assert.deepEqual(enqueued.map(item=>item.callId),[partial]);
   assert.equal((await db.query(`SELECT count(*)::int n FROM transcript_jobs WHERE call_id IN($1,$2)`,[uploading,finalizing])).rows[0].n,0);
+});
+
+test('S118: an ended pending call the gateway never bound is settled to no recording after 10 min, only with the Pixel archive on',async()=>{
+  const ago=(minutes:number)=>new Date(Date.now()-minutes*60_000).toISOString();
+  const unbound=await endedCall(ago(11),'pending'),fresh=await endedCall(ago(1),'pending');
+  const bound=await endedCall(ago(11),'pending');await bind(bound);
+  const internal=await endedCall(ago(11),'pending');await db.query(`UPDATE call_records SET internal_call=true WHERE id=$1`,[internal]);
+  const status=async(id:string)=>(await db.query(`SELECT recording_status FROM call_records WHERE id=$1`,[id])).rows[0].recording_status;
+  const options={enabled:true,db,scanBatch:10,enabledAt:new Date('2099-01-01T00:00:00.000Z'),
+    worker:{enqueueCall:async()=>{throw new Error('unused');},tickOnce:async()=>'idle'},
+    resolveSource:()=>({manifest:async()=>null,openTrack:async()=>{throw new Error('unused');}}) as any};
+  await new TranscriptionRuntime(options).tickOnce();
+  assert.equal(await status(unbound),'pending');
+  await new TranscriptionRuntime({...options,pixelSource:{manifest:async()=>null,openTrack:async()=>{throw new Error('unused');}} as any}).tickOnce();
+  assert.deepEqual([await status(unbound),await status(fresh),await status(bound),await status(internal)],['none','pending','pending','pending']);
 });

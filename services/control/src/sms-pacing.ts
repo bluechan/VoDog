@@ -3,6 +3,12 @@ import {smsFailed} from './diag.js';
 
 /** Caller holds the gateway row lock. No timer or process-local state is authoritative. */
 export async function releaseSms(c:PoolClient,gatewayId:string,onlineSeconds:number) {
+  // Idle heartbeat: nothing queued, nothing in flight and no pre-S48 command to adopt means every
+  // statement below would match nothing, so one read replaces them (the pacing row is created on demand).
+  const work=(await c.query(`SELECT EXISTS(SELECT 1 FROM sms_dispatch_queue WHERE gateway_id=$1 AND released_at IS NULL)
+      OR EXISTS(SELECT 1 FROM gateway_sms_pacing WHERE gateway_id=$1 AND command_id IS NOT NULL)
+      OR EXISTS(SELECT 1 FROM commands WHERE gateway_id=$1 AND kind='send_sms' AND status='pending' AND sms_execution_observed_at IS NULL) busy`,[gatewayId])).rows[0];
+  if(!work.busy)return null;
   const g=(await c.query(`SELECT *,last_seen_at>clock_timestamp()-$2*interval '1 second' online FROM gateways WHERE id=$1 FOR UPDATE`,[gatewayId,onlineSeconds])).rows[0];
   await c.query(`INSERT INTO gateway_sms_pacing(gateway_id) VALUES($1) ON CONFLICT DO NOTHING`,[gatewayId]);
   const pace=(await c.query(`SELECT *,next_release_at<=clock_timestamp() due FROM gateway_sms_pacing WHERE gateway_id=$1`,[gatewayId])).rows[0];

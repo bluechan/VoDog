@@ -3,16 +3,13 @@ ALTER TABLE push_registrations ADD COLUMN IF NOT EXISTS platform text NOT NULL D
 ALTER TABLE push_registrations ADD COLUMN IF NOT EXISTS package_name text;
 ALTER TABLE push_registrations ADD COLUMN IF NOT EXISTS fcm_token text;
 ALTER TABLE push_registrations ALTER COLUMN environment DROP NOT NULL;
-DO $android_push_registration_constraints$
-BEGIN
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='push_registrations_platform_shape') THEN
-  ALTER TABLE push_registrations ADD CONSTRAINT push_registrations_platform_shape CHECK(
-   (platform='ios' AND environment IS NOT NULL AND package_name IS NULL AND fcm_token IS NULL)
-   OR
-   (platform='android' AND environment IS NULL AND package_name='org.vodog' AND apns_token IS NULL AND voip_token IS NULL)
-  );
- END IF;
-END $android_push_registration_constraints$;
+-- S104: rebuilt by name so an existing constraint picks up the watchos branch.
+ALTER TABLE push_registrations DROP CONSTRAINT IF EXISTS push_registrations_platform_shape;
+ALTER TABLE push_registrations ADD CONSTRAINT push_registrations_platform_shape CHECK (
+  (platform = 'ios' AND environment IS NOT NULL AND package_name IS NULL AND fcm_token IS NULL)
+  OR (platform = 'android' AND environment IS NULL AND package_name = 'org.vodog' AND apns_token IS NULL AND voip_token IS NULL)
+  OR (platform = 'watchos' AND environment IS NOT NULL AND package_name IS NULL AND fcm_token IS NULL)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS push_registrations_fcm_token_unique ON push_registrations(fcm_token) WHERE fcm_token IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS android_push_deliveries (

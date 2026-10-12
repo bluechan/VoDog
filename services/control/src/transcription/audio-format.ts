@@ -47,6 +47,29 @@ export function noVoiceEvidence(bytes: Buffer, mediaType: string, version: numbe
   return {reason: 'no_voice_activity', detector: 'pcm16_voiced_run_v1', sampleCount, durationMs: sampleCount / 16, longestVoicedMs: longest * 20};
 }
 
+/** S128: the window at the end of the caller-side track that decides whether the AI was still audible at hangup. */
+export const TAIL_WINDOW_MS = 500;
+
+/**
+ * S128: true when the last 500 ms of a canonical Pixel WAV hold ≥160 ms of voiced frames (the S78 thresholds:
+ * 20 ms frames above -50 dBFS, `MIN_VOICED_RUN_MS` in total). Measured 2026-10-10 on the caller-side track: an AI that hangs up itself leaves
+ * ≥0.9 s of digital silence (the Voice worker's end tail), a caller who cuts the AI off leaves speech at about
+ * -20 dBFS inside the window (681fa2ad: 300 ms of speech, then 200 ms at -73). The frames are counted, not required to be contiguous: a 20 ms
+ * dip inside 300 ms of speech must not hide it, and a lone click (≤100 ms) still falls short.
+ * Frames are counted back from the last sample; a track shorter than the window is judged on what it has.
+ * Call only on bytes that passed `validTranscriptionAudio`.
+ */
+export function tailVoiceActive(bytes: Buffer): boolean {
+  const frameBytes = VOICE_FRAME_SAMPLES * 2, needFrames = MIN_VOICED_RUN_MS / 20;
+  let voiced = 0;
+  for (let frame = bytes.length - frameBytes, left = TAIL_WINDOW_MS / 20; frame >= 44 && left > 0; frame -= frameBytes, left--) {
+    let energy = 0;
+    for (let offset = frame; offset < frame + frameBytes; offset += 2) { const sample = bytes.readInt16LE(offset); energy += sample * sample; }
+    if (energy > VOICE_FRAME_ENERGY && ++voiced >= needFrames) return true;
+  }
+  return false;
+}
+
 /** Proof of digital silence, not a voice/volume threshold. Call only after verifying the source SHA. */
 export function allZeroPcmEvidence(bytes: Buffer, mediaType: string, version: number): AllZeroPcmEvidence | null {
   if (mediaType !== 'audio/wav' || !validTranscriptionAudio(bytes, mediaType, version) || bytes.length === 44) return null;

@@ -4,6 +4,8 @@ import {z} from 'zod';
 import {annotateNumbers, normalizeContactName} from '../contacts/repository.js';
 import {pageEnvelope, pageOffset, pageQueryShape} from '../pagination.js';
 import {PENDING_CALL,visibleCall} from '../badges.js';
+import {readAiTranscriptLines} from '../ai-runs/transcripts.js';
+import {buildDialog} from './dialog.js';
 
 type UserIdentity = {userId: string; sessionId?: string};
 type WindowResult = {fromInclusive: Date; toExclusive: Date; period: string; timeZone: string; disambiguation: string};
@@ -35,12 +37,21 @@ export function registerTranscriptionRoutes(app: FastifyInstance, db: Pool, depe
   app.get('/api/v1/calls/:id/transcript', async (request, reply) => {
     const identity = dependencies.requireUser(request);
     const {id} = z.object({id: z.uuid()}).parse(request.params);
-    const call = await db.query('SELECT 1 FROM call_records WHERE id=$1 AND snapshot_owner_id=$2', [id, identity.userId]);
+    // S128: `owner_joined_local` is the same S94 fact the report rows carry; it keeps the read-time marker off a taken-over call.
+    const call = await db.query(`SELECT c.answered_by_platform,c.answered_at,
+      EXISTS(SELECT 1 FROM ai_call_runs r WHERE r.id=c.ai_run_id AND r.failure_code='owner_joined') owner_joined_local
+      FROM call_records c WHERE c.id=$1 AND c.snapshot_owner_id=$2`, [id, identity.userId]);
     if (!call.rowCount) dependencies.fail(404, 'NOT_FOUND', 'Call not found');
     const job = await db.query(`SELECT * FROM transcript_jobs WHERE call_id=$1 AND snapshot_owner_id=$2
       ORDER BY created_at DESC,id DESC LIMIT 1`, [id, identity.userId]);
     reply.header('Cache-Control', 'private, no-store');
-    return {transcript: job.rowCount ? transcriptDto(job.rows[0]) : null};
+    if (!job.rowCount) return {transcript: null};
+    // S101: a read-only conversation view next to the untouched stored result.
+    const row = job.rows[0], {answered_by_platform: answeredBy, answered_at: answeredAt, owner_joined_local: ownerJoined} = call.rows[0];
+    const dialog = row.state === 'succeeded' ? buildDialog({result: row.result, manifest: row.manifest,
+      call: {answeredBy, answeredAt, ownerJoinedLocal: ownerJoined === true},
+      aiLines: answeredBy === 'ai' ? await readAiTranscriptLines(db, {callId: id, snapshotOwnerId: identity.userId}) : []}) : null;
+    return {transcript: {...transcriptDto(row), dialog}};
   });
 
   /**

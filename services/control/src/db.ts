@@ -7,6 +7,10 @@ export function createDb(connectionString: string): Db {
   return new pg.Pool({
     connectionString,
     max: 10,
+    // Keep a few connections warm across idle gaps so a ringing call never pays for a fresh
+    // Postgres handshake (pg-pool's default reaps every idle client after 10 s).
+    min: 3,
+    idleTimeoutMillis: 60_000,
     connectionTimeoutMillis: 5_000,
     query_timeout: 15_000,
     statement_timeout: 15_000,

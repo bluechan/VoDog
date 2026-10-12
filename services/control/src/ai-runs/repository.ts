@@ -105,6 +105,15 @@ export async function createAiRunForIncoming(c:PoolClient,input:{enabled:boolean
 
 export async function claimAiRun(db:Db,input:{enabled:boolean;instanceId:string;bootId:string;prewarmSeconds?:number}){
   if(!input.enabled)return null;
+  const prewarmSeconds=Math.min(60,Math.max(0,input.prewarmSeconds??30));
+  // An idle poll (4/s per worker) is one read-only statement, never a write transaction: the same
+  // worker and claimable predicates as below, without locks. A stale worker still gets its 409.
+  const probe=(await db.query(`SELECT EXISTS(SELECT 1 FROM ai_worker_instances WHERE instance_id=$1 AND boot_id=$2 AND protocol=$3 AND expires_at>now()) worker,
+      EXISTS(SELECT 1 FROM ai_call_runs run JOIN call_records call ON call.id=run.call_id
+        WHERE run.state='pending' AND run.attempts<3 AND COALESCE(run.next_attempt_at,run.trigger_at)<=now()+$4::int*interval '1 second'
+          AND call.state='incoming_ringing' AND call.ai_run_id=run.id) claimable`,[input.instanceId,input.bootId,AI_PROTOCOL,prewarmSeconds])).rows[0];
+  if(!probe.worker)throw new AiRunError(409,'AI_WORKER_STALE','Voice worker heartbeat is stale');
+  if(!probe.claimable)return null;
   // A retry mints a fresh lease token: only the attempt that commits hands one out.
   return tx(db,async c=>{
     const worker=await c.query(`SELECT 1 FROM ai_worker_instances WHERE instance_id=$1 AND boot_id=$2 AND protocol=$3 AND expires_at>now() FOR UPDATE`,[input.instanceId,input.bootId,AI_PROTOCOL]);
@@ -115,7 +124,7 @@ export async function claimAiRun(db:Db,input:{enabled:boolean;instanceId:string;
     const q=await c.query(`SELECT run.* FROM ai_call_runs run JOIN call_records call ON call.id=run.call_id
       WHERE run.state='pending' AND run.attempts<3 AND COALESCE(run.next_attempt_at,run.trigger_at)<=now()+$1::int*interval '1 second'
         AND call.state='incoming_ringing' AND call.ai_run_id=run.id
-      ORDER BY COALESCE(run.next_attempt_at,run.trigger_at),run.id FOR UPDATE OF run SKIP LOCKED LIMIT 1`,[Math.min(60,Math.max(0,input.prewarmSeconds??30))]);
+      ORDER BY COALESCE(run.next_attempt_at,run.trigger_at),run.id FOR UPDATE OF run SKIP LOCKED LIMIT 1`,[prewarmSeconds]);
     if(!q.rowCount)return null;
     const token=leaseToken(),row=(await c.query(`UPDATE ai_call_runs SET state='preparing',attempts=attempts+1,
       lease_owner=$2,lease_boot_id=$3,lease_hash=$4,lease_until=now()+$5::int*interval '1 second',updated_at=now()
@@ -134,16 +143,51 @@ export async function renewAiLease(db:Queryable,input:{runId:string;instanceId:s
   return{state:q.rows[0].state as AiRunState,leaseExpiresAt:q.rows[0].lease_until};
 }
 
-export async function commitAiAnswer(db:Db,input:{enabled:boolean;runId:string;instanceId:string;bootId:string;token:string;onlineSeconds:number;nodeId:string}){
+/**
+ * The gateway learns the callId only from the `/incoming` response, so the snapshot that lists the
+ * call as ringing lands one heartbeat cycle later — often after the worker's commit. Instead of a
+ * 409 that costs a full fail/re-claim cycle, the commit waits for that snapshot: at most this long,
+ * polling a lock-free read every step, strictly inside the worker's 3 s request timeout.
+ */
+export const AI_COMMIT_RINGING_WAIT_MS=2000;
+export const AI_COMMIT_RINGING_STEP_MS=150;
+
+export async function commitAiAnswer(db:Db,input:{enabled:boolean;runId:string;instanceId:string;bootId:string;token:string;onlineSeconds:number;nodeId:string;ringingWaitMs?:number;ringingStepMs?:number}){
   if(!input.enabled)throw new AiRunError(503,'AI_DISABLED','AI answering is disabled');
+  const deadline=Date.now()+Math.min(AI_COMMIT_RINGING_WAIT_MS,Math.max(0,input.ringingWaitMs??0)),step=Math.max(10,input.ringingStepMs??AI_COMMIT_RINGING_STEP_MS);
   const target=await db.query(`SELECT gateway_id,call_id FROM ai_call_runs WHERE id=$1`,[input.runId]);
   if(!target.rowCount)throw new AiRunError(404,'AI_RUN_NOT_FOUND','AI run was not found');
+  for(;;){
+    try{return await commitAiAnswerOnce(db,input,target.rows[0]);}
+    catch(error){
+      if(!(error instanceof AiRunError&&error.code==='AI_RINGING_NOT_CONFIRMED'))throw error;
+      let settled=false;
+      while(!settled&&Date.now()+step<=deadline){
+        await new Promise(resolve=>setTimeout(resolve,step));
+        settled=await ringingSettled(db,input.runId,input.onlineSeconds);
+      }
+      if(!settled)throw error;
+    }
+  }
+}
+
+/** Lock-free: true once a fresh snapshot lists the call ringing, or the run/call moved on (the full commit then decides). */
+async function ringingSettled(db:Queryable,runId:string,onlineSeconds:number){
+  const row=(await db.query(`SELECT run.state run_state,call.id call_id,call.state call_state,call.ai_run_id,call.device_call_id,snap.calls,
+      snap.observed_at>=now()-$2::int*interval '1 second' fresh
+    FROM ai_call_runs run JOIN call_records call ON call.id=run.call_id
+    LEFT JOIN gateway_telecom_snapshots snap ON snap.gateway_id=run.gateway_id AND snap.generation=run.device_generation WHERE run.id=$1`,[runId,onlineSeconds])).rows[0];
+  if(!row||row.run_state!=='preparing'||row.call_state!=='incoming_ringing'||row.ai_run_id!==runId)return true;
+  return Boolean(row.fresh&&Array.isArray(row.calls)&&(row.calls as any[]).some(item=>item.callId===row.call_id&&item.deviceCallId===row.device_call_id&&item.state==='ringing'));
+}
+
+async function commitAiAnswerOnce(db:Db,input:{runId:string;instanceId:string;bootId:string;token:string;onlineSeconds:number;nodeId:string},target:{gateway_id:string;call_id:string}){
   // The lost_race branch must persist its state change and still answer 409, so the closure returns it
   // as a value (tx commits) and the error is thrown only after the commit.
   const result=await tx(db,async c=>{
-    const gateway=(await c.query(`SELECT *,${DEBOUNCED_CAPABILITIES} FROM gateways WHERE id=$1 FOR UPDATE`,[target.rows[0].gateway_id])).rows[0];
+    const gateway=(await c.query(`SELECT *,${DEBOUNCED_CAPABILITIES} FROM gateways WHERE id=$1 FOR UPDATE`,[target.gateway_id])).rows[0];
     const call=(await c.query(`SELECT call.*,sim.owner_user_id,sim.version assignment_version,sim.device_present,sim.assignment_pending
-      FROM call_records call JOIN sims sim ON sim.id=call.sim_id WHERE call.id=$1 FOR UPDATE OF call,sim`,[target.rows[0].call_id])).rows[0];
+      FROM call_records call JOIN sims sim ON sim.id=call.sim_id WHERE call.id=$1 FOR UPDATE OF call,sim`,[target.call_id])).rows[0];
     const run=(await c.query(`SELECT * FROM ai_call_runs WHERE id=$1 FOR UPDATE`,[input.runId])).rows[0];
     if(!run||call?.ai_run_id!==run.id)throw new AiRunError(409,'AI_LOST_RACE','AI run no longer owns this incoming call');
     assertLease(run,input);
@@ -228,7 +272,7 @@ export async function observeAiAnswerAck(c:PoolClient,input:{callId:string;comma
   return{handled:false,restoredRinging:false};
 }
 
-export async function readAiRun(db:Queryable,input:{runId:string;instanceId:string;bootId:string;token:string;onlineSeconds:number}){
+export async function readAiRun(db:Queryable,input:{runId:string;instanceId:string;bootId:string;token:string;onlineSeconds:number;activeCallGraceSeconds?:number}){
   const q=await db.query(`SELECT run.*,call.state call_state,call.ai_run_id,call.answered_by_platform,call.media_node_id call_media_node_id,
       call.media_epoch call_media_epoch,call.generation call_generation,gateway.device_epoch,gateway.control_enabled,gateway.last_seen_at,
       ${capabilityReady('gateway','media')} media_ready_debounced,${capabilityReady('gateway','telephony')} telephony_ready_debounced,
@@ -236,7 +280,10 @@ export async function readAiRun(db:Queryable,input:{runId:string;instanceId:stri
     FROM ai_call_runs run JOIN call_records call ON call.id=run.call_id JOIN gateways gateway ON gateway.id=run.gateway_id WHERE run.id=$1`,[input.runId,input.instanceId,input.bootId,AI_PROTOCOL]);
   if(!q.rowCount)throw new AiRunError(404,'AI_RUN_NOT_FOUND','AI run was not found');
   const row=q.rows[0];assertLease(row,input);
-  const gatewayReady=row.control_enabled&&row.telephony_ready_debounced&&row.media_ready_debounced&&row.last_seen_at&&Date.now()-new Date(row.last_seen_at).getTime()<=input.onlineSeconds*1000;
+  // GATEWAY_ACTIVE_CALL_GRACE_SECONDS: an already active call on a pinned node keeps its audio through
+  // a longer heartbeat gap, mirroring the media close worker. 0 (default) = the online window alone.
+  const freshSeconds=row.call_state==='active'&&row.call_media_node_id?Math.max(input.onlineSeconds,input.activeCallGraceSeconds??0):input.onlineSeconds;
+  const gatewayReady=row.control_enabled&&row.telephony_ready_debounced&&row.media_ready_debounced&&row.last_seen_at&&Date.now()-new Date(row.last_seen_at).getTime()<=freshSeconds*1000;
   const audioAllowed=row.state==='active'&&row.call_state==='active'&&row.ai_run_id===row.id&&row.answered_by_platform==='ai'&&
     Number(row.call_generation)===Number(row.device_generation)&&Number(row.device_epoch)===Number(row.device_generation)&&
     Number(row.call_media_epoch)===Number(row.media_epoch)&&Boolean(gatewayReady)&&Boolean(row.worker_healthy);

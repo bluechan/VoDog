@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import {Readable} from 'node:stream';
 import test from 'node:test';
 import type {RecordingManifest, RecordingSource, RecordingTrack} from '../recording-store.js';
-import {createGeminiTranscriptionProvider, createOpenAICompatibleTranscriptionProvider} from './provider.js';
+import {createGeminiTranscriptionProvider, createOpenAICompatibleTranscriptionProvider, subtitleSegments} from './provider.js';
 import {retryAfterPolicy, TranscriptionProviderHttpError} from './provider-error.js';
 import {RegistryRecordingReader, TranscriptRecordingReaderError} from './reader.js';
 import {freezeRecordingManifest, type TrackReadRequest} from './worker.js';
@@ -266,7 +266,7 @@ test('OpenAI-compatible provider falls back to one segment when the model answer
   const prose = '喂，你好，我这边是物业客服。';
   const ogg = createOpenAICompatibleTranscriptionProvider({...options, fetcher: async () => chatResponse(prose)});
   assert.deepEqual(withoutAttempts(await ogg.transcribe(remote, context())), {
-    text: prose, segments: [{text: prose, startMs: 0}],
+    text: prose, segments: [{text: prose, startMs: 0}], salvaged: true,
     provider: 'openai-compatible', model: 'compatible-test', version: 'compatible-test-202609',
   });
   // Only the fixed-rate Pixel WAV has a length the server can derive without decoding the audio.
@@ -305,6 +305,27 @@ test('OpenAI-compatible provider keeps salvaged words but never stores a half-ke
       fetcher: async () => chatResponse(typeof empty === 'string' ? empty : JSON.stringify(empty))});
     await assert.rejects(provider.transcribe(remote, context()), /no transcription/);
   }
+});
+
+test('S102b subtitleSegments parses MM:SS and HH:MM:SS cues, run together or per line, with optional speakers', async () => {
+  assert.deepEqual(subtitleSegments('00:03.220 --> 00:03.940 [speaker:A] 嗯？00:03.940 --> 00:05.100 [speaker:B] 早晨，早安。00:05.740 --> 00:06.900 [speaker:A] 上班了嗎？'), [
+    {text: '嗯？', startMs: 3220, endMs: 3940, speaker: 'A'},
+    {text: '早晨，早安。', startMs: 3940, endMs: 5100, speaker: 'B'},
+    {text: '上班了嗎？', startMs: 5740, endMs: 6900, speaker: 'A'},
+  ]);
+  assert.deepEqual(subtitleSegments('1\n00:01:02,500 --> 00:01:04.000\n喂\n\n2\n01:00:00.5 --> 01:00:01.000 [speaker: B] 你好\n'), [
+    {text: '喂', startMs: 62_500, endMs: 64_000},
+    {text: '你好', startMs: 3_600_500, endMs: 3_601_000, speaker: 'B'},
+  ]);
+  assert.equal(subtitleSegments('00:01.000 --> 00:02.000 只有一句'), null);
+  assert.equal(subtitleSegments('00:05.000 --> 00:06.000 后\n00:01.000 --> 00:02.000 前'), null);
+  assert.equal(subtitleSegments('00:01.000 --> 00:00.500 倒\n00:02.000 --> 00:03.000 正'), null);
+  assert.equal(subtitleSegments('喂，你好。'), null);
+  // Through the provider: a subtitle answer is a timed result, not a salvaged blob.
+  const provider = createOpenAICompatibleTranscriptionProvider({...options, fetcher: async () => chatResponse('00:00.000 --> 00:00.010 喂\n00:00.010 --> 00:00.020 你好')});
+  const result = await provider.transcribe(pixelWav, wavContext());
+  assert.deepEqual(result.segments, [{text: '喂', startMs: 0, endMs: 10}, {text: '你好', startMs: 10, endMs: 20}]);
+  assert.equal(result.salvaged, undefined);
 });
 
 test('OpenAI-compatible provider rejects truncated, unusable, ambiguous and oversized responses', async () => {

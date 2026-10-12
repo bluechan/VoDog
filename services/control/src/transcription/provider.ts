@@ -1,6 +1,7 @@
 import type {TranscriptClassificationResult, TranscriptionAttempt, TranscriptionProvider, TranscriptionResult} from './worker.js';
 import {validTranscriptionAudio} from './audio-format.js';
 import {retryAfterPolicy, TranscriptionProviderHttpError} from './provider-error.js';
+import {TranscriptionWorkerError} from './worker.js';
 
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -17,6 +18,14 @@ const OPENAI_TRANSCRIPTION_PROMPT =
   '按自然停顿分句，startMs 与 endMs 是相对音频开头的整数毫秒并随分句递增；text 只写音频里听到的原话（中文用简体中文），' +
   '不要翻译、不要总结、不要添加说话人标签。不要输出 Markdown 代码围栏或任何解释文字。' +
   '如果音频里没有清晰可辨的人声（只有静音、噪声、按键音或提示音），输出 {"segments":[]}；绝不猜测、补全或编造内容。';
+/** S102: appended to the JSON prompt when the audio is the two-party mix (`track: 'mix'`). The labels go
+ * in their own field so `text` keeps the base prompt's "no speaker labels" rule. */
+const OPENAI_MIX_SPEAKER_PROMPT =
+  '这段音频是两位通话者的混音：每个分句另加字段 "speaker"，取值 "A" 或 "B"（第一位开口者为 A，同一人始终用同一标签），' +
+  '即 {"startMs":<整数>,"endMs":<整数>,"speaker":"A","text":"..."}；startMs 随分句递增，两人同时说话时 endMs 可以重叠；text 里仍不写说话人。';
+/** S102 degenerate-answer guard: below this many characters the ratio and length rules do not apply (a short
+ * 「好的好的」 or a one-word answer on a 20 ms clip is not degenerate). */
+const DEGENERATE_MIN_CHARS = 60;
 /** Second attempt: the simplest request the server is known to answer, with no format contract. */
 const OPENAI_PLAIN_TRANSCRIPTION_PROMPT = '请逐字转写这段通话音频，只输出文字，按自然停顿分行。没有清晰人声时不要猜测或编造。';
 /** Provider word annotations are grouped per utterance so stored segments read as sentences, not one row per word. */
@@ -161,10 +170,28 @@ export function createOpenAICompatibleTranscriptionProvider(options: OpenAICompa
         try {
           const answer = await requestTranscription({
             endpoint, apiKey, fetcher, timeoutMs, maxTokens, temperature, data, format, durationMs,
-            model: plan.model, mode: plan.prompt, prompt: plan.prompt === 'json' ? jsonPrompt : plainPrompt,
+            model: plan.model, mode: plan.prompt,
+            prompt: plan.prompt === 'plain' ? plainPrompt : context.track === 'mix' ? jsonPrompt + OPENAI_MIX_SPEAKER_PROMPT : jsonPrompt,
             signal: context.signal, clock: options.clock ?? (() => new Date()),
           });
           attempts.push({model: plan.model, prompt: plan.prompt, status: answer.status, ms: Date.now() - startedAt});
+          // S102b: a salvaged mix chunk (one untimed blob) is asked once more with the production JSON prompt
+          // before it is kept; any failure of that one extra call keeps the first answer.
+          if (answer.transcript.salvaged && context.track === 'mix') {
+            const reaskStartedAt = Date.now();
+            try {
+              const again = await requestTranscription({
+                endpoint, apiKey, fetcher, timeoutMs, maxTokens, temperature, data, format, durationMs,
+                model, mode: 'json', prompt: jsonPrompt + OPENAI_MIX_SPEAKER_PROMPT,
+                signal: context.signal, clock: options.clock ?? (() => new Date()),
+              });
+              attempts.push({model, prompt: 'json', status: again.status, ms: Date.now() - reaskStartedAt});
+              return {...again.transcript, provider: 'openai-compatible', model, version: again.version, attempts};
+            } catch (error) {
+              if (context.signal.aborted) throw error;
+              attempts.push({model, prompt: 'json', status: attemptStatus(error), ms: Date.now() - reaskStartedAt});
+            }
+          }
           return {...answer.transcript, provider: 'openai-compatible', model: plan.model, version: answer.version, attempts};
         } catch (error) {
           attempts.push({model: plan.model, prompt: plan.prompt, status: attemptStatus(error), ms: Date.now() - startedAt});
@@ -185,7 +212,7 @@ async function requestTranscription(input: {
   endpoint: string; apiKey: string; fetcher: typeof fetch; timeoutMs: number; maxTokens: number;
   temperature: number | undefined; data: string; format: string; durationMs: number | undefined;
   model: string; mode: 'json' | 'plain'; prompt: string; signal: AbortSignal; clock: () => Date;
-}): Promise<{transcript: {text: string; segments?: Array<{text: string; startMs?: number; endMs?: number}>}; version: string; status: number}> {
+}): Promise<{transcript: ChatTranscript; version: string; status: number}> {
   const linked = linkedSignal(input.signal, input.timeoutMs);
   const stall = (error: unknown) => {
     if (input.signal.aborted) return error;
@@ -237,8 +264,11 @@ function attemptStatus(error: unknown): number | string {
   return 'invalid_response';
 }
 
-/** Turn one chat completion into the same `{text, segments}` shape the native Gemini path returns. */
-function chatTranscriptionResult(value: unknown, durationMs: number | undefined, mode: 'json' | 'plain' = 'json'): {text: string; segments?: Array<{text: string; startMs?: number; endMs?: number}>} {
+type ChatTranscript = {text: string; segments?: Array<{text: string; startMs?: number; endMs?: number; speaker?: 'A' | 'B'}>; salvaged?: boolean};
+
+/** Turn one chat completion into the same `{text, segments}` shape the native Gemini path returns.
+ * `salvaged` marks an answer that kept the words but not the timing (one blob, or untimed lines). */
+function chatTranscriptionResult(value: unknown, durationMs: number | undefined, mode: 'json' | 'plain' = 'json'): ChatTranscript {
   const root = value as any;
   if (!root || typeof root !== 'object' || Array.isArray(root)) throw new Error('Transcription provider returned no transcription');
   if (!Array.isArray(root.choices) || root.choices.length !== 1) throw new Error('Transcription provider returned no transcription');
@@ -255,22 +285,29 @@ function chatTranscriptionResult(value: unknown, durationMs: number | undefined,
   if (!body) throw new Error('Transcription provider returned no transcription');
   // S78: the prompt's explicit "no speech" answer. The worker skips the track instead of retrying.
   if (mode === 'json' && /^\{\s*"segments"\s*:\s*\[\s*\]\s*\}$/.test(body)) return {text: '', segments: []};
-  const strict = strictSegments(body);
-  if (strict) return {text: joinWords(strict.map((segment) => segment.text)), segments: strict};
+  // S102b: a subtitle-style answer (`00:03.220 --> 00:03.940 [speaker:A] 嗯？`) is timed, not salvage.
+  const strict = strictSegments(body) ?? subtitleSegments(body);
+  // S102: a looping or invented answer is a provider failure (retried), never a transcript — checked
+  // before either the strict segments or the salvaged words are kept.
+  const words = strict ? joinWords(strict.map((segment) => segment.text)) : salvagedText(body);
+  if (words !== null && degenerateTranscript(words, durationMs)) {
+    throw new TranscriptionWorkerError('PROVIDER_DEGENERATE', 'Transcription provider returned a degenerate transcript', true);
+  }
+  if (strict) return {text: words!, segments: strict};
   // The contract was not met. Keep whatever words came back, never the JSON envelope.
-  const salvaged = salvagedText(body);
+  const salvaged = words;
   if (salvaged === null) throw new Error('Transcription provider returned no transcription');
   // The plain prompt asks for one utterance per line and claims no timing at all, so the lines become
   // segments without timestamps; the JSON prompt's fallback is one segment starting at 0, whose
   // `endMs` is only known when the source is Pixel's fixed-rate PCM WAV.
   if (mode === 'plain') {
     const lines = salvaged.split('\n').map((line) => line.trim()).filter(Boolean);
-    if (lines.length) return {text: joinWords(lines), segments: lines.map((text) => ({text}))};
+    if (lines.length) return {text: joinWords(lines), segments: lines.map((text) => ({text})), salvaged: true};
   }
   const flattened = salvaged.split('\n').map((line) => line.trim()).filter(Boolean);
   if (!flattened.length) throw new Error('Transcription provider returned no transcription');
   const text = joinWords(flattened);
-  return {text, segments: [{text, startMs: 0, ...(durationMs === undefined ? {} : {endMs: durationMs})}]};
+  return {text, segments: [{text, startMs: 0, ...(durationMs === undefined ? {} : {endMs: durationMs})}], salvaged: true};
 }
 
 function chatContentText(content: unknown): string {
@@ -293,27 +330,71 @@ function stripJsonFence(content: string): string {
   return (fenced ? fenced[1]!.trim() : trimmed);
 }
 
-function strictSegments(body: string): Array<{text: string; startMs: number; endMs: number}> | null {
+/** S102: true for a looping or padded answer — a 2–8 character n-gram repeated ≥ 8 times in a row, one
+ * n-gram covering ≥ 30 % of the text, or more than 12 characters per second of audio. Whitespace,
+ * punctuation and symbols are ignored; the last two rules need at least `DEGENERATE_MIN_CHARS`. */
+export function degenerateTranscript(text: string, durationMs?: number): boolean {
+  const chars = [...text.replace(/[\s\p{P}\p{S}]/gu, '')];
+  const plain = chars.join('');
+  if (/(.{2,8})\1{7,}/su.test(plain)) return true;
+  if (chars.length < DEGENERATE_MIN_CHARS) return false;
+  if (durationMs !== undefined && chars.length > durationMs / 1000 * 12) return true;
+  for (let n = 2; n <= 8; n++) {
+    const counts = new Map<string, number>();
+    for (let index = 0; index + n <= chars.length; index++) {
+      const gram = chars.slice(index, index + n).join('');
+      const count = (counts.get(gram) ?? 0) + 1;
+      if (count * n >= chars.length * 0.3) return true;
+      counts.set(gram, count);
+    }
+  }
+  return false;
+}
+
+/** S102: `startMs` must not go back, but `endMs` may (two people talking over each other overlap). */
+function strictSegments(body: string): Array<{text: string; startMs: number; endMs: number; speaker?: 'A' | 'B'}> | null {
   let value: unknown;
   try { value = JSON.parse(body); } catch { return null; }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const raw = (value as Record<string, unknown>).segments;
   if (!Array.isArray(raw) || raw.length === 0) return null;
-  const segments: Array<{text: string; startMs: number; endMs: number}> = [];
+  const segments: Array<{text: string; startMs: number; endMs: number; speaker?: 'A' | 'B'}> = [];
   let previousStartMs = 0;
-  let previousEndMs = 0;
   for (const item of raw) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-    const {text, startMs, endMs} = item as Record<string, unknown>;
+    const {text, startMs, endMs, speaker} = item as Record<string, unknown>;
     if (typeof text !== 'string' || !text.trim()) return null;
     if (!Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs)) return null;
     const start = startMs as number, end = endMs as number;
-    if (start < 0 || end < start || end > MAX_SEGMENT_MS || start < previousStartMs || end < previousEndMs) return null;
-    segments.push({text: text.trim(), startMs: start, endMs: end});
+    if (start < 0 || end < start || end > MAX_SEGMENT_MS || start < previousStartMs) return null;
+    segments.push({text: text.trim(), startMs: start, endMs: end, ...(speaker === 'A' || speaker === 'B' ? {speaker} : {})});
     previousStartMs = start;
-    previousEndMs = end;
   }
   return segments;
+}
+
+const SUBTITLE_TIME = String.raw`(?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{1,3}`;
+const SUBTITLE_CUE = new RegExp(String.raw`(${SUBTITLE_TIME})\s*-->\s*(${SUBTITLE_TIME})\s*(?:\[speaker:\s*([AB])\])?([\s\S]*?)(?=${SUBTITLE_TIME}\s*-->|$)`, 'g');
+
+function subtitleMs(value: string): number {
+  const [clock, fraction] = value.split(/[.,]/);
+  return clock!.split(':').reduce((total, part) => total * 60 + Number(part), 0) * 1000 + Number(fraction!.padEnd(3, '0'));
+}
+
+/** S102b: `MM:SS.mmm --> MM:SS.mmm [speaker:A] text` cues (or `HH:MM:SS.mmm`), one per line or run together.
+ * `null` unless ≥ 2 cues with text, non-decreasing starts and `end ≥ start`. */
+export function subtitleSegments(body: string): Array<{text: string; startMs: number; endMs: number; speaker?: 'A' | 'B'}> | null {
+  const segments: Array<{text: string; startMs: number; endMs: number; speaker?: 'A' | 'B'}> = [];
+  let previousStartMs = 0;
+  for (const [, from, to, speaker, raw] of body.matchAll(SUBTITLE_CUE)) {
+    // An SRT cue number on its own line and a closing fence belong to no one's words.
+    const text = raw!.replace(/```\w*/g, '').replace(/\n\s*\d+\s*$/, '').trim();
+    const startMs = subtitleMs(from!), endMs = subtitleMs(to!);
+    if (endMs < startMs || endMs > MAX_SEGMENT_MS || startMs < previousStartMs) return null;
+    previousStartMs = startMs;
+    if (text) segments.push({text, startMs, endMs, ...(speaker === 'A' || speaker === 'B' ? {speaker} : {})});
+  }
+  return segments.length >= 2 ? segments : null;
 }
 
 /** `null` when nothing usable came back; never the raw JSON envelope of a contract the model half-kept. */

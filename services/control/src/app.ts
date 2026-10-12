@@ -17,6 +17,7 @@ import {
 import { pageEnvelope, pageOffset, pageQueryShape } from "./pagination.js";
 import {
   annotateNumbers,
+  backfillContactPhoneLocations,
   EMPTY_NUMBER_ANNOTATION,
   normalizeContactName,
   normalizePhone,
@@ -72,6 +73,7 @@ import { ApnsClient } from "./apns.js";
 import { PushWorker } from "./push-worker.js";
 import { registerPushRoutes } from "./push-routes.js";
 import { MediaCloseWorker } from "./media-close-worker.js";
+import { hasLiveCalls, liveCallSql } from "./live-calls.js";
 import {
   RecordingStore,
   RemoteRecordingStore,
@@ -99,6 +101,7 @@ import {closeWebCallLease,createInitialWebCallLease,isWebCallPrincipal,markWebCa
 import {createFcmAccessTokenProvider} from './fcm-credentials.js';
 import {FcmClient} from './fcm.js';
 import {AndroidPushWorker} from './android-push-worker.js';
+import {WatchPushWorker} from './watch-push-worker.js';
 import {BadgeWorker,PENDING_CALL,visibleCall,registerBadgeRoutes} from './badges.js';
 import {registerAiRunRoutes} from './ai-runs/routes.js';
 import {registerVoiceProviderRoutes} from './ai-runs/voice-providers.js';
@@ -150,6 +153,8 @@ class ApiError extends Error {
     public code: string,
     message: string,
     public details?: unknown,
+    // S130: extra top-level `error.*` fields (e.g. boundModuleLabel) that clients read directly.
+    public fields?: Record<string, unknown>,
   ) {
     super(message);
   }
@@ -326,6 +331,7 @@ function settingsDto(r: any, availability:Awaited<ReturnType<typeof settingsAvai
   };
 }
 
+let mediaTurnDefaultsWarned=false;
 export async function buildApp(
   db: Db,
   config: Config,
@@ -340,13 +346,17 @@ export async function buildApp(
     ? new RecordingStore(config.RECORDING_ROOT)
     : null;
   const pixelRecordings=config.PIXEL_ARCHIVE_ENABLED&&config.PIXEL_ARCHIVE_ROOT?new PixelRecordingArchiveReader(db,config.PIXEL_ARCHIVE_ROOT):null;
-  const mediaCloseWorker=media?new MediaCloseWorker(db,media,{gatewayOfflineSeconds:config.GATEWAY_ONLINE_SECONDS}):null;
+  const mediaCloseWorker=media?new MediaCloseWorker(db,media,{gatewayOfflineSeconds:config.GATEWAY_ONLINE_SECONDS,activeCallGraceSeconds:config.GATEWAY_ACTIVE_CALL_GRACE_SECONDS??0}):null;
   // S20 D4: every command insert rings this after its own transaction committed; a suspended gateway
   // request then returns immediately instead of waiting for the next heartbeat.
   const commandDoorbell=new CommandDoorbell();
   // S21 §D: a separate waiter table for the standby beacon. It must never share the command
   // doorbell's 8 s cap or its per-gateway slot — an OFF gateway holds one request of its own.
   const standbyDoorbell=new CommandDoorbell();
+  // AI claim long poll (AI_CLAIM_HOLD_MS): one waiter per Voice worker instance, rung after any commit
+  // that created a run. Off (hold 0) nobody ever waits here.
+  const aiClaimDoorbell=new CommandDoorbell();
+  const wakeAiClaims=()=>aiClaimDoorbell.notifyAll();
   const rawDoorbellMaxHoldMs=Number(config.GATEWAY_COMMAND_DOORBELL_MAX_MS??0);
   const doorbellMaxHoldMs=Number.isFinite(rawDoorbellMaxHoldMs)?Math.min(DOORBELL_HARD_CAP_MS,Math.max(0,Math.trunc(rawDoorbellMaxHoldMs))):0;
   const rawStandbyMaxHoldMs=Number(config.GATEWAY_STANDBY_MAX_HOLD_MS??GATEWAY_STANDBY_HARD_CAP_MS);
@@ -363,9 +373,16 @@ export async function buildApp(
     trustProxy: true,
     genReqId: () => opaqueToken(12),
   });
+  // Once per process: TURN URLs that silently fell back to the built-in example.com placeholder defaults.
+  if(media?.defaultedTurnUrls.length&&!mediaTurnDefaultsWarned){
+    mediaTurnDefaultsWarned=true;
+    app.log.warn({nodes:media.defaultedTurnUrls},"media_node_turn_defaulted: TURN URLs come from built-in defaults, not MEDIA_NODES_JSON");
+  }
   const apnsClient = config.APNS_KEY_ID && config.APNS_TEAM_ID && config.APNS_KEY_PATH
     ? new ApnsClient(config.APNS_KEY_ID, config.APNS_TEAM_ID, await readFile(config.APNS_KEY_PATH, "utf8")) : null;
   const pushWorker = apnsClient ? new PushWorker(db, apnsClient, config.GATEWAY_ONLINE_SECONDS) : null;
+  const watchPushWorker = apnsClient ? new WatchPushWorker(db, apnsClient, { enabled: config.WATCHOS_PUSH_ENABLED, onlineSeconds: config.GATEWAY_ONLINE_SECONDS }) : null;
+  app.addHook("onClose",async()=>{apnsClient?.close();});
   let androidPushWorker:AndroidPushWorker|null=null,fcmClient:FcmClient|null=null;
   if(config.FCM_ENABLED){
     if(!config.FCM_PROJECT_ID||!config.FCM_CREDENTIALS_PATH)throw new Error('FCM requires project ID and credentials path');
@@ -377,13 +394,15 @@ export async function buildApp(
   app.addHook("onReady",async()=>{badgeWorker.start();});
   app.addHook("onClose",async()=>{await badgeWorker.stop();});
   // A ringing call wakes the push workers now instead of on their next 1 s poll.
-  const kickPush=()=>{void pushWorker?.tick().catch(()=>{});void androidPushWorker?.tickOnce().catch(()=>{});};
+  const kickPush=()=>{void pushWorker?.tick().catch(()=>{});void androidPushWorker?.tickOnce().catch(()=>{});void watchPushWorker?.tickOnce().catch(()=>{});};
   app.decorate("commandDoorbell",commandDoorbell);
-  app.addHook("onClose",async()=>{commandDoorbell.closeAll();standbyDoorbell.closeAll();});
+  app.addHook("onClose",async()=>{commandDoorbell.closeAll();standbyDoorbell.closeAll();aiClaimDoorbell.closeAll();});
   app.addHook("onReady", async()=>{pushWorker?.start();});
   app.addHook("onClose", async()=>{await pushWorker?.stop();});
   app.addHook("onReady",async()=>{androidPushWorker?.start();});
   app.addHook("onClose",async()=>{await androidPushWorker?.stop();});
+  app.addHook("onReady",async()=>{watchPushWorker?.start();});
+  app.addHook("onClose",async()=>{await watchPushWorker?.stop();});
   await app.register(cookie, { secret: config.COOKIE_SECRET });
   await app.register(helmet, { contentSecurityPolicy: false });
   app.addHook("onReady",async()=>{mediaCloseWorker?.start();});
@@ -397,6 +416,11 @@ export async function buildApp(
   // S22: one bounded, idempotent pass. Fire and forget — a search key is never worth delaying
   // readiness or failing startup for, and the process may close while it is still running.
   app.addHook("onReady",async()=>{void backfillCallCanonicalKeys(db,message=>app.log.info(message)).catch(error=>workerError(db,'canonical_key_backfill',error));});
+  // S96: contact phone locations, once at start and hourly (rows unresolved now are retried later).
+  const contactLocationBackfill=()=>{void backfillContactPhoneLocations(db,message=>app.log.info(message)).catch(error=>workerError(db,'contact_location_backfill',error));};
+  let contactLocationTimer:ReturnType<typeof setInterval>|undefined;
+  app.addHook("onReady",async()=>{contactLocationBackfill();contactLocationTimer=setInterval(contactLocationBackfill,3_600_000);contactLocationTimer.unref();});
+  app.addHook("onClose",async()=>{clearInterval(contactLocationTimer);});
   // S69: successful user GETs are summarised every 5 min instead of one row each.
   const httpRollup=new HttpRollup();
   const rollupTimer=setInterval(()=>{void httpRollup.flush(db);},300_000);rollupTimer.unref();
@@ -409,6 +433,7 @@ export async function buildApp(
       req.diagCode = err.code;
       return reply.code(err.status).send({
         error: {
+          ...err.fields,
           code: err.code,
           message: err.message,
           requestId: req.id,
@@ -548,8 +573,14 @@ export async function buildApp(
       return;
     }
     if (bearer) {
+      // `last_used_at` is coarse bookkeeping: a gateway authenticates several times a second (heartbeat,
+      // doorbell, snapshot), so the row is rewritten at most once a minute instead of on every request.
       const d = await db.query(
-        `UPDATE device_credentials SET last_used_at=now() WHERE secret_hash=$1 AND revoked_at IS NULL RETURNING gateway_id`,
+        `WITH credential AS (SELECT id,gateway_id,last_used_at FROM device_credentials WHERE secret_hash=$1 AND revoked_at IS NULL),
+           touched AS (UPDATE device_credentials SET last_used_at=now() FROM credential
+             WHERE device_credentials.id=credential.id AND device_credentials.revoked_at IS NULL
+               AND (credential.last_used_at IS NULL OR credential.last_used_at<now()-interval '60 seconds'))
+         SELECT gateway_id FROM credential`,
         [hash],
       );
       if (d.rowCount)
@@ -968,9 +999,13 @@ export async function buildApp(
     mutationOrigin(req, config);
     requireWebCallProtocol(req,p,config);
     const key = idemKey(req);
+    // S105: the watch dials through its iPhone's session; `platform:'watchos'` is the only override.
     const b = z
-      .object({ simId: z.uuid(), remoteNumber: outboundCallNumber })
+      .object({ simId: z.uuid(), remoteNumber: outboundCallNumber, platform: z.literal("watchos").optional() })
       .parse(req.body);
+    if (b.platform && p.platform !== "ios")
+      fail(400, "INVALID_REQUEST", "platform override requires an ios session");
+    const originatingPlatform = b.platform === "watchos" && p.platform === "ios" ? "watchos" : p.platform;
     let doorbellGatewayId: string | null = null;
     const result = await tx(db, async (c) => {
       const currentSession=await c.query(`SELECT 1 FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>now() FOR UPDATE`,[p.sessionId,p.user.id]);
@@ -1068,7 +1103,7 @@ export async function buildApp(
             generation,
             s.mode,
             p.sessionId,
-            p.platform,
+            originatingPlatform,
             s.time_zone,
             remoteKey,
             !!peerSim,
@@ -1122,7 +1157,7 @@ export async function buildApp(
     const { id } = z.object({ id: z.uuid() }).parse(req.params);
     const b = z
       .object({
-        platform: z.enum(["web", "ios", "android", "macos"]),
+        platform: z.enum(["web", "ios", "android", "macos", "watchos"]),
         deviceName: z.string().max(120).optional(),
       })
       .parse(req.body);
@@ -1173,7 +1208,8 @@ export async function buildApp(
       ]);
       await c.query(
         `UPDATE call_records SET state='connecting',claimed_by_session_id=$2,answered_by_platform=$3,answered_by_device=$4,generation=$5 WHERE id=$1`,
-        [id, p.sessionId, p.platform, b.deviceName ?? null, generation],
+        // S105: the watch claims through its iPhone's session; record the device that actually answered.
+        [id, p.sessionId, b.platform === 'watchos' && p.platform === 'ios' ? 'watchos' : p.platform, b.deviceName ?? null, generation],
       );
       await c.query(
         `INSERT INTO commands(gateway_id,call_id,generation,sequence,kind,payload,expires_at) VALUES($1,$2,$3,$4,'answer',$5,now()+interval '15 seconds')`,
@@ -1232,6 +1268,7 @@ export async function buildApp(
         onProviderUnavailable:({provider})=>{aiSkippedProvider=provider;}});
       return Boolean(run);
     });
+    if(aiScheduled)wakeAiClaims();
     diag(db,"call.owner_busy",{ms:Date.now()-startedAt,aiScheduled,platform:p.platform,
       ...(aiSkippedProvider?{aiSkipped:"provider_unavailable",voiceProvider:aiSkippedProvider}:{})},{callId:id,userId:p.user.id});
     return {aiScheduled};
@@ -1401,7 +1438,7 @@ export async function buildApp(
   app.post("/api/v1/diag/events", { bodyLimit: 262144 }, async (req) => {
     let source = "", device = "", userId: string | null = null;
     if (req.principal?.kind === "user") {
-      source = z.enum(["ios", "android", "macos", "web"]).parse(req.headers["x-diag-source"]);
+      source = z.enum(["ios", "android", "macos", "web", "watchos"]).parse(req.headers["x-diag-source"]);
       device = req.principal.sessionId;
       userId = req.principal.user.id;
     } else if (req.principal?.kind === "device") {
@@ -1788,6 +1825,7 @@ export async function buildApp(
         remoteNumber: row.remote_number,
         contactId: annotations[index]?.contactId ?? null,
         contactName: annotations[index]?.contactName ?? null,
+        ...(annotations[index]?.remoteLocation ? { remoteLocation: annotations[index]!.remoteLocation } : {}),
         occurredAt: row.occurred_at,
         bodyPreview: row.body === null || row.body === undefined ? null : String(row.body).slice(0, 160),
         blockedEntryId: annotations[index]?.blockedEntryId ?? null,
@@ -1933,7 +1971,7 @@ export async function buildApp(
     fail:(status,code,message)=>fail(status,code,message),
   });
   registerMediaRoutes(app, db, config, media,mediaProbes);
-  registerAiRunRoutes(app,db,config,media,fail,callId=>requestMediaClose(db,media,callId),ringDoorbell);
+  registerAiRunRoutes(app,db,config,media,fail,callId=>requestMediaClose(db,media,callId),ringDoorbell,aiClaimDoorbell);
   registerVoiceProviderRoutes(app,db,config,{
     requireUser:(request)=>({userId:requireUser(request).user.id}),
     mutationOrigin:(request)=>mutationOrigin(request,config),
@@ -1947,7 +1985,7 @@ export async function buildApp(
     minFreeBytes:config.PIXEL_ARCHIVE_MIN_FREE_BYTES,finalizeConcurrency:config.PIXEL_ARCHIVE_FINALIZE_CONCURRENCY,
     requireGateway:(request)=>({gatewayId:requireDevice(request).gatewayId}),
     requireUser:(request)=>({userId:requireUser(request).user.id}),fail,
-    onArchived:(callId)=>{if(pixelRecordings&&config.RECORDING_MP3_CACHE_DIR)void pretranscodePixelRecording(db,pixelRecordings,config.RECORDING_MP3_CACHE_DIR,callId);},
+    onArchived:(callId)=>{if(pixelRecordings&&config.RECORDING_MP3_CACHE_DIR)void pretranscodePixelRecording(db,pixelRecordings,config.RECORDING_MP3_CACHE_DIR,callId,undefined,{maxWaitMs:config.RECORDING_PRETRANSCODE_MAX_WAIT_SECONDS*1000,transcriptionEnabled:config.TRANSCRIPTION_ENABLED});},
   });
   registerTranscriptionRoutes(app,db,{
     requireUser:(request)=>{const principal=requireUser(request);return{userId:principal.user.id,sessionId:principal.sessionId};},
@@ -1955,7 +1993,7 @@ export async function buildApp(
     fail:(status,code,message,details)=>fail(status,code,message,details),
     reportWindow,reportDayWindow,
   });
-  registerGatewayRoutes(app, db, config, media, commandDoorbell, doorbellMaxHoldMs, standbyDoorbell, standbyMaxHoldMs, kickPush);
+  registerGatewayRoutes(app, db, config, media, commandDoorbell, doorbellMaxHoldMs, standbyDoorbell, standbyMaxHoldMs, kickPush, wakeAiClaims);
   app.get("/healthz", async () => ({ ok: true }));
   return app;
 }
@@ -2017,6 +2055,74 @@ function relayIce<S extends {username:string;credential:string}>(config:Config,i
  * answered on the gateway device itself (Pixel dialer / Mac module window). The caller then moves the
  * state to `active`, which ends ringing everywhere else; a pending AI run loses the race.
  */
+/**
+ * S130 §3: module ↔ gateway-row binding for `/gateway/pair`. Runs inside the pairing transaction
+ * before the epoch bump; every refusal throws a 409 so the caller's transaction rolls back whole.
+ * Returns the row's module label after pairing (null when the row stays unbound).
+ */
+async function bindPairingModule(c: PoolClient, gatewayId: string, replace: boolean, key?: string, label?: string) {
+  const row = (await c.query(`SELECT module_key,module_label FROM gateways WHERE id=$1 FOR UPDATE`, [gatewayId])).rows[0];
+  const boundLabel = (row.module_label ?? null) as string | null;
+  const refuse = (code: string, message: string, fields: Record<string, unknown>): never => {
+    throw new ApiError(409, code, message, undefined, fields);
+  };
+  if (!key) {
+    if (replace || row.module_key)
+      refuse("MODULE_KEY_REQUIRED", "This gateway is bound to a module; pairing must identify the module", { boundModuleLabel: boundLabel });
+    return boundLabel;
+  }
+  if (replace) {
+    const released = await c.query(
+      `UPDATE gateways SET module_key=NULL,module_label=NULL WHERE module_key=$1 AND id<>$2 RETURNING id`,
+      [key, gatewayId],
+    );
+    for (const r of released.rows)
+      await c.query(
+        `INSERT INTO audit_events(action,resource_type,resource_id,details)VALUES('gateway.module.released','gateway',$1,$2)`,
+        [r.id, JSON.stringify({ moduleLabel: label ?? null, toGatewayId: gatewayId })],
+      );
+  } else {
+    const elsewhere = await c.query(`SELECT name FROM gateways WHERE module_key=$1 AND id<>$2`, [key, gatewayId]);
+    if (elsewhere.rowCount)
+      refuse("MODULE_BOUND_ELSEWHERE", "This module is already bound to another gateway", { boundGatewayName: elsewhere.rows[0].name });
+    if (row.module_key && row.module_key !== key)
+      refuse("MODULE_MISMATCH", "This gateway is bound to a different module", { boundModuleLabel: boundLabel });
+  }
+  const finalLabel = label ?? (row.module_key === key ? boundLabel : null);
+  await c.query(`UPDATE gateways SET module_key=$2,module_label=$3 WHERE id=$1`, [gatewayId, key, finalLabel]);
+  if (row.module_key !== key)
+    await c.query(
+      `INSERT INTO audit_events(action,resource_type,resource_id,details)VALUES('gateway.module.bound','gateway',$1,$2)`,
+      [gatewayId, JSON.stringify({ moduleLabel: finalLabel, previousModuleLabel: boundLabel, replaceModule: replace, source: "pair" })],
+    );
+  return finalLabel;
+}
+/**
+ * S130 §4: an authenticated heartbeat backfills an unbound row, never steals a key bound elsewhere, and
+ * never rejects on a mismatch — it only files a (throttled) diagnostic. Never fails the heartbeat.
+ */
+async function heartbeatModule(db: Db, gatewayId: string, key: string, label?: string) {
+  try {
+    const r = (await db.query(
+      `WITH cur AS (SELECT module_key,module_label FROM gateways WHERE id=$1),
+       upd AS (UPDATE gateways SET module_key=$2,module_label=$3 WHERE id=$1 AND module_key IS NULL
+               AND NOT EXISTS(SELECT 1 FROM gateways WHERE module_key=$2) RETURNING id)
+       SELECT cur.module_key,cur.module_label,(SELECT count(*) FROM upd)::int bound FROM cur`,
+      [gatewayId, key, label ?? null],
+    )).rows[0];
+    if (!r) return;
+    if (r.bound)
+      await db.query(
+        `INSERT INTO audit_events(action,resource_type,resource_id,details)VALUES('gateway.module.bound','gateway',$1,$2)`,
+        [gatewayId, JSON.stringify({ moduleLabel: label ?? null, source: "heartbeat" })],
+      );
+    else if (r.module_key && r.module_key !== key && throttled(`gateway.module_mismatch:${gatewayId}`, 10 * 60_000))
+      diag(db, "gateway.module_mismatch", { gatewayId, boundModuleLabel: r.module_label, reportedModuleLabel: label ?? null }, { level: "warn" });
+  } catch (error) {
+    // A concurrent bind of the same key hits the unique index; the next beat sees the settled state.
+    diag(db, "gateway.module_bind_failed", { gatewayId, error: errorReason(error) }, { level: "warn" });
+  }
+}
 async function markDeviceAnswer(c: PoolClient, callId: string) {
   const answered = await c.query(
     `UPDATE call_records SET answered_by_platform='device' WHERE id=$1 AND direction='incoming' AND state='incoming_ringing'
@@ -2103,7 +2209,7 @@ function occupancyDto(r: any, sessionId: string) {
 /**
  * S21 §A: `contactId/contactName/blocked/blockedEntryId` are resolved per page by
  * `annotateNumbers`, never by the client and never by loading the owner's whole address book.
- * Write paths pass the empty annotation; the three fields are contractually optional/nullable.
+ * S116: mutation responses annotate too (mutationCallDto); the fields stay optional/nullable.
  */
 // S58: dial/claim/end build their DTO from a bare call_records row; this adds the sim → gateway
 // kind the list/detail reads join, so a mutation response never downgrades a DJI 4G call to 'pixel'.
@@ -2112,8 +2218,22 @@ async function mutationCallDto(c: PoolClient, r: any) {
   const extra = await c.query(`SELECT (SELECT g.kind FROM sims s JOIN gateways g ON g.id=s.gateway_id WHERE s.id=$1) kind,
     (SELECT ${PENDING_CALL} FROM call_records c WHERE c.id=$2) unseen,
     (SELECT COALESCE(NULLIF(ps.label,''),ps.phone_label) FROM sims ps WHERE ps.id=$3) peer_sim_label,
-    (SELECT COALESCE(NULLIF(cs.label,''),cs.phone_label) FROM sims cs WHERE cs.id=$1) sim_label`, [r.sim_id, r.id, r.peer_sim_id ?? null]);
-  return callDto({ ...r, gateway_kind: extra.rows[0]?.kind ?? null, unseen: extra.rows[0]?.unseen, peer_sim_label: extra.rows[0]?.peer_sim_label, sim_label: extra.rows[0]?.sim_label });
+    (SELECT COALESCE(NULLIF(cs.label,''),cs.phone_label) FROM sims cs WHERE cs.id=$1) sim_label,
+    (SELECT cs.country_iso FROM sims cs WHERE cs.id=$1) sim_country_iso`, [r.sim_id, r.id, r.peer_sim_id ?? null]);
+  // S116: annotate like GET /calls/:id so the dial screen shows the contact name at once. Scope = the
+  // call's snapshot owner (every caller already gated on snapshot_owner_id = p.user.id). Inside the
+  // caller's transaction, so a lookup failure rolls back to a savepoint and falls back to empty.
+  let annotation = EMPTY_NUMBER_ANNOTATION;
+  try {
+    await c.query("SAVEPOINT s116_call_annotation");
+    [annotation = EMPTY_NUMBER_ANNOTATION] = await annotateNumbers(c, r.snapshot_owner_id, [
+      { remoteNumber: r.remote_number, countryIso: extra.rows[0]?.sim_country_iso },
+    ], "call");
+    await c.query("RELEASE SAVEPOINT s116_call_annotation");
+  } catch {
+    await c.query("ROLLBACK TO SAVEPOINT s116_call_annotation").catch(() => undefined);
+  }
+  return callDto({ ...r, gateway_kind: extra.rows[0]?.kind ?? null, unseen: extra.rows[0]?.unseen, peer_sim_label: extra.rows[0]?.peer_sim_label, sim_label: extra.rows[0]?.sim_label }, annotation);
 }
 
 /** S72: the other leg's SIM label (label, else its number); needs `c` = call_records. */
@@ -2217,8 +2337,11 @@ function failTranscode(db: Db, error: unknown, stderr = ""): never {
   diag(db, "recording.transcode_failed", { error: String((error as Error)?.message ?? error).slice(0, 200), stderr }, { level: "error" });
   return fail(503, "RECORDING_TRANSCODE_FAILED", "Recording could not be transcoded");
 }
+// S100: every ffmpeg/ffprobe runs under `nice -n 19` so post-call work never outbids heartbeats or a live call.
 async function runFfmpeg(db: Db, args: string[], pipe?: (proc: ReturnType<typeof spawn>) => Promise<void>) {
-  const proc = spawn("ffmpeg", args, { stdio: ["pipe","pipe","pipe"] });
+  const proc = spawn("nice", ["-n","19","ffmpeg",...args], { stdio: ["pipe","pipe","pipe"] });
+  const closed = once(proc, "close");
+  closed.catch(() => {}); // a spawn ENOENT rejects this too; that path is handled just below
   let stderr = "";
   proc.stderr!.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-600); });
   try {
@@ -2231,10 +2354,12 @@ async function runFfmpeg(db: Db, args: string[], pipe?: (proc: ReturnType<typeof
   try {
     await Promise.all([
       ...(pipe ? [pipe(proc)] : []),
-      once(proc, "close").then(([code]) => { if (code !== 0) throw new Error(`ffmpeg exited ${code}`); }),
+      closed.then(([code]) => { if (code !== 0) throw new Error(`ffmpeg exited ${code}`); }),
     ]);
   } catch (error) {
     proc.kill("SIGKILL");
+    // `nice` itself spawned, so a missing ffmpeg is its exit 127, not ENOENT: keep the documented 501.
+    if ((await closed.catch(() => [null]))[0] === 127) fail(501, "RECORDING_TRANSCODE_UNAVAILABLE", "MP3 transcoding is not available");
     failTranscode(db, error, stderr);
   }
 }
@@ -2245,7 +2370,7 @@ async function transcodeMp3(db: Db, cacheDir: string, target: string, open: () =
   try {
     // Output goes to a file, not pipe:1: ffmpeg can only write the Xing/VBR header when it can seek
     // back, and without it players estimate the duration from bitrate (a 22 s track read as 28 s).
-    await runFfmpeg(db, ["-hide_banner","-loglevel","error","-i","pipe:0","-codec:a","libmp3lame","-q:a","5","-f","mp3","-y",temp], async (proc) => {
+    await runFfmpeg(db, ["-hide_banner","-loglevel","error","-i","pipe:0","-codec:a","libmp3lame","-threads","1","-q:a","5","-f","mp3","-y",temp], async (proc) => {
       // The remote store's stream is already flowing (its idle-timeout `data` listener starts it), so it
       // must be piped in the same tick it is opened: any await in between drops the Ogg header pages.
       opened = await open();
@@ -2281,7 +2406,7 @@ async function mixMp3(db: Db, cacheDir: string, target: string, open: (track: Re
     const filter = offset >= 0
       ? `[1:a]adelay=${delay}:all=1[d];[0:a][d]amix=inputs=2:duration=longest:normalize=0`
       : `[0:a]adelay=${delay}:all=1[d];[d][1:a]amix=inputs=2:duration=longest:normalize=0`;
-    await runFfmpeg(db, ["-hide_banner","-loglevel","error","-nostdin","-i",caller,"-i",remote,"-filter_complex",filter,"-codec:a","libmp3lame","-q:a","5","-f","mp3",temp]);
+    await runFfmpeg(db, ["-hide_banner","-loglevel","error","-nostdin","-i",caller,"-i",remote,"-filter_complex",filter,"-codec:a","libmp3lame","-threads","1","-q:a","5","-f","mp3",temp]);
     await rename(temp, target);
   } finally {
     await Promise.all([temp, caller, remote].map((path) => unlink(path).catch(() => {})));
@@ -2289,7 +2414,7 @@ async function mixMp3(db: Db, cacheDir: string, target: string, open: (track: Re
 }
 /** Decoded length of a spooled track, in ms; an absent or unreadable ffprobe measures nothing. */
 async function probeDurationMs(path: string) {
-  const proc = spawn("ffprobe", ["-v","error","-show_entries","format=duration","-of","csv=p=0",path], { stdio: ["ignore","pipe","pipe"] });
+  const proc = spawn("nice", ["-n","19","ffprobe","-v","error","-show_entries","format=duration","-of","csv=p=0",path], { stdio: ["ignore","pipe","pipe"] });
   let out = "";
   proc.stdout!.on("data", (chunk: Buffer) => { out = (out + chunk.toString()).slice(0, 64); });
   proc.stderr!.resume();
@@ -2321,9 +2446,11 @@ export async function pretranscodePixelRecording(
   cacheDir: string,
   callId: string,
   transcode = transcodeMp3,
+  wait: { maxWaitMs?: number; pollMs?: number; transcriptionEnabled?: boolean } = {},
 ) {
   let track = "";
   try {
+    await pretranscodeWait(db, callId, wait);
     const manifest = await reader.manifest(callId);
     for (const item of [...manifest?.tracks ?? [], ...manifest?.uplinkTracks ?? []]) {
       track = item.track;
@@ -2333,6 +2460,25 @@ export async function pretranscodePixelRecording(
   } catch (error) {
     diag(db, "recording.pretranscode_failed", { track, reason: errorReason(error) }, { callId, level: "warn" });
   }
+}
+// S100: the archive lands while the transcript job (enqueued by the runtime's next scan) and maybe the next call
+// are starting, so the transcode yields until both are done, polling on an unref timer up to maxWaitMs (0 = never wait).
+async function pretranscodeWait(db: Db, callId: string, { maxWaitMs = 0, pollMs = 15_000, transcriptionEnabled = false }) {
+  const started = Date.now();
+  let reason = "";
+  while (maxWaitMs > 0) {
+    // A missing job only means "not scanned yet" while transcription is on and the call is one the runtime enqueues.
+    const transcript = (await db.query(`SELECT EXISTS(SELECT 1 FROM transcript_jobs WHERE call_id=$1 AND state IN ('queued','running','retry'))
+      OR ($2::boolean AND NOT EXISTS(SELECT 1 FROM transcript_jobs WHERE call_id=$1) AND EXISTS(SELECT 1 FROM call_records c
+        WHERE c.id=$1 AND c.state='ended' AND NOT (c.internal_call AND c.direction='outgoing'))) pending`, [callId, transcriptionEnabled])).rows[0]?.pending === true;
+    const blocker = transcript ? "transcript_running" : await hasLiveCalls(db) ? "live_call" : "";
+    if (!blocker) break;
+    reason = blocker;
+    const left = maxWaitMs - (Date.now() - started);
+    if (left <= 0) { reason = "max_wait"; break; }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, left)).unref());
+  }
+  if (reason) diag(db, "recording.pretranscode_deferred", { waitedMs: Date.now() - started, reason }, { callId });
 }
 function cachedMp3(cacheDir: string, key: string, build: (target: string) => Promise<void>) {
   const target = join(cacheDir, `${key}.mp3`);
@@ -2878,13 +3024,15 @@ async function authorizeGatewayMedia(
   // telecom snapshot, ack). `ensureCaptureBinding` inserts a row whose FK takes KEY SHARE on this
   // gateway, so taking the call row first inverted the order against the snapshot POST (which holds
   // the gateway and then locks the call) — 2026-09-18 deadlock (40P01) on media/options.
-  await c.query(`SELECT id FROM gateways WHERE id=$1 FOR UPDATE`,[gatewayId]);
+  // S123 决策 8: KEY SHARE, since this only reads the gateway: it no longer queues behind the heartbeat's non-key
+  // UPDATE and is compatible with the binding FK's KEY SHARE, but still waits for the snapshot's FOR UPDATE by design.
+  await c.query(`SELECT id FROM gateways WHERE id=$1 FOR KEY SHARE`,[gatewayId]);
   // S22 (R5 §Q7.4): the gateway's own media leg reads the same 3-heartbeat / 15-second debounce as
   // the AI audio authority and the human call path. A bare `g.media_ready` here let one unready
   // heartbeat refuse options/offer with 503 and, on the post-offer recheck, close the bridge room
   // that the AI leg was already using.
   const q = await c.query(
-    `SELECT c.id,c.state,c.direction,c.generation,c.snapshot_owner_id,c.device_call_id,c.media_node_id,c.media_epoch,c.originating_session_id,c.claimed_by_session_id,g.device_epoch,g.control_enabled,g.last_seen_at,
+    `SELECT c.id,c.state,c.direction,c.answered_by_platform,c.generation,c.snapshot_owner_id,c.device_call_id,c.media_node_id,c.media_epoch,c.originating_session_id,c.claimed_by_session_id,g.device_epoch,g.control_enabled,g.last_seen_at,
        (g.media_ready OR (g.media_unready_heartbeats<3 AND (g.media_unready_since IS NULL OR g.media_unready_since>now()-interval '15 seconds'))) media_ready
      FROM call_records c JOIN gateways g ON g.id=c.gateway_id WHERE c.id=$1 AND c.gateway_id=$2 FOR UPDATE OF c`,
     [callId, gatewayId],
@@ -2893,8 +3041,11 @@ async function authorizeGatewayMedia(
   const call = q.rows[0];
   // S56: a capture-less options request is only an unanswered outgoing call's early-media leg.
   // A terminal call falls through to MEDIA_REVOKED below: an early leg racing a hangup is not a missing capture.
+  // S123 决策 7: or an AI-answered incoming call's leg, built while the phone still rings ('connecting' from the
+  // AI commit until the ACTIVE snapshot) or after a budget answer ('active'); it arms via capture-binding.
   if(earlyMediaOnly&&!["ending","ended","failed","unknown"].includes(call.state)&&
-    !(config.EARLY_MEDIA_ENABLED&&call.direction==="outgoing"&&["outgoing_pending","connecting"].includes(call.state)))
+    !(config.EARLY_MEDIA_ENABLED&&call.direction==="outgoing"&&["outgoing_pending","connecting"].includes(call.state))&&
+    !(config.AI_EARLY_LEG_ENABLED&&call.direction==="incoming"&&call.answered_by_platform==="ai"&&["connecting","active"].includes(call.state)))
     fail(409,"CAPTURE_BINDING_REQUIRED","Gateway must provide a durable recording capture identity");
   if (!call.media_ready) {
     diag(db,"media.unavailable",{role:"gateway",reason:"gateway_media_not_ready",gatewayId},{callId,level:"warn"});
@@ -3032,7 +3183,7 @@ function registerMediaRoutes(
     const { callId } = z.object({ callId: z.uuid() }).parse(req.params);
     const body=z.object({transport:z.enum(["udp","tls"]).default("udp"),relay:z.boolean().optional(),nodeId:z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional(),capture:z.object({deviceCallId:z.string().min(1).max(200),telecomCreationTimeMillis:z.number().int().positive().max(Number.MAX_SAFE_INTEGER)}).optional()}).default({transport:"udp"}).parse(req.body);
     const earlyMediaOnly=config.PIXEL_ARCHIVE_ENABLED&&!body.capture;
-    if(earlyMediaOnly&&!config.EARLY_MEDIA_ENABLED)fail(409,"CAPTURE_BINDING_REQUIRED","Gateway must provide a durable recording capture identity");
+    if(earlyMediaOnly&&!config.EARLY_MEDIA_ENABLED&&!config.AI_EARLY_LEG_ENABLED)fail(409,"CAPTURE_BINDING_REQUIRED","Gateway must provide a durable recording capture identity");
     const bridge=requireMediaBridge(media);
     let call;
     try {
@@ -3108,26 +3259,27 @@ function registerAdminRoutes(app: FastifyInstance, db: Db, config: Config) {
       })),
     };
   });
+  const ADMIN_GATEWAY_COLUMNS = `id,name,control_enabled,telephony_ready,sms_ready,media_ready,last_seen_at,device_epoch,command_sequence,time_zone,kind,module_label`;
+  const adminGatewayDto = (r: any) => ({
+    id: r.id,
+    name: r.name,
+    controlEnabled: r.control_enabled,
+    telephonyReady: r.telephony_ready,
+    smsReady: r.sms_ready,
+    mediaReady: r.media_ready,
+    lastSeenAt: r.last_seen_at,
+    deviceEpoch: Number(r.device_epoch),
+    serverSequence: Number(r.command_sequence),
+    timeZone: r.time_zone,
+    kind: r.kind,
+    ...(r.module_label ? { moduleLabel: r.module_label } : {}),
+  });
   app.get("/api/v1/admin/gateways", async (req) => {
     requireAdmin(req);
     const q = await db.query(
-      `SELECT id,name,control_enabled,telephony_ready,sms_ready,media_ready,last_seen_at,device_epoch,command_sequence,time_zone,kind FROM gateways ORDER BY name`,
+      `SELECT ${ADMIN_GATEWAY_COLUMNS} FROM gateways ORDER BY name`,
     );
-    return {
-      items: q.rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        controlEnabled: r.control_enabled,
-        telephonyReady: r.telephony_ready,
-        smsReady: r.sms_ready,
-        mediaReady: r.media_ready,
-        lastSeenAt: r.last_seen_at,
-        deviceEpoch: Number(r.device_epoch),
-        serverSequence: Number(r.command_sequence),
-        timeZone: r.time_zone,
-        kind: r.kind,
-      })),
-    };
+    return { items: q.rows.map(adminGatewayDto) };
   });
   app.get("/api/v1/admin/sims", async (req) => {
     requireAdmin(req);
@@ -3175,6 +3327,37 @@ function registerAdminRoutes(app: FastifyInstance, db: Db, config: Config) {
       },
     });
   });
+  // S131: the only writer of gateways.name after creation; heartbeat and pair never touch it.
+  app.patch("/api/v1/admin/gateways/:gatewayId", async (req) => {
+    const p = requireAdmin(req);
+    mutationOrigin(req, config);
+    const { gatewayId } = z.object({ gatewayId: z.uuid() }).parse(req.params);
+    const { name } = z
+      .object({ name: z.string().trim().min(1).max(120) })
+      .parse(req.body);
+    const row = await tx(db, async (c) => {
+      // Serialise renames so two concurrent renames cannot both pass the duplicate check.
+      // No unique index: existing duplicate names stay valid until someone renames one of them.
+      await c.query(`SELECT pg_advisory_xact_lock(hashtext('vodog-gateway-rename'))`);
+      const locked = await c.query(`SELECT name FROM gateways WHERE id=$1 FOR UPDATE`, [gatewayId]);
+      if (!locked.rowCount) fail(404, "NOT_FOUND", "Gateway not found");
+      const oldName: string = locked.rows[0].name;
+      if (oldName !== name) {
+        const taken = await c.query(
+          `SELECT 1 FROM gateways WHERE id<>$1 AND lower(btrim(name))=lower($2) LIMIT 1`,
+          [gatewayId, name],
+        );
+        if (taken.rowCount) fail(409, "GATEWAY_NAME_TAKEN", "已有同名网关");
+        await c.query(`UPDATE gateways SET name=$2 WHERE id=$1`, [gatewayId, name]);
+        await c.query(
+          `INSERT INTO audit_events(actor_user_id,action,resource_type,resource_id,details)VALUES($1,'gateway.rename','gateway',$2,$3)`,
+          [p.user.id, gatewayId, JSON.stringify({ oldName, newName: name })],
+        );
+      }
+      return (await c.query(`SELECT ${ADMIN_GATEWAY_COLUMNS} FROM gateways WHERE id=$1`, [gatewayId])).rows[0];
+    });
+    return { gateway: adminGatewayDto(row) };
+  });
   app.delete("/api/v1/admin/gateways/:gatewayId", async (req, reply) => {
     const p = requireAdmin(req);
     mutationOrigin(req, config);
@@ -3215,14 +3398,22 @@ function registerAdminRoutes(app: FastifyInstance, db: Db, config: Config) {
       const p = requireAdmin(req);
       mutationOrigin(req, config);
       const { gatewayId } = z.object({ gatewayId: z.uuid() }).parse(req.params);
+      // S130: replaceModule lets this code move the row to a different module.
+      const { replaceModule } = z
+        .object({ replaceModule: z.boolean().default(false) })
+        .parse(req.body ?? {});
       const exists = await db.query(`SELECT 1 FROM gateways WHERE id=$1`, [
         gatewayId,
       ]);
       if (!exists.rowCount) fail(404, "NOT_FOUND", "Gateway not found");
       const code = opaqueToken(24);
       const q = await db.query(
-        `INSERT INTO device_pairing_codes(gateway_id,code_hash,expires_at,created_by)VALUES($1,$2,now()+interval '10 minutes',$3)RETURNING id,expires_at`,
-        [gatewayId, tokenHash(code), p.user.id],
+        `INSERT INTO device_pairing_codes(gateway_id,code_hash,expires_at,created_by,replace_module)VALUES($1,$2,now()+interval '10 minutes',$3,$4)RETURNING id,expires_at`,
+        [gatewayId, tokenHash(code), p.user.id, replaceModule],
+      );
+      await db.query(
+        `INSERT INTO audit_events(actor_user_id,action,resource_type,resource_id,details)VALUES($1,'gateway.pairing_code.create','gateway',$2,$3)`,
+        [p.user.id, gatewayId, JSON.stringify({ replaceModule })],
       );
       return reply.code(201).send({
         pairingCode: {
@@ -3306,6 +3497,7 @@ function registerGatewayRoutes(
   standbyDoorbell: CommandDoorbell,
   standbyMaxHoldMs: number,
   kickPush: () => void,
+  wakeAiClaims: () => void = () => {},
 ) {
   const ringDoorbell=(gatewayId:string|null|undefined)=>{if(gatewayId)commandDoorbell.notify(gatewayId);};
   // S29 §2.2: in-memory only. Counts consecutive heartbeats in which the same replay proposal is
@@ -3357,12 +3549,18 @@ function registerGatewayRoutes(
   });
   app.post("/api/v1/gateway/pair", async (req, reply) => {
     const b = z
-      .object({ code: z.string().min(20), label: z.string().min(1).max(120) })
+      .object({
+        code: z.string().min(20),
+        label: z.string().min(1).max(120),
+        // S130: optional module identity (CellDock); Pixel omits both and its row never binds.
+        moduleKey: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+        moduleLabel: z.string().regex(/^\d{6}$/).optional(),
+      })
       .parse(req.body);
     const secret = opaqueToken();
     const value = await tx(db, async (c) => {
       const q = await c.query(
-        `UPDATE device_pairing_codes SET consumed_at=now() WHERE code_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING gateway_id`,
+        `UPDATE device_pairing_codes SET consumed_at=now() WHERE code_hash=$1 AND consumed_at IS NULL AND expires_at>now() RETURNING gateway_id,replace_module`,
         [tokenHash(b.code)],
       );
       if (!q.rowCount)
@@ -3372,6 +3570,9 @@ function registerGatewayRoutes(
           "Pairing code is expired, consumed, or invalid",
         );
       const gatewayId = q.rows[0].gateway_id;
+      // S130 §3: decide the module binding before the epoch bump; any 409 rolls back this whole
+      // transaction, so the code stays unconsumed and the current credentials stay valid.
+      const moduleLabel = await bindPairingModule(c, gatewayId, Boolean(q.rows[0].replace_module), b.moduleKey, b.moduleLabel);
       const openCalls = await c.query(
         `SELECT id FROM call_records WHERE gateway_id=$1 AND state NOT IN ('ended','failed')`,
         [gatewayId],
@@ -3395,6 +3596,7 @@ function registerGatewayRoutes(
       return {
         gatewayId,
         deviceEpoch: Number(g.rows[0].device_epoch),
+        moduleLabel,
         closeCallIds: openCalls.rows.map((row) => row.id as string),
       };
     });
@@ -3403,7 +3605,11 @@ function registerGatewayRoutes(
     );
     return reply.code(201).send({
       deviceToken: secret,
-      gateway: { id: value.gatewayId, deviceEpoch: value.deviceEpoch },
+      gateway: {
+        id: value.gatewayId,
+        deviceEpoch: value.deviceEpoch,
+        ...(value.moduleLabel ? { moduleLabel: value.moduleLabel } : {}),
+      },
     });
   });
   app.post("/api/v1/gateway/sims/sync", async (req) => {
@@ -3999,6 +4205,8 @@ function registerGatewayRoutes(
     ringDoorbell(doorbellGatewayId);
     if (!value.replayed) {
       if (value.call?.state === "incoming_ringing") kickPush();
+      // After the commit, like the doorbell: a held AI claim picks the new run up at once.
+      if (value.call?.ai_run_id) wakeAiClaims();
       // Never the number: which Pixel, what Control decided, and how long the report took.
       diag(db, "call.incoming", {
         direction: "incoming", gatewayId: p.gatewayId, disposition: value.disposition,
@@ -4139,7 +4347,7 @@ function registerGatewayRoutes(
         telecomCreationTimeMillis: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       })
       .parse(req.body);
-    if (!(config.PIXEL_ORIGINATED_CALLS_ENABLED || config.EARLY_MEDIA_ENABLED) || !config.PIXEL_ARCHIVE_ENABLED)
+    if (!(config.PIXEL_ORIGINATED_CALLS_ENABLED || config.EARLY_MEDIA_ENABLED || config.AI_EARLY_LEG_ENABLED) || !config.PIXEL_ARCHIVE_ENABLED)
       fail(503, "CAPTURE_DISABLED", "Pixel-originated recording capture is not enabled");
     const bridge = requireMediaBridge(media);
     return tx(db, async (c) => {
@@ -4156,7 +4364,9 @@ function registerGatewayRoutes(
       // S56: an early-media outgoing call asks here once ACTIVE; its media node is already pinned.
       const pixelCall = config.PIXEL_ORIGINATED_CALLS_ENABLED && call.originating_platform === "pixel";
       const earlyMediaCall = config.EARLY_MEDIA_ENABLED && call.direction === "outgoing";
-      if (!(pixelCall || earlyMediaCall) || call.state !== "active")
+      // S123 决策 7: an AI early leg arms here once ACTIVE, like the S56 outgoing leg.
+      const aiEarlyLegCall = config.AI_EARLY_LEG_ENABLED && call.direction === "incoming" && call.answered_by_platform === "ai";
+      if (!(pixelCall || earlyMediaCall || aiEarlyLegCall) || call.state !== "active")
         fail(409, "CAPTURE_NOT_ACTIVE", "Recording capture requires an active call dialed on the phone");
       const nodeId = call.media_node_id ?? bridge.defaultNodeId;
       if (!call.media_node_id)
@@ -4826,6 +5036,9 @@ function registerGatewayRoutes(
         deviceStatus: z.unknown().optional(),
         // S58: display-only hardware kind; omitted by an old gateway, which keeps the stored value.
         kind: z.enum(['pixel','dji4g']).optional(),
+        // S130 §4: backfills an unbound row; a mismatch is only diagnosed, never rejected.
+        moduleKey: z.string().regex(/^[0-9a-f]{16}$/).optional().catch(undefined),
+        moduleLabel: z.string().regex(/^\d{6}$/).optional().catch(undefined),
       })
       .parse(req.body);
     if (b.timeZone !== undefined) {
@@ -4885,7 +5098,7 @@ function registerGatewayRoutes(
         // pinned a media node survives a transient mediaReady=false; only a control
         // shutdown, a call without a media node, or a sustained withdrawal ends it.
         const calls=await c.query(`UPDATE call_records call SET state='unknown',failure_reason='media_capability_withdrawn'
-          FROM gateways gateway WHERE gateway.id=call.gateway_id AND call.gateway_id=$1 AND call.state NOT IN ('ending','ended','failed','unknown')
+          FROM gateways gateway WHERE gateway.id=call.gateway_id AND call.gateway_id=$1 AND ${liveCallSql('call')}
             AND ($2::boolean OR (call.answered_by_platform IS DISTINCT FROM 'device' AND (call.media_node_id IS NULL OR gateway.media_unready_heartbeats>=3
               OR gateway.media_unready_since<=now()-interval '15 seconds'))) RETURNING call.id`,[p.gatewayId,!b.controlEnabled]);
         closeCallIds=calls.rows.map(row=>row.id);
@@ -4999,7 +5212,8 @@ function registerGatewayRoutes(
          ORDER BY sequence LIMIT 100`,
         [p.gatewayId,epoch,b.capabilities.smsReady,b.capabilities.telephonyReady,b.capabilities.commandReconciliationReady,b.reportedSequence,deliveryFloor],
       ):{rows:[]};
-      await c.query(`UPDATE sms_dispatch_queue SET first_delivery_at=COALESCE(first_delivery_at,clock_timestamp()) WHERE command_id=ANY($1::uuid[])`,[q.rows.filter((row:any)=>row.kind==='send_sms').map((row:any)=>row.id)]);
+      const deliveredSms=q.rows.filter((row:any)=>row.kind==='send_sms').map((row:any)=>row.id);
+      if(deliveredSms.length)await c.query(`UPDATE sms_dispatch_queue SET first_delivery_at=COALESCE(first_delivery_at,clock_timestamp()) WHERE command_id=ANY($1::uuid[])`,[deliveredSms]);
       // Hangup-before-delivery: `/end` only cancels a dial no heartbeat has handed out for execution.
       const executableDials=q.rows.filter((row:any)=>row.kind==='dial'&&!row.reconciliation_only).map((row:any)=>row.id);
       if(executableDials.length)await c.query(`UPDATE commands SET delivered_at=clock_timestamp() WHERE id=ANY($1::uuid[]) AND delivered_at IS NULL`,[executableDials]);
@@ -5007,6 +5221,7 @@ function registerGatewayRoutes(
         replayCommitted:{floor:Number(persistedHorizon?.committed_floor??1),revision:Number(persistedHorizon?.committed_revision??0)}};
     });
     await Promise.all(state.closeCallIds.map(callId=>requestMediaClose(db,media,callId)));
+    if(b.moduleKey)await heartbeatModule(db,p.gatewayId,b.moduleKey,b.moduleLabel);
     // S36b D3: emitted after the transaction, so a rolled-back heartbeat files nothing. `gateway.state`
     // only on an actual flip — a steady 2 s beat must not write a row per beat — and the gap is what
     // makes a Doze window or a dead radio visible after the fact.
@@ -5055,6 +5270,8 @@ function registerGatewayRoutes(
       numberBlocklist: { ...state.numberBlocklist, phoneSync: phoneBlocklistSyncMode(config) },
       // S56: every answer, like `phoneSync`; the gateway follows it at runtime.
       earlyMedia: config.EARLY_MEDIA_ENABLED,
+      // S123 决策 6: same rule as `earlyMedia`.
+      aiEarlyLeg: config.AI_EARLY_LEG_ENABLED,
       // S21 §D: null unless a remote OFF was pending; it is already consumed when this is `off`.
       desiredPower: state.desiredPower ?? null,
       // 0 means the long poll is off; the gateway's doorbell coroutine only runs above 0.

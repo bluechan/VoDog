@@ -3,8 +3,9 @@ import type {FastifyInstance,FastifyRequest} from 'fastify';
 import {z} from 'zod';
 import type {Config} from '../config.js';
 import type {Db} from '../db.js';
+import type {CommandDoorbell} from '../command-doorbell.js';
 import {MediaNodeNotFoundError,MediaNodeRegistry} from '../media-node-registry.js';
-import {AiRunError,AI_PROTOCOL,authorizeAiMedia,claimAiRun,commitAiAnswer,failAiRun,heartbeatAiWorker,markAiMediaFailure,readAiRun,renewAiLease} from './repository.js';
+import {AiRunError,AI_COMMIT_RINGING_WAIT_MS,AI_PROTOCOL,authorizeAiMedia,claimAiRun,commitAiAnswer,failAiRun,heartbeatAiWorker,markAiMediaFailure,readAiRun,renewAiLease} from './repository.js';
 import {VOICE_PROVIDER_ID} from './voice-providers.js';
 import {diag} from '../diag.js';
 import {MediaBridgeError} from '../media-client.js';
@@ -15,7 +16,11 @@ const workerIdentity=z.object({instanceId:z.uuid(),bootId:z.uuid()});
 
 export function registerAiRunRoutes(app:FastifyInstance,db:Db,config:Config,media:MediaNodeRegistry|null,fail:Fail,onMediaClose:(callId:string)=>Promise<void>,
   /** S20 D4: rung after the answer command's transaction committed, never inside it. */
-  onCommandInserted?:(gatewayId:string)=>void){
+  onCommandInserted?:(gatewayId:string)=>void,
+  /** Claim long poll: one waiter per worker instance, rung (notifyAll) after a run-creating commit. */
+  claimDoorbell?:CommandDoorbell){
+  const rawClaimHoldMs=Number(config.AI_CLAIM_HOLD_MS??0);
+  const claimHoldMs=claimDoorbell&&Number.isFinite(rawClaimHoldMs)?Math.min(2500,Math.max(0,Math.trunc(rawClaimHoldMs))):0;
   const mapError=(error:unknown):never=>{
     if(error instanceof AiRunError&&error.lease?.runId)leaseLost(error.lease as {runId:string;check:string;runState?:string});
     if(error instanceof AiRunError)fail(error.status,error.code,error.message);throw error;
@@ -47,8 +52,15 @@ export function registerAiRunRoutes(app:FastifyInstance,db:Db,config:Config,medi
     try{return{worker:{...body,...await heartbeatAiWorker(db,body)}};}catch(error){return mapError(error);}
   });
   app.post('/internal/v1/ai/runs/claim',async(req,reply)=>{
-    requireService(req);const body=workerIdentity.parse(req.body);
-    try{const claimed=await claimAiRun(db,{enabled:config.AI_ENABLED&&config.AI_WORKER_READY,...body});if(!claimed)return reply.code(204).send();return{run:{...claimed.run,leaseToken:claimed.leaseToken,leaseExpiresAt:claimed.leaseExpiresAt}};}catch(error){return mapError(error);}
+    requireService(req);const body=workerIdentity.parse(req.body);const enabled=config.AI_ENABLED&&config.AI_WORKER_READY;
+    // Registration strictly precedes the first read (as in the command doorbell), so a run committed
+    // in between still wakes this waiter. No pg client is held while it sleeps; one retry on a wake.
+    const waiter=enabled&&claimHoldMs>0?claimDoorbell!.listen(body.instanceId):null;
+    try{
+      let claimed=await claimAiRun(db,{enabled,...body});
+      if(!claimed&&waiter&&await waiter.wait(claimHoldMs,reply.raw,req.raw.socket))claimed=await claimAiRun(db,{enabled,...body});
+      if(!claimed)return reply.code(204).send();return{run:{...claimed.run,leaseToken:claimed.leaseToken,leaseExpiresAt:claimed.leaseExpiresAt}};
+    }catch(error){return mapError(error);}finally{waiter?.dispose();}
   });
   app.put('/internal/v1/ai/runs/:runId/lease',async req=>{
     requireService(req);const {runId}=z.object({runId:z.uuid()}).parse(req.params),body=workerIdentity.parse(req.body);
@@ -59,7 +71,7 @@ export function registerAiRunRoutes(app:FastifyInstance,db:Db,config:Config,medi
     if(!media)fail(503,'MEDIA_UNAVAILABLE','Call media is not configured');
     let nodeId:string;try{nodeId=media.choose(config.AI_MEDIA_NODE_ID);}catch(error){if(error instanceof MediaNodeNotFoundError)fail(503,'AI_MEDIA_NODE_UNAVAILABLE','AI media node is not configured');throw error;}
     try{
-      const committed=await commitAiAnswer(db,{enabled:config.AI_ENABLED&&config.AI_WORKER_READY,runId,token:lease(req),onlineSeconds:config.GATEWAY_ONLINE_SECONDS,nodeId,...body});
+      const committed=await commitAiAnswer(db,{enabled:config.AI_ENABLED&&config.AI_WORKER_READY,runId,token:lease(req),onlineSeconds:config.GATEWAY_ONLINE_SECONDS,nodeId,ringingWaitMs:AI_COMMIT_RINGING_WAIT_MS,...body});
       if(!committed.replayed&&onCommandInserted){
         const owner=await db.query(`SELECT gateway_id FROM ai_call_runs WHERE id=$1`,[runId]);
         if(owner.rowCount)onCommandInserted(owner.rows[0].gateway_id);
@@ -83,7 +95,7 @@ export function registerAiRunRoutes(app:FastifyInstance,db:Db,config:Config,medi
   });
   app.get('/internal/v1/ai/runs/:runId',async req=>{
     requireService(req);const {runId}=z.object({runId:z.uuid()}).parse(req.params),query=workerIdentity.parse(req.query);
-    try{return await readAiRun(db,{runId,token:lease(req),onlineSeconds:config.GATEWAY_ONLINE_SECONDS,...query});}catch(error){return mapError(error);}
+    try{return await readAiRun(db,{runId,token:lease(req),onlineSeconds:config.GATEWAY_ONLINE_SECONDS,activeCallGraceSeconds:config.GATEWAY_ACTIVE_CALL_GRACE_SECONDS??0,...query});}catch(error){return mapError(error);}
   });
   app.post('/internal/v1/ai/runs/:runId/fail',async req=>{
     requireService(req);const {runId}=z.object({runId:z.uuid()}).parse(req.params),body=workerIdentity.extend({code:z.string().regex(/^[a-z0-9_]{1,80}$/)}).parse(req.body);

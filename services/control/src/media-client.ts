@@ -27,7 +27,18 @@ export class MediaBridgeClient {
   /** S75c: `replace` only for the leg's owner — the bridge then replaces the role's leg even if it still looks Connected. */
   async offer(callId: string, role: 'client' | 'gateway', offer: {type:'offer';sdp:string}, mediaEpoch = 1, replace = false) {
     if (offer.type !== 'offer' || Buffer.byteLength(offer.sdp)>120*1024) throw new Error('Invalid media offer');
-    const response = await fetch(`${this.controlBaseUrl}/offer`, {method:'POST',headers:{Authorization:'Bearer '+this.grant(callId,role,mediaEpoch,replace),'Content-Type':'application/json'},body:JSON.stringify(offer),signal:AbortSignal.timeout(15000),redirect:'error'});
+    // Every attempt carries a fresh single-use grant.
+    const send = () => fetch(`${this.controlBaseUrl}/offer`, {method:'POST',headers:{Authorization:'Bearer '+this.grant(callId,role,mediaEpoch,replace),'Content-Type':'application/json'},body:JSON.stringify(offer),signal:AbortSignal.timeout(15000),redirect:'error'});
+    let response: Response;
+    try { response = await send(); }
+    catch (error) {
+      // One resend after a connection-level failure (a reset keep-alive socket, a refused connect),
+      // only for a replacing leg: the bridge swaps that role's leg anyway (S75c). Never after an HTTP
+      // answer or a timeout, and never for the AI leg, which stays single-attempt (S22).
+      if (!replace || !isConnectionError(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, OFFER_RETRY_DELAY_MS));
+      response = await send();
+    }
     if (!response.ok) throw new MediaBridgeError(response.status);
     const answer = await response.json() as {type:string;sdp:string};
     if(answer.type!=='answer'||typeof answer.sdp!=='string'||answer.sdp.length>128*1024)throw new Error('Invalid bridge answer');
@@ -39,6 +50,15 @@ export class MediaBridgeClient {
     const response=await fetch(`${this.controlBaseUrl}/close/${callId}`,{method:'POST',headers:{Authorization:'Bearer '+this.secret,'X-Media-Epoch':String(mediaEpoch)},signal:AbortSignal.timeout(5000),redirect:'error'});
     if(!response.ok)throw new MediaBridgeError(response.status);
   }
+}
+const OFFER_RETRY_DELAY_MS = 150;
+const CONNECTION_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED']);
+/** fetch reports network failures as `TypeError('fetch failed')` with the socket error as `cause`; a timeout is a DOMException and never matches. */
+export function isConnectionError(error: unknown): boolean {
+  if (!(error instanceof TypeError)) return false;
+  const cause = (error as { cause?: { code?: unknown; errors?: { code?: unknown }[] } }).cause;
+  const codes = [cause?.code, ...(Array.isArray(cause?.errors) ? cause.errors.map(item => item?.code) : [])];
+  return codes.some(code => typeof code === 'string' && CONNECTION_ERROR_CODES.has(code));
 }
 export class MediaBridgeError extends Error { constructor(public readonly status:number){super('Media bridge request failed');} }
 export function validatedControlBaseUrl(value: string): string {

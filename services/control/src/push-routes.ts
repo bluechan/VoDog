@@ -10,9 +10,12 @@ export function registerPushRoutes(app: FastifyInstance, db: Db, authorize: (req
   app.put('/api/v1/push/registrations/:installationId', async (req, reply) => {
     const identity = authorize(req);
     const { installationId } = z.object({ installationId: z.uuid() }).parse(req.params);
-    const platform = z.object({platform:z.enum(['ios','android'])}).parse(req.body).platform;
-    if (identity.platform !== platform) return reply.code(403).send({ error: { code: 'PLATFORM_MISMATCH', message: `An ${platform} session is required` } });
-    const body = platform === 'ios'
+    const platform = z.object({platform:z.enum(['ios','android','watchos'])}).parse(req.body).platform;
+    // S104: the watch shares its iPhone's session; every other pairing stays strict.
+    if (identity.platform !== platform && !(identity.platform === 'ios' && platform === 'watchos')) return reply.code(403).send({ error: { code: 'PLATFORM_MISMATCH', message: `An ${platform} session is required` } });
+    const body = platform === 'watchos'
+      ? z.object({ platform: z.literal('watchos'), bundleId: z.literal('org.vodog.watchkitapp'), environment: z.enum(['development','production']), deviceName: z.string().min(1).max(120), apnsToken: token, voipToken: token.optional(), badge }).parse(req.body)
+      : platform === 'ios'
       ? z.object({ platform: z.literal('ios'), bundleId: z.literal('org.vodog'), environment: z.enum(['development','production']), deviceName: z.string().min(1).max(120), apnsToken: token.optional(), voipToken: token.optional(), badge }).parse(req.body)
       : z.object({ platform: z.literal('android'), packageName: z.literal('org.vodog'), deviceName: z.string().min(1).max(120), fcmToken, badge }).parse(req.body);
     const badgeCalls = body.badge?.calls ?? null, badgeSms = body.badge?.sms ?? null;
@@ -32,6 +35,22 @@ export function registerPushRoutes(app: FastifyInstance, db: Db, authorize: (req
           [installationId,identity.userId,identity.sessionId,body.packageName,body.deviceName,body.fcmToken,badgeCalls,badgeSms]);
         await client.query('COMMIT');const row=result.rows[0];
         return {registration:{id:row.id,installationId:row.installation_id,fcmEnabled:row.fcm_enabled,updatedAt:row.updated_at}};
+      }
+      if (body.platform === 'watchos') {
+        // S105: the watch's own PushKit token rides along; same rotation rule as the iOS branch.
+        await client.query(`UPDATE push_registrations SET
+          apns_token=CASE WHEN apns_token=$2 THEN NULL ELSE apns_token END,
+          voip_token=CASE WHEN voip_token=$3 THEN NULL ELSE voip_token END,updated_at=now()
+          WHERE installation_id<>$1 AND environment=$4 AND (apns_token=$2 OR voip_token=$3)`,[installationId,body.apnsToken,body.voipToken??null,body.environment]);
+        const result=await client.query(`INSERT INTO push_registrations(installation_id,user_id,session_id,platform,environment,package_name,device_name,apns_token,voip_token,fcm_token,badge_calls,badge_sms)
+          VALUES($1,$2,$3,'watchos',$4,NULL,$5,$6,$9,NULL,COALESCE($7::boolean,false),COALESCE($8::boolean,false))
+          ON CONFLICT(installation_id) DO UPDATE SET user_id=excluded.user_id,session_id=excluded.session_id,platform='watchos',environment=excluded.environment,package_name=NULL,
+          device_name=excluded.device_name,apns_token=excluded.apns_token,
+          voip_token=CASE WHEN push_registrations.user_id=excluded.user_id AND push_registrations.environment=excluded.environment THEN COALESCE(excluded.voip_token,push_registrations.voip_token) ELSE excluded.voip_token END,fcm_token=NULL,
+          badge_calls=COALESCE($7::boolean,push_registrations.badge_calls),badge_sms=COALESCE($8::boolean,push_registrations.badge_sms),disabled_at=NULL,updated_at=now() RETURNING id,installation_id,apns_token IS NOT NULL apns_enabled,voip_token IS NOT NULL voip_enabled,updated_at`,
+          [installationId,identity.userId,identity.sessionId,body.environment,body.deviceName,body.apnsToken,badgeCalls,badgeSms,body.voipToken??null]);
+        await client.query('COMMIT');const row=result.rows[0];
+        return {registration:{id:row.id,installationId:row.installation_id,apnsEnabled:row.apns_enabled,voipEnabled:row.voip_enabled,updatedAt:row.updated_at}};
       }
       await client.query(`UPDATE push_registrations SET
         apns_token=CASE WHEN apns_token=$2 THEN NULL ELSE apns_token END,

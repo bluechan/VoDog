@@ -94,6 +94,11 @@ export class CommandDoorbell {
     this.waiters.get(gatewayId)?.settle(true);
   }
 
+  /** Wakes every waiter (the AI claim table is keyed by worker instance and any of them may claim). */
+  notifyAll() {
+    for (const waiter of [...this.waiters.values()]) waiter.settle(true);
+  }
+
   release(gatewayId: string, waiter: DoorbellWaiter) {
     if (this.waiters.get(gatewayId) === waiter) this.waiters.delete(gatewayId);
   }

@@ -69,7 +69,8 @@ test('a Pixel track over 20 MiB is transcribed in timed pieces and merged; a sho
   const db = {query: async () => ({rowCount: 1, rows: [{media_node_id: 'relay-primary', media_epoch: 1}]})};
   const sent: Array<{track: string; bytes: number}> = [];
   let piece = 0;
-  const worker = new TranscriptionWorker(repository as never, {enabled: true,
+  // Pins the per-track 20 MiB chunking (fallback path); the S102 mix path is tested in transcription.test.ts.
+  const worker = new TranscriptionWorker(repository as never, {enabled: true, mixTracks: false,
     reader: new RegistryRecordingReader(db as never, () => { throw new Error('media source unused'); }, source),
     provider: {
       transcribe: async (bytes, context) => {

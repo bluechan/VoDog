@@ -2,6 +2,7 @@ import type {FastifyInstance,FastifyRequest} from 'fastify';
 import type {PoolClient} from 'pg';
 import {z} from 'zod';
 import type {Db} from '../db.js';
+import {locateNumbers} from '../phone-location.js';
 import {
  CONTACT_IMPORT_MAX_BYTES,
  CONTACT_IMPORT_MAX_ITEMS,
@@ -85,7 +86,10 @@ export function registerContactRoutes(app:FastifyInstance,db:Db,deps:Deps){
   const {userId}=requireUser(req);
   const {number}=z.object({number:z.string().min(1).max(64)}).parse(req.query);
   const iso=await ownerCountryIso(db,userId);
-  return {item:await lookupContact(db,userId,number,iso)};
+  // S96: the location stands on its own, so a partial or unknown number still gets one.
+  const [item,located]=await Promise.all([lookupContact(db,userId,number,iso),locateNumbers(db,[{number,countryIso:iso}])]);
+  const location=located.get(number);
+  return {item,...(location?{location}:{})};
  });
 
  app.get('/api/v1/contacts/:id',async req=>{

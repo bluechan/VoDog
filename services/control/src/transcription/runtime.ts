@@ -1,7 +1,7 @@
 import type {Pool,PoolClient} from 'pg';
 import type {Config} from '../config.js';
 import {attachClientErrorListener,takeClientError} from '../db.js';
-import {workerError} from '../diag.js';
+import {diag,workerError} from '../diag.js';
 import {MediaNodeRegistry} from '../media-node-registry.js';
 import {RecordingStore,type RecordingSource,type RecordingManifest} from '../recording-store.js';
 import {createGeminiTranscriptionProvider,createOpenAICompatibleTranscriptionProvider} from './provider.js';
@@ -81,6 +81,18 @@ export class TranscriptionRuntime {
       locked=lock.rows[0]?.locked===true;
       if(signal.aborted){release(new Error('transcription runtime stopped after advisory lock'));return{scanned:0,enqueued:0,worker:'stopped'};}
       if(!locked)return'busy';
+      // S118: with the Pixel archive as the only source, an ended call with no capture binding
+      // means the gateway never joined media, so no caller audio can ever arrive; the 10 min grace
+      // covers a late capture-binding post. Without this the call stays 'pending' forever.
+      if(this.options.pixelSource){
+        const sweepQuery=client.query(`UPDATE call_records c SET recording_status='none'
+          WHERE c.state='ended' AND c.recording_status='pending' AND c.ended_at < now()-interval '10 minutes' AND NOT c.internal_call
+            AND NOT EXISTS(SELECT 1 FROM recording_capture_bindings b WHERE b.call_id=c.id)
+            AND NOT EXISTS(SELECT 1 FROM pixel_recording_archives a WHERE a.call_id=c.id)`);
+        try{await bounded(sweepQuery,signal,this.discoveryTimeoutMs,'unbound recording sweep');}
+        catch{sweepQuery.catch(()=>undefined);/* the sweep retries next tick; a dead client fails the scan below */}
+        if(signal.aborted){release(new Error('transcription runtime stopped after unbound recording sweep'));return{scanned:0,enqueued:0,worker:'stopped'};}
+      }
       const candidateQuery=client.query(`SELECT c.id,c.snapshot_owner_id,COALESCE(c.media_node_id,'relay-primary') media_node_id,c.media_epoch,c.ended_at
         FROM call_records c WHERE c.state='ended' AND c.ended_at IS NOT NULL AND c.ended_at >= $1
           AND c.recording_status IN ('pending','ready','complete')
@@ -250,6 +262,6 @@ export function createTranscriptionRuntime(db:Pool,config:Config):TranscriptionR
   // widened from the default 120 s; the lease is renewed against the same number before each call.
   const worker=new TranscriptionWorker(repository,{enabled:true,reader,provider,maxAttempts:4,
     ...(config.TRANSCRIPTION_BASE_URL?{providerTimeoutMs:210_000}:{}),
-    aiTranscripts:input=>readAiTranscriptLines(db,input)});
+    aiTranscripts:input=>readAiTranscriptLines(db,input),diag:(event,fields,target)=>diag(db,event,fields,target)});
   return new TranscriptionRuntime({enabled:true,db,worker,resolveSource,pixelSource,enabledAt:new Date(config.TRANSCRIPTION_ENABLED_AT),intervalMs:config.TRANSCRIPTION_SCAN_INTERVAL_SECONDS*1000,scanBatch:config.TRANSCRIPTION_SCAN_BATCH});
 }

@@ -17,6 +17,8 @@ export type MediaNodeDefinition = z.infer<typeof nodeSchema>;
 export class MediaNodeRegistry {
   private readonly nodes = new Map<string, {definition: MediaNodeDefinition; client: MediaBridgeClient}>();
   readonly defaultNodeId: string;
+  /** Nodes whose TURN URLs are the built-in defaults rather than configuration (the implicit relay-primary); startup warns about these. */
+  readonly defaultedTurnUrls: {nodeId: string; turnUdpUrl: string; turnTlsUrl: string}[] = [];
   constructor(definitions: MediaNodeDefinition[], defaultNodeId = 'relay-primary') {
     if (!definitions.length) throw new Error('At least one media node is required');
     for (const raw of definitions) {
@@ -35,14 +37,19 @@ export class MediaNodeRegistry {
       try { raw = JSON.parse(config.MEDIA_NODES_JSON); } catch { throw new Error('MEDIA_NODES_JSON is invalid JSON'); }
       definitions.push(...z.array(nodeSchema).min(1).parse(raw));
     }
-    if (config.MEDIA_SECRET && config.TURN_SECRET && !definitions.some(node => node.id === 'relay-primary')) definitions.push({
+    // The implicit relay-primary keeps placeholder example.com TURN defaults; they are left
+    // as they are but reported at startup (configure MEDIA_NODES_JSON), see `defaultedTurnUrls`.
+    const implicitPrimary = Boolean(config.MEDIA_SECRET && config.TURN_SECRET && !definitions.some(node => node.id === 'relay-primary'));
+    if (implicitPrimary) definitions.push({
       id:'relay-primary', controlBaseUrl:'http://127.0.0.1:16881',
       turnUdpUrl:'turn:relay-secondary.example.com:16801?transport=udp',
       turnTlsUrl:'turns:relay-secondary.example.com:16802?transport=tcp',
-      mediaSecret:config.MEDIA_SECRET, turnSecret:config.TURN_SECRET,
+      mediaSecret:config.MEDIA_SECRET!, turnSecret:config.TURN_SECRET!,
     });
     if (!definitions.length) return null;
-    return new MediaNodeRegistry(definitions, config.MEDIA_DEFAULT_NODE_ID);
+    const registry = new MediaNodeRegistry(definitions, config.MEDIA_DEFAULT_NODE_ID);
+    if (implicitPrimary) { const primary = registry.nodes.get('relay-primary')!.definition; registry.defaultedTurnUrls.push({nodeId:'relay-primary', turnUdpUrl:primary.turnUdpUrl, turnTlsUrl:primary.turnTlsUrl}); }
+    return registry;
   }
   choose(preferred?: string): string {
     const id = preferred ?? this.defaultNodeId;

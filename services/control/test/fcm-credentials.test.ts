@@ -85,3 +85,33 @@ test('FCM private-file loader rejects permissive modes and symlinks', async () =
     await assert.rejects(createFcmAccessTokenProvider('vodog-test', join(directory, 'alias.json')));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test('FCM replaces the token in the background about five minutes before expiry, so the ring path never waits on OAuth', async () => {
+  let now = 1_800_000_000_000, calls = 0, failing = false, minted = 0, lifetime = 3600;
+  const timers: { run: () => void; delayMs: number; cancelled: boolean }[] = [];
+  const schedule = (run: () => void, delayMs: number) => { const timer = { run, delayMs, cancelled: false }; timers.push(timer); return () => { timer.cancelled = true; }; };
+  const provider = serviceAccountTokenProvider('vodog-test', credentials, (async () => {
+    calls++;
+    if (failing) throw new Error('network down');
+    return new Response(JSON.stringify({ access_token: 'safe-test-token-' + String(++minted).padStart(6, '0'), token_type: 'Bearer', expires_in: lifetime }));
+  }) as typeof fetch, () => now, schedule, () => 0.5);
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(await provider.getAccessToken(), 'safe-test-token-000001');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0]!.delayMs, 3_300_000 - 30_000, 'expiry minus 300 s, jittered (here by 30 s)');
+  now += timers[0]!.delayMs; timers[0]!.run(); await settle();
+  assert.equal(calls, 2, 'the timer refreshed on its own');
+  assert.equal(await provider.getAccessToken(), 'safe-test-token-000002');
+  assert.equal(calls, 2, 'the delivery used the fresh token without an OAuth round trip');
+  assert.equal(timers.length, 2, 'the next refresh is scheduled');
+  failing = true; now += timers[1]!.delayMs; timers[1]!.run(); await settle();
+  assert.equal(calls, 3);
+  assert.equal(timers[2]!.delayMs, 30_000, 'a failed background refresh retries while the old token still works');
+  assert.equal(await provider.getAccessToken(), 'safe-test-token-000002', 'the still-valid token keeps serving deliveries');
+  failing = false; now += 600_000;
+  assert.equal(await provider.getAccessToken(), 'safe-test-token-000003', 'past expiry the delivery refreshes inline as before');
+  assert.equal(timers[2]!.cancelled, true, 'the success replaced the pending retry');
+  lifetime = 120; now += 3_600_000;
+  await provider.getAccessToken();
+  assert.equal(timers.at(-1)!.delayMs, 60_000, 'a short-lived token is never refreshed sooner than half its lifetime');
+});

@@ -8,6 +8,11 @@ const schema = z.object({
   ANDROID_PASSKEY_ORIGINS: z.string().regex(/^android:apk-key-hash:[A-Za-z0-9_-]{43}(,android:apk-key-hash:[A-Za-z0-9_-]{43})*$/).optional(),
   COOKIE_SECRET: z.string().min(32),
   GATEWAY_ONLINE_SECONDS: z.coerce.number().int().min(5).max(300).default(30),
+  // A call already `active` on a pinned media node tolerates a heartbeat gap this long before the
+  // media close worker tears it down and AI audio authority is withdrawn. New authorizations, ringing
+  // and push gating keep GATEWAY_ONLINE_SECONDS. 0 = off (today's behaviour); values below
+  // GATEWAY_ONLINE_SECONDS change nothing.
+  GATEWAY_ACTIVE_CALL_GRACE_SECONDS: z.coerce.number().int().min(0).max(300).default(0),
   // Command doorbell hold ceiling. 0 disables the long poll entirely; the 8 s hard cap keeps the
   // suspended request well inside every proxy read timeout on the path. Out of range refuses to start.
   GATEWAY_COMMAND_DOORBELL_MAX_MS: z.coerce.number().int().min(0).max(8000).default(0),
@@ -18,6 +23,10 @@ const schema = z.object({
   AI_ENABLED: z.enum(['true','false']).default('false').transform(v => v === 'true'),
   AI_WORKER_READY: z.enum(['true','false']).default('false').transform(v => v === 'true'),
   AI_INTERNAL_TOKEN: optionalSecret,
+  // Claim long poll: an idle claim waits up to this long for a run to be created (woken after that
+  // commit) instead of returning 204 at once. 0 = off (today's 250 ms polling); the cap keeps the
+  // held request under the Voice worker's 3 s request timeout.
+  AI_CLAIM_HOLD_MS: z.coerce.number().int().min(0).max(2500).default(0),
   AI_MEDIA_NODE_ID: z.preprocess(value=>value===""?undefined:value,z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional()),
   // S24 决策 3. Comma-separated ids of the voice providers this deployment is actually configured for.
   // Stays a string in Config on purpose: the DB tests build config objects by hand and never see this
@@ -41,6 +50,8 @@ const schema = z.object({
   RECORDING_ROOT: z.preprocess(value=>value===""?undefined:value,z.string().min(1).optional()),
   // S36 C4: where transcoded MP3 exports are cached. Unset keeps `format=mp3` on its 501.
   RECORDING_MP3_CACHE_DIR: z.preprocess(value=>value===""?undefined:value,z.string().startsWith('/').optional()),
+  // S100: how long a finished archive's mp3 pre-transcode yields to its transcript job and live calls; 0 = transcode at once.
+  RECORDING_PRETRANSCODE_MAX_WAIT_SECONDS: z.coerce.number().int().min(0).max(86400).default(600),
   PIXEL_ARCHIVE_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   PIXEL_ARCHIVE_ROOT: z.preprocess(value=>value===""?undefined:value,z.string().startsWith('/').optional()),
   PIXEL_ARCHIVE_VALIDATOR_PATH: z.preprocess(value=>value===""?undefined:value,z.string().startsWith('/').optional()),
@@ -84,6 +95,9 @@ const schema = z.object({
   // S56: let an unanswered VoDog outgoing call open its media leg without a capture identity
   // so clients hear carrier ringback/busy tones; rides the heartbeat as `earlyMedia`. Off = rollback.
   EARLY_MEDIA_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  // S123 决策 6/7: let an AI-answered incoming call's gateway leg open without a capture identity
+  // while the phone still rings; rides the heartbeat as `aiEarlyLeg`. Off = rollback (new calls only).
+  AI_EARLY_LEG_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S38: record and archive calls the user dials on the Pixel itself. Off = the gateway's
   // outgoing-observed reports are acknowledged but never become call records.
   PIXEL_ORIGINATED_CALLS_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
@@ -104,6 +118,8 @@ const schema = z.object({
   COMMAND_REPLAY_HORIZON_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S67: the 5 s badge worker pushes app-icon counts over APNs (regular token) and FCM.
   BADGE_PUSH_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  // S104: the watchOS incoming/ended alert worker. Off = watch registrations are accepted, nothing is sent.
+  WATCHOS_PUSH_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   TURNSTILE_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   TURNSTILE_SITE_KEY: z.preprocess(value=>value===""?undefined:value,z.string().min(10).max(120).optional()),
   TURNSTILE_SECRET_KEY: z.preprocess(value=>value===""?undefined:value,z.string().min(10).max(120).optional()),

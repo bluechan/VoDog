@@ -35,6 +35,10 @@ ALTER TABLE gateways ADD COLUMN IF NOT EXISTS media_unready_heartbeats integer N
 ALTER TABLE gateways ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'pixel';
 ALTER TABLE gateways DROP CONSTRAINT IF EXISTS gateways_kind_check;
 ALTER TABLE gateways ADD CONSTRAINT gateways_kind_check CHECK (kind IN ('pixel','dji4g'));
+-- S130: the module a gateway row is bound to (CellDock keychain key + IMEI last 6). Pixel rows stay NULL.
+ALTER TABLE gateways ADD COLUMN IF NOT EXISTS module_key text;
+ALTER TABLE gateways ADD COLUMN IF NOT EXISTS module_label text;
+CREATE UNIQUE INDEX IF NOT EXISTS gateways_module_key_idx ON gateways(module_key) WHERE module_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS device_credentials (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), gateway_id uuid NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
   secret_hash text NOT NULL UNIQUE, label text NOT NULL, revoked_at timestamptz, last_used_at timestamptz, created_at timestamptz NOT NULL DEFAULT now()
@@ -44,6 +48,7 @@ CREATE TABLE IF NOT EXISTS device_pairing_codes (
   code_hash text NOT NULL UNIQUE, expires_at timestamptz NOT NULL, consumed_at timestamptz,
   created_by uuid NOT NULL REFERENCES users(id), created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE device_pairing_codes ADD COLUMN IF NOT EXISTS replace_module boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS sims (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), gateway_id uuid NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
   slot_index smallint CHECK (slot_index BETWEEN 0 AND 7), owner_user_id uuid REFERENCES users(id),
@@ -99,13 +104,13 @@ CREATE TABLE IF NOT EXISTS call_records (
   remote_number text, state call_state NOT NULL, generation bigint NOT NULL,
   started_at timestamptz NOT NULL DEFAULT now(), answered_at timestamptz, ended_at timestamptz,
   claimed_by_session_id uuid REFERENCES sessions(id), originating_session_id uuid REFERENCES sessions(id),
-  originating_platform text CHECK(originating_platform IN ('web','ios','android','macos','pixel')), answered_by_platform text, answered_by_device text,
+  originating_platform text CHECK(originating_platform IN ('web','ios','android','macos','pixel','watchos')), answered_by_platform text, answered_by_device text,
   mode_snapshot text NOT NULL, failure_reason text, recording_status text NOT NULL DEFAULT 'none',
   media_node_id text, media_epoch bigint NOT NULL DEFAULT 1,
   CHECK (state <> 'active' OR answered_at IS NOT NULL)
 );
 ALTER TABLE call_records ADD COLUMN IF NOT EXISTS originating_session_id uuid REFERENCES sessions(id);
-ALTER TABLE call_records ADD COLUMN IF NOT EXISTS originating_platform text CHECK(originating_platform IN ('web','ios','android','macos','pixel'));
+ALTER TABLE call_records ADD COLUMN IF NOT EXISTS originating_platform text CHECK(originating_platform IN ('web','ios','android','macos','pixel','watchos'));
 ALTER TABLE call_records ADD COLUMN IF NOT EXISTS device_call_id text;
 ALTER TABLE call_records ADD COLUMN IF NOT EXISTS observed_at timestamptz;
 ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_node_id text;
@@ -611,7 +616,7 @@ ALTER TABLE call_records ADD COLUMN IF NOT EXISTS conflict_disposition text;
 ALTER TABLE call_records DROP CONSTRAINT IF EXISTS call_records_conflict_disposition_check;
 ALTER TABLE call_records ADD CONSTRAINT call_records_conflict_disposition_check CHECK (conflict_disposition IS NULL OR conflict_disposition IN ('rejected','ai_answered'));
 ALTER TABLE call_records DROP CONSTRAINT IF EXISTS call_records_originating_platform_check;
-ALTER TABLE call_records ADD CONSTRAINT call_records_originating_platform_check CHECK (originating_platform IS NULL OR originating_platform IN ('web','ios','android','macos','pixel'));
+ALTER TABLE call_records ADD CONSTRAINT call_records_originating_platform_check CHECK (originating_platform IS NULL OR originating_platform IN ('web','ios','android','macos','pixel','watchos'));
 -- S54: native macOS client (CellDock). Sessions gain 'macos' the same way; the list above
 -- was widened in place so a re-run never re-validates macos rows against the S38 list.
 ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_platform_check;
@@ -772,3 +777,33 @@ ALTER TABLE commands ALTER COLUMN delivered_at DROP DEFAULT;
 -- token is first used, so a native app killed before saving the new pair is not logged out.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS previous_refresh_hash text;
 CREATE INDEX IF NOT EXISTS sessions_previous_refresh_hash ON sessions(previous_refresh_hash) WHERE previous_refresh_hash IS NOT NULL;
+-- S96 phone-number home location. Operators load their own data (no importer ships);
+-- empty tables are valid and simply yield no location. contact_phones.location is derived, never versioned.
+CREATE TABLE IF NOT EXISTS phone_location_prefixes (prefix text PRIMARY KEY, province text NOT NULL, city text NOT NULL, isp text NOT NULL, area_code text);
+CREATE TABLE IF NOT EXISTS phone_location_areas (area_code text PRIMARY KEY, province text NOT NULL, city text NOT NULL);
+ALTER TABLE contact_phones ADD COLUMN IF NOT EXISTS location text;
+-- Hot idle-path predicates: per-gateway pending command scans (heartbeat dtmf/settings expiry, SMS
+-- pacing's legacy adoption, delivery) and the live-call scans of the heartbeat withdrawal and the
+-- media close worker. Both stay small because they only hold rows still in flight.
+CREATE INDEX IF NOT EXISTS commands_pending_idx ON commands(gateway_id, kind, sequence) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS call_records_live_idx ON call_records(gateway_id) WHERE state NOT IN ('ending','ended','failed','unknown');
+-- S104 watchOS companion: the watch registers its own APNs token (alert topic .watchkitapp) under its
+-- iPhone's session. The named constraint is rebuilt because IF NOT EXISTS never updates an existing one.
+ALTER TABLE push_registrations DROP CONSTRAINT IF EXISTS push_registrations_platform_shape;
+ALTER TABLE push_registrations ADD CONSTRAINT push_registrations_platform_shape CHECK (
+  (platform = 'ios' AND environment IS NOT NULL AND package_name IS NULL AND fcm_token IS NULL)
+  OR (platform = 'android' AND environment IS NULL AND package_name = 'org.vodog' AND apns_token IS NULL AND voip_token IS NULL)
+  OR (platform = 'watchos' AND environment IS NOT NULL AND package_name IS NULL AND fcm_token IS NULL)
+);
+CREATE TABLE IF NOT EXISTS watchos_push_deliveries (
+  id uuid PRIMARY KEY,
+  registration_id uuid NOT NULL REFERENCES push_registrations(id) ON DELETE CASCADE,
+  call_id uuid NOT NULL REFERENCES call_records(id) ON DELETE CASCADE,
+  event text NOT NULL CHECK (event IN ('call.incoming','call.answered_elsewhere','call.missed')),
+  state text NOT NULL CHECK (state IN ('pending','delivered','failed','cancelled')),
+  attempts integer NOT NULL DEFAULT 0,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (registration_id, call_id, event)
+);

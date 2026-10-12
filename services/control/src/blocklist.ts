@@ -53,7 +53,7 @@ export function phoneBlocklistSyncMode(config:{PHONE_BLOCKLIST_SYNC_ENABLED?:boo
  * ponytail: CN-only; derive from sims.country_iso if a non-CN gateway ever ships.
  */
 const CN_MOBILE=/^1[3-9]\d{9}$/;
-const CN_SERVICE_SHORT=/^(?:95\d{3,4}|96\d{3}|10\d{3,6}|12\d{3})$/;
+export const CN_SERVICE_SHORT=/^(?:95\d{3,4}|96\d{3}|10\d{3,6}|12\d{3})$/;
 const CN_NATIONAL_SERVICE=/^[48]00\d{7}$/;
 const CN_AREA_PATTERN='(?:10|2[0-9]|[3-9][0-9]{2})';
 const CN_LANDLINE=new RegExp(`^(${CN_AREA_PATTERN})(\\d{5,8})$`);

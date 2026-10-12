@@ -169,14 +169,15 @@ test('badge push payloads: APNs alert topic with aps.badge only, FCM normal-prio
   const server=createServer();let received:any;
   server.on('stream',(stream,headers)=>{let raw='';stream.setEncoding('utf8');stream.on('data',c=>raw+=c);stream.on('end',()=>{received={headers,body:JSON.parse(raw)};stream.respond({':status':200});stream.end();});});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let client:ApnsClient|undefined;
   try{
     const address=server.address() as any;
-    const client=new ApnsClient('TESTKEY001','TESTTEAM01',pem,url=>{assert.equal(url,'https://api.push.apple.com');return connect('http://127.0.0.1:'+address.port);});
+    client=new ApnsClient('TESTKEY001','TESTTEAM01',pem,url=>{assert.equal(url,'https://api.push.apple.com');return connect('http://127.0.0.1:'+address.port);});
     assert.equal((await client.sendBadge({token:'d'.repeat(64),environment:'production',badge:7})).status,200);
     assert.equal(received.headers['apns-topic'],'org.vodog');assert.equal(received.headers['apns-push-type'],'alert');
     assert.equal(received.headers['apns-priority'],'10');assert.equal(received.headers['apns-collapse-id'],'badge');
     assert.deepEqual(received.body,{aps:{badge:7}});
-  }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));}
+  }finally{client?.close();await new Promise<void>(resolve=>server.close(()=>resolve()));}
   let request:any;const fcm=new FcmClient('vodog-example',{getAccessToken:async()=>'t'},async(_url,init)=>{request=init;return new Response('{}',{status:200});});
   const notificationId=crypto.randomUUID();
   await fcm.sendBadge({token:'fcm-'+'x'.repeat(40),notificationId,badge:3,calls:1,sms:2});

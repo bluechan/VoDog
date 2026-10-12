@@ -85,7 +85,7 @@ test('worker persists source and original incompleteness; derived track is not d
   const manifest=descriptor();let result:any;let done=false;const requests:TrackReadRequest[]=[];
   const repository={claim:async()=>done?null:{id:'job',callId,snapshotOwnerId:owner,manifest,manifestFingerprint:freezeRecordingManifest(manifest,callId).fingerprint,leaseToken:'lease',attempts:1},
     renewLease:async()=>true,complete:async(input:any)=>{result=input.result;done=true;return true;},fail:async(input:any)=>{throw new Error(JSON.stringify(input));}};
-  const worker=new TranscriptionWorker(repository as never,{enabled:true,reader:{readTrack:async r=>{requests.push(r);return bytes;}},provider:{transcribe:async()=>({text:'原声转录'})}});
+  const worker=new TranscriptionWorker(repository as never,{enabled:true,mixTracks:false,reader:{readTrack:async r=>{requests.push(r);return bytes;}},provider:{transcribe:async()=>({text:'原声转录'})}});
   assert.equal(await worker.tickOnce(),'succeeded');assert.equal(requests.length,2);assert.ok(requests.every(r=>r.source==='pixel'&&r.archiveId===manifest.archiveId));
   assert.equal(result.recording.manifestVersion,3);assert.equal(result.recording.source,'pixel');assert.equal(result.recording.complete,false);
   assert.equal(result.recording.archiveComplete,true);assert.equal(result.recording.selectionPolicy,'original_capture_only');
@@ -168,11 +168,13 @@ test('verified Pixel discovery waits for upload, then persists one source job ac
   const gateway=(await localDb.query("INSERT INTO gateways(name)VALUES('pixel-transcript')RETURNING id")).rows[0].id;
   const sim=(await localDb.query("INSERT INTO sims(gateway_id,slot_index,owner_user_id,label)VALUES($1,0,$2,'SIM')RETURNING id",[gateway,user])).rows[0].id;
   await localDb.query("INSERT INTO call_records(id,gateway_id,sim_id,snapshot_owner_id,direction,state,generation,mode_snapshot,ended_at,recording_status,media_node_id,media_epoch)VALUES($1,$2,$3,$4,'incoming','ended',1,'normal','2026-09-10T00:00:10Z','pending','relay-secondary',9)",[callId,gateway,sim,user]);
+  // S118: a Pixel archive always hangs off a capture binding; without one the call is settled to no recording.
+  await localDb.query("INSERT INTO recording_capture_bindings(call_id,gateway_id,snapshot_owner_id,device_call_id,telecom_creation_time_millis,capture_generation,media_node_id,media_epoch)VALUES($1,$2,$3,'pixel-call',1,1,'relay-secondary',9)",[callId,gateway,user]);
   let uploaded=false,mediaReads=0,transcribes=0;
   const archive:PixelTranscriptSource={...source(),manifest:async()=>uploaded?descriptor():null};
   const resolver=()=>{mediaReads++;throw new Error('must wait for verified Pixel archive');};
   const repository=new PostgresTranscriptJobRepository(localDb);
-  const worker=new TranscriptionWorker(repository,{enabled:true,reader:new RegistryRecordingReader(localDb,resolver,archive),provider:{transcribe:async()=>{transcribes++;return{text:'真实形状PCM的隔离转录'};}}});
+  const worker=new TranscriptionWorker(repository,{enabled:true,mixTracks:false,reader:new RegistryRecordingReader(localDb,resolver,archive),provider:{transcribe:async()=>{transcribes++;return{text:'真实形状PCM的隔离转录'};}}});
   const options={enabled:true,db:localDb,worker,resolveSource:resolver,pixelSource:archive,enabledAt:new Date('2026-09-10T00:00:00Z'),scanBatch:10};
   const runtime=new TranscriptionRuntime(options);
   assert.deepEqual(await runtime.tickOnce(),{scanned:1,enqueued:0,worker:'idle'});assert.equal(mediaReads,0);assert.equal(transcribes,0);
@@ -206,7 +208,7 @@ test('S94 freeze swaps the caller side to caller_uplink and the worker labels it
   let result:any;let done=false;const requests:TrackReadRequest[]=[];
   const repository={claim:async()=>done?null:{id:'job',callId,snapshotOwnerId:owner,manifest:m,manifestFingerprint:f.fingerprint,leaseToken:'lease',attempts:1},
     renewLease:async()=>true,complete:async(input:any)=>{result=input.result;done=true;return true;},fail:async(input:any)=>{throw new Error(JSON.stringify(input));}};
-  const worker=new TranscriptionWorker(repository as never,{enabled:true,reader:{readTrack:async r=>{requests.push(r);return r.track==='caller_uplink'?uplinkBytes:bytes;}},provider:{transcribe:async(_b,ctx)=>({text:`${ctx.track} 转录`})}});
+  const worker=new TranscriptionWorker(repository as never,{enabled:true,mixTracks:false,reader:{readTrack:async r=>{requests.push(r);return r.track==='caller_uplink'?uplinkBytes:bytes;}},provider:{transcribe:async(_b,ctx)=>({text:`${ctx.track} 转录`})}});
   assert.equal(await worker.tickOnce(),'succeeded');
   assert.deepEqual(requests.map(r=>r.track),['remote_original','caller_uplink']);
   assert.deepEqual(result.segments.map((s:any)=>[s.track,s.speaker]),[['remote_original','remote'],['caller_uplink','vodog_user']]);

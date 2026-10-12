@@ -300,3 +300,13 @@ test('call and SMS pages carry contact and block annotation without loading the 
   assert.equal(cleared.json().items[0].blocked,false);
   assert.equal(cleared.json().items[0].blockedEntryId,null);
 });
+
+test('S116: the outbound dial response already carries the contact name',async()=>{
+  const contact=await create({displayName:'Dialed Friend',phones:[{rawNumber:'+8613600136000'}]});
+  assert.equal(contact.statusCode,201,contact.body);
+  await db.query(`INSERT INTO gateway_telecom_snapshots(gateway_id,generation,snapshot_id,snapshot_sequence,reported_sequence,local_busy,calls,observed_at)SELECT id,device_epoch,gen_random_uuid(),0,0,false,'[]',now() FROM gateways WHERE id=$1`,[gatewayId]);
+  const dial=await app.inject({method:'POST',url:'/api/v1/calls/outbound',headers:{...auth(token),'idempotency-key':'s116-outbound-contact-0001'},payload:{simId,remoteNumber:'13600136000'}});
+  assert.equal(dial.statusCode,202,dial.body);
+  assert.equal(dial.json().call.contactName,'Dialed Friend');
+  assert.equal(dial.json().call.contactId,contact.json().item.id);
+});

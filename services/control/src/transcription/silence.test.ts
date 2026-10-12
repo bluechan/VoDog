@@ -81,7 +81,8 @@ async function run(fixture: ReturnType<typeof recording>, options: {reader?: Rec
   };
   const db = {query: async () => ({rowCount: 1, rows: [{media_node_id: 'relay-primary', media_epoch: 1}]})};
   const reader = options.reader ?? new RegistryRecordingReader(db as never, () => { throw new Error('source swap'); }, source);
-  const worker = new TranscriptionWorker(repository as never, {enabled: true, reader,
+  // These cases pin the per-track semantics (S49/S78); the S102 mix path has its own tests in transcription.test.ts.
+  const worker = new TranscriptionWorker(repository as never, {enabled: true, reader, mixTracks: false,
     provider: {
       transcribe: async (bytes, context) => {
         providerTracks.push(context.track);
@@ -181,14 +182,14 @@ test('both silent tracks retain explicitly labelled AI fallback and skip evidenc
   assert.equal(output.result.segments[0].track, 'ai_realtime_transcript');
 });
 
-test('all-zero bytes with a corrupt expected hash fail integrity before silence handling or fallback', async () => {
+test('all-zero bytes with a corrupt expected hash fail the reader integrity gate before silence handling or fallback', async () => {
   const fixture = recording(wav(), speech());
   fixture.manifest.tracks[0]!.sha256 = 'f'.repeat(64);
-  // Bypass the real reader's independent integrity gate to exercise the worker gate itself.
-  const output = await run(fixture, {reader: {readTrack: async request => fixture.bodies[request.track as Track]}});
-  assert.equal(output.outcome, 'failed');
-  assert.equal(output.failure.errorCode, 'RECORDING_INTEGRITY_FAILED');
-  assert.equal(output.failure.terminal, true);
+  // S100: the real reader is the one SHA-256 gate (the worker no longer re-hashes what it returns).
+  // The reader's mismatch is its own (retryable) error, exactly what production did before S100 too.
+  const output = await run(fixture);
+  assert.equal(output.outcome, 'retry');
+  assert.equal(output.failure.errorMessage, 'Opened recording metadata does not match the frozen manifest');
   assert.deepEqual(output.providerTracks, []); assert.deepEqual(output.classified, []);
   assert.equal(output.aiReads, 0);
 });

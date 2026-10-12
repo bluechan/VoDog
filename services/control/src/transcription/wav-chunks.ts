@@ -15,7 +15,7 @@ export const WAV_CHUNK_MAX_MS = 5 * 60_000;
 export type WavChunk = {startMs: number; bytes: Buffer};
 
 /** Canonical 44-byte header around a PCM slice, same layout `validTranscriptionAudio` requires. */
-function canonicalWav(pcm: Buffer): Buffer {
+export function canonicalWav(pcm: Buffer): Buffer {
   const header = Buffer.alloc(HEADER_BYTES);
   header.write('RIFF', 0, 'latin1'); header.writeUInt32LE(pcm.length + 36, 4); header.write('WAVE', 8, 'latin1');
   header.write('fmt ', 12, 'latin1'); header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);

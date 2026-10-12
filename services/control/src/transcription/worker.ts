@@ -2,8 +2,11 @@ import {createHash} from 'node:crypto';
 import {PostgresTranscriptJobRepository, type TranscriptJob} from './repository.js';
 import {parsePixelRecordingDescriptor, type PixelRecordingDescriptor} from '../recording-archive.js';
 import {maxTranscriptionRetryDelayMs, minRateLimitRetryDelayMs, TranscriptionProviderHttpError} from './provider-error.js';
-import {allZeroPcmEvidence, noVoiceEvidence, validTranscriptionAudio, type AllZeroPcmEvidence, type NoVoiceEvidence} from './audio-format.js';
+import {allZeroPcmEvidence, noVoiceEvidence, tailVoiceActive, validTranscriptionAudio, type AllZeroPcmEvidence, type NoVoiceEvidence} from './audio-format.js';
 import {MAX_WAV_TRACK_BYTES, splitCanonicalWav} from './wav-chunks.js';
+import {MIX_CHUNK_MS, mixTracks, type MixedTracks} from './mix.js';
+import {canonicalWav} from './wav-chunks.js';
+import {attributeSegments} from './attribution.js';
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const MAX_PROVIDER_INPUT_BYTES = 20 * 1024 * 1024;
@@ -28,7 +31,9 @@ export type TrackReadRequest = {
 export interface RecordingReader { readTrack(request: TrackReadRequest): Promise<Buffer>; }
 /** S23 决策 5: one row per provider attempt, stored inside `transcript_jobs.result` (jsonb, no DDL). */
 export type TranscriptionAttempt = {model: string; prompt: string; status: number | string; ms: number};
-export type TranscriptionResult = {text: string; segments?: Array<{text: string; startMs?: number; endMs?: number}>; provider?: string; model?: string; version?: string; attempts?: TranscriptionAttempt[]};
+export type TranscriptionResult = {text: string; segments?: Array<{text: string; startMs?: number; endMs?: number; speaker?: string}>; provider?: string; model?: string; version?: string; attempts?: TranscriptionAttempt[];
+  /** S102b: the provider kept the words but not the timing (one untimed blob or untimed lines). */
+  salvaged?: boolean};
 export type TranscriptClassificationResult = {
   classification?: 'advertising' | 'not_advertising' | 'unknown' | string;
   category?: string;
@@ -120,7 +125,7 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function normalizedResult(result: TranscriptionResult, track: FrozenRecording['tracks'][number]) {
+function normalizedResult(result: TranscriptionResult, track: {track: string; speaker: string}) {
   const text = typeof result?.text === 'string' ? result.text.trim() : '';
   if (!text) throw new TranscriptionWorkerError('PROVIDER_EMPTY_RESULT', 'Transcription provider returned no text', true);
   const source = result.segments ?? [{text}];
@@ -165,6 +170,87 @@ export async function chunkedResult(chunks: Array<{startMs: number; bytes: Buffe
     ...(attempts.length ? {attempts} : {})};
 }
 
+export type TranscriptDiag = (event: string, fields: Record<string, unknown>, target: {callId: string; level: 'info' | 'warn'}) => unknown;
+/** S102: a chunk whose last segment ends this far before the chunk's end was probably cut short by the provider. */
+const CHUNK_TRUNCATION_MS = 15_000;
+
+/**
+ * S102: the two tracks are mixed on the call timeline, transcribed in ≤ 3 min pieces (one provider call
+ * each), and each segment's speaker is decided by the original tracks' energy (attribution.ts). Segment
+ * times are mix time = call time. `null` when no piece had speech.
+ */
+export async function mixedResult(input: {mix: MixedTracks; callId: string;
+  transcribe: (audio: Buffer) => Promise<TranscriptionResult>; diag?: TranscriptDiag}) {
+  const {mix} = input;
+  const chunks = splitCanonicalWav(mix.wav, MIX_CHUNK_MS);
+  const rows: Array<{chunk: number; label: unknown; segment: ReturnType<typeof normalizedResult>['segments'][number]; windowStartMs: number; windowEndMs: number}> = [];
+  const parts: Array<ReturnType<typeof normalizedResult>> = [];
+  const chunkFacts: Array<{chunkMs: number; lastEndMs: number}> = [];
+  for (const [index, chunk] of chunks.entries()) {
+    const chunkMs = (chunk.bytes.length - 44) / 32;
+    let lastEndMs = 0;
+    /** Appends one answer's segments shifted by `shiftMs` inside the chunk; `minStartMs` drops a tail's overlap. */
+    const take = (raw: TranscriptionResult, shiftMs: number, minStartMs = 0) => {
+      // A piece with no speech (including the explicit `{"segments":[]}`) is skipped, as in chunkedResult.
+      if (typeof raw?.text !== 'string' || !raw.text.trim()) return 0;
+      const part = normalizedResult(raw, {track: 'mix', speaker: ''});
+      parts.push(part);
+      const labels = Array.isArray(raw.segments) ? raw.segments.map((segment) => segment?.speaker) : [];
+      let kept = 0;
+      part.segments.forEach((segment, position) => {
+        const inChunkStart = segment.startMs === undefined ? undefined : segment.startMs + shiftMs;
+        if (minStartMs > 0 && (inChunkStart === undefined || inChunkStart < minStartMs)) return;
+        const inChunkEnd = segment.endMs === undefined ? undefined : segment.endMs + shiftMs;
+        lastEndMs = Math.max(lastEndMs, inChunkEnd ?? inChunkStart ?? 0);
+        const startMs = inChunkStart === undefined ? undefined : inChunkStart + chunk.startMs;
+        const endMs = inChunkEnd === undefined ? undefined : inChunkEnd + chunk.startMs;
+        kept++;
+        rows.push({chunk: index, label: labels[position],
+          segment: {...segment, ...(startMs === undefined ? {} : {startMs}), ...(endMs === undefined ? {} : {endMs})},
+          // An untimed segment is measured over its whole piece.
+          windowStartMs: startMs ?? chunk.startMs, windowEndMs: endMs ?? (startMs === undefined ? chunk.startMs + chunkMs : startMs)});
+      });
+      return kept;
+    };
+    const raw = await input.transcribe(chunk.bytes);
+    // S102b: the provider already re-asked a salvaged chunk once; what is still salvaged is kept and reported.
+    if (raw?.salvaged) input.diag?.('transcript.chunk_salvaged', {chunk: index, chunkMs}, {callId: input.callId, level: 'info'});
+    const spoken = take(raw, 0);
+    // S102b: a cut-short answer gets one re-ask of the uncovered tail (2 s overlap, overlapping segments dropped).
+    if (spoken && !raw.salvaged && chunkMs - lastEndMs > CHUNK_TRUNCATION_MS) {
+      const tailStartMs = Math.max(0, Math.floor(lastEndMs) - 2_000);
+      const tailEndBefore = lastEndMs;
+      const segments = take(await input.transcribe(canonicalWav(chunk.bytes.subarray(44 + tailStartMs * 32))), tailStartMs, tailEndBefore);
+      input.diag?.('transcript.chunk_tail', {chunk: index, tailMs: chunkMs - tailStartMs, segments}, {callId: input.callId, level: 'info'});
+    }
+    chunkFacts.push({chunkMs, lastEndMs});
+  }
+  const attributed = attributeSegments(rows.map((row) => ({startMs: row.windowStartMs, endMs: row.windowEndMs, label: row.label})), {
+    remote: mix.envelopes.remote, caller: mix.envelopes.caller});
+  chunkFacts.forEach(({chunkMs, lastEndMs}, index) => {
+    const counts = {energy: 0, label: 0, unknown: 0};
+    rows.forEach((row, position) => { if (row.chunk === index) counts[attributed[position]!.attribution]++; });
+    const segments = counts.energy + counts.label + counts.unknown;
+    const fields = {chunk: index, chunkMs, lastEndMs, segments, attribution: counts};
+    input.diag?.('transcript.chunk', fields, {callId: input.callId, level: 'info'});
+    // A silent piece has no last segment; only a piece with speech can be cut short.
+    if (segments && lastEndMs < chunkMs - CHUNK_TRUNCATION_MS) input.diag?.('transcript.chunk_truncated', fields, {callId: input.callId, level: 'warn'});
+  });
+  if (!parts.length) return null;
+  const segments = rows.map((row, position) => {
+    const {speaker, attribution, energyRatio} = attributed[position]!;
+    const {startMs, endMs, text} = row.segment;
+    return {track: 'mix', speaker, text, ...(startMs === undefined ? {} : {startMs}), ...(endMs === undefined ? {} : {endMs}), attribution, energyRatio};
+  });
+  const attempts = parts.flatMap((part) => part.attempts ?? []).slice(0, 20);
+  return {
+    segments,
+    text: segments.map((segment) => `${segment.speaker}: ${segment.text}`).join('\n'),
+    provider: {track: 'mix', provider: parts[0]!.provider, model: parts[0]!.model, version: parts[0]!.version, ...(attempts.length ? {attempts} : {})},
+    mix: {remoteOffsetMs: mix.offsets.remoteMs, callerOffsetMs: mix.offsets.callerMs, durationMs: mix.durationMs, chunkMs: MIX_CHUNK_MS},
+  };
+}
+
 export class TranscriptionWorker {
   constructor(private readonly repository: PostgresTranscriptJobRepository, private readonly options: {
     reader: RecordingReader; provider?: TranscriptionProvider; enabled?: boolean; leaseMs?: number; maxAttempts?: number;
@@ -173,6 +259,10 @@ export class TranscriptionWorker {
     random?: () => number;
     /** S22 decision 6: realtime AI transcript fallback for a call whose recording has no audio. */
     aiTranscripts?: (input: {callId: string; snapshotOwnerId: string}) => Promise<AiTranscriptLine[]>;
+    /** S102: mix two usable Pixel WAV tracks into one transcription (default on); `false` keeps per-track only. */
+    mixTracks?: boolean;
+    /** S102/S102b: per-chunk completeness rows (`transcript.chunk`, `transcript.chunk_truncated`, `transcript.chunk_tail`, `transcript.chunk_salvaged`); no text. */
+    diag?: TranscriptDiag;
   }) {}
 
   async enqueueCall(input: {callId: string; snapshotOwnerId: string; manifest: unknown}) {
@@ -233,8 +323,40 @@ export class TranscriptionWorker {
     if (frozen.tracks.some((track) => track.bytes > (track.mediaType === 'audio/wav' ? MAX_WAV_TRACK_BYTES : MAX_PROVIDER_INPUT_BYTES))) {
       throw new TranscriptionWorkerError('RECORDING_TOO_LARGE', 'A recording track exceeds the transcription input limit');
     }
-    const transcripts = [];
+    const transcripts: Array<{track: FrozenRecording['tracks'][number]; result: ReturnType<typeof normalizedResult>}> = [];
+    const providerTimeoutMs = this.options.providerTimeoutMs ?? 120_000;
+    const transcriberFor = (request: {callId: string; snapshotOwnerId: string; manifestFingerprint: string; track: string; mediaType: string;
+      formatVersion: number; source?: 'pixel'; archiveId?: string}) => async (audio: Buffer) => {
+      await this.requireLease(job, providerTimeoutMs);
+      return withTimeout((operationSignal) => provider.transcribe(audio, {
+        callId: request.callId, snapshotOwnerId: request.snapshotOwnerId,
+        manifestFingerprint: request.manifestFingerprint, track: request.track,
+        mediaType: request.mediaType, formatVersion: request.formatVersion, signal: operationSignal,
+        source: request.source, archiveId: request.archiveId,
+      }), providerTimeoutMs, 'Transcription provider timed out', signal);
+    };
+    const transcribeTrack = async (track: FrozenRecording['tracks'][number], bytes: Buffer, transcribe: (audio: Buffer) => Promise<TranscriptionResult>) => {
+      // Under the provider cap the track goes whole, exactly as before; only a long Pixel WAV is chunked.
+      if (track.mediaType === 'audio/wav' && bytes.length > MAX_PROVIDER_INPUT_BYTES) {
+        transcripts.push({track, result: await chunkedResult(splitCanonicalWav(bytes), transcribe, track)});
+        return;
+      }
+      const raw = await transcribe(bytes);
+      // S78: the provider's explicit "no speech" (`{"segments":[]}`) skips the track; any other empty answer still retries.
+      if (raw?.text === '' && Array.isArray(raw.segments) && raw.segments.length === 0) {
+        skippedTracks.push({track: track.track, reason: 'provider_no_speech'});
+        return;
+      }
+      transcripts.push({track, result: normalizedResult(raw, track)});
+    };
+    // S102: Pixel WAV tracks are read and gated first; when both carry voice they are mixed instead.
+    const deferForMix = this.options.mixTracks !== false && frozen.manifest.version !== 1;
+    // ponytail: both Pixel tracks are held until mixed; during provider calls only the mix and its chunk copies
+    // (≈ 2 × the longer track) stay resident (S102b). Stream if calls outgrow it.
+    const usable: Array<{track: FrozenRecording['tracks'][number]; bytes: Buffer | null; transcribe: (audio: Buffer) => Promise<TranscriptionResult>; request: Parameters<typeof transcriberFor>[0]}> = [];
     const skippedTracks: Array<(AllZeroPcmEvidence | NoVoiceEvidence | {reason: 'provider_no_speech'}) & {track: string}> = [];
+    // S128: whether the caller-side track (the AI's voice on an AI-answered call) still carried speech at hangup.
+    let callerTail: {track: string; active: boolean} | undefined;
     for (const track of frozen.tracks) {
       // S22 决策 6: a header-sized track is not audio. Skipping it here is what keeps the 44-byte
       // Pixel WAV of a failed capture away from the provider.
@@ -248,7 +370,8 @@ export class TranscriptionWorker {
         ...(frozen.manifest.version === 1 ? {} : {source: 'pixel' as const, archiveId: frozen.manifest.archiveId}),
       };
       const bytes = await withTimeout((operationSignal) => this.options.reader.readTrack({...requestWithoutSignal, signal: operationSignal}), readerTimeoutMs, 'Recording read timed out', signal);
-      if (!Buffer.isBuffer(bytes) || bytes.length !== track.bytes || createHash('sha256').update(bytes).digest('hex') !== track.sha256) {
+      // S100: RecordingReader.readTrack already verified length and SHA-256 (reader.ts); a second 25 MB hash only burned CPU.
+      if (!Buffer.isBuffer(bytes) || bytes.length !== track.bytes) {
         throw new TranscriptionWorkerError('RECORDING_INTEGRITY_FAILED', `${track.name} does not match the frozen manifest`);
       }
       if (track.mediaType === 'audio/wav' && !validTranscriptionAudio(bytes, track.mediaType, track.formatVersion)) {
@@ -262,45 +385,42 @@ export class TranscriptionWorker {
         skippedTracks.push({track: track.track, ...silence});
         continue;
       }
-      const providerTimeoutMs = this.options.providerTimeoutMs ?? 120_000;
-      const transcribe = async (audio: Buffer) => {
-        await this.requireLease(job, providerTimeoutMs);
-        return withTimeout((operationSignal) => provider.transcribe(audio, {
-          callId: requestWithoutSignal.callId, snapshotOwnerId: requestWithoutSignal.snapshotOwnerId,
-          manifestFingerprint: requestWithoutSignal.manifestFingerprint, track: requestWithoutSignal.track,
-          mediaType: requestWithoutSignal.mediaType, formatVersion: requestWithoutSignal.formatVersion, signal: operationSignal,
-          source: requestWithoutSignal.source, archiveId: requestWithoutSignal.archiveId,
-        }), providerTimeoutMs, 'Transcription provider timed out', signal);
-      };
-      // Under the provider cap the track goes whole, exactly as before; only a long Pixel WAV is chunked.
-      if (track.mediaType === 'audio/wav' && bytes.length > MAX_PROVIDER_INPUT_BYTES) {
-        transcripts.push({track, result: await chunkedResult(splitCanonicalWav(bytes), transcribe, track)});
-        continue;
-      }
-      const raw = await transcribe(bytes);
-      // S78: the provider's explicit "no speech" (`{"segments":[]}`) skips the track; any other empty answer still retries.
-      if (raw?.text === '' && Array.isArray(raw.segments) && raw.segments.length === 0) {
-        skippedTracks.push({track: track.track, reason: 'provider_no_speech'});
-        continue;
-      }
-      const result = normalizedResult(raw, track);
-      transcripts.push({track, result});
+      // S128: measured here, while the PCM is resident and whether or not the track ends up in a mix.
+      if (track.speaker === 'vodog_user' && track.mediaType === 'audio/wav') callerTail = {track: track.track, active: tailVoiceActive(bytes)};
+      const transcribe = transcriberFor(requestWithoutSignal);
+      if (deferForMix) { usable.push({track, bytes, transcribe, request: requestWithoutSignal}); continue; }
+      await transcribeTrack(track, bytes, transcribe);
+    }
+    let mixed: Awaited<ReturnType<typeof mixedResult>> = null;
+    const remote = usable.find((item) => item.track.speaker === 'remote');
+    const caller = usable.find((item) => item.track.speaker === 'vodog_user');
+    if (remote && caller && usable.every((item) => item.track.mediaType === 'audio/wav')) {
+      const mix = mixTracks({remote: remote.bytes, caller: caller.bytes})!;
+      // S102b: attribution reads the 10 ms envelopes, so the PCM tracks are released before any provider call.
+      for (const item of usable) item.bytes = null;
+      mixed = await mixedResult({mix, callId: job.callId, diag: this.options.diag,
+        transcribe: transcriberFor({...remote.request, track: 'mix'})});
+      // Every piece came back as explicit no speech: both tracks are skipped like the per-track path would.
+      if (!mixed) for (const item of usable) skippedTracks.push({track: item.track.track, reason: 'provider_no_speech'});
+    } else {
+      // S102 fallback: one track is missing (empty, all-zero or voiceless), so the survivor goes alone.
+      for (const item of usable) await transcribeTrack(item.track, item.bytes!, item.transcribe);
     }
     // No usable audio: retain the explicitly labelled realtime AI fallback. Without it,
     // header-only or proven all-zero captures are terminal; the original recording stays intact.
-    const aiLines = transcripts.length || !this.options.aiTranscripts ? [] :
+    const aiLines = transcripts.length || mixed || !this.options.aiTranscripts ? [] :
       (await this.options.aiTranscripts({callId: job.callId, snapshotOwnerId: job.snapshotOwnerId}))
         .filter((line) => typeof line?.text === 'string' && line.text.trim());
-    if (!transcripts.length && !aiLines.length) throw new TranscriptionWorkerError('RECORDING_EMPTY', skippedTracks.length
+    if (!transcripts.length && !mixed && !aiLines.length) throw new TranscriptionWorkerError('RECORDING_EMPTY', skippedTracks.length
       ? `录音为空、PCM 全零或没有人声（${skippedTracks.map((skipped) => `${skipped.track}: ${skipped.reason}`).join(', ')}）`
       : '录音为空或采集失败');
-    const fromAi = !transcripts.length;
-    const segments = fromAi
+    const fromAi = !transcripts.length && !mixed;
+    const segments: unknown[] = fromAi
       ? aiLines.map((line) => ({track: 'ai_realtime_transcript', speaker: line.role === 'ai' ? 'ai' : 'remote', text: line.text.trim(), at: line.at}))
-      : transcripts.flatMap(({result}) => result.segments);
+      : mixed ? mixed.segments : transcripts.flatMap(({result}) => result.segments);
     const text = fromAi
       ? aiLines.map((line) => `${AI_ROLE_LABEL[line.role] ?? line.role}: ${line.text.trim()}`).join('\n')
-      : transcripts.map(({track, result}) => `${track.speaker}: ${result.text}`).join('\n');
+      : mixed ? mixed.text : transcripts.map(({track, result}) => `${track.speaker}: ${result.text}`).join('\n');
     let classified: TranscriptClassificationResult = {};
     if (provider.classify) {
       const providerTimeoutMs = this.options.providerTimeoutMs ?? 120_000;
@@ -329,17 +449,21 @@ export class TranscriptionWorker {
         source: fromAi ? 'ai_realtime_transcript' : frozen.manifest.version === 1 ? 'media' : 'pixel',
         // Transcript coverage must not claim both original tracks when one was skipped.
         // Preserve the archive's independent capture facts below without rewriting the manifest.
-        complete: !fromAi && transcripts.length === frozen.tracks.length &&
+        complete: !fromAi && (mixed ? true : transcripts.length === frozen.tracks.length) &&
           (frozen.manifest.version === 1 ? frozen.manifest.complete : frozen.manifest.captureComplete),
         ...(frozen.manifest.version === 1 ? {} : {archiveId: frozen.manifest.archiveId,
           manifestSha256: frozen.manifest.manifestSha256,
           archiveComplete: frozen.manifest.archiveComplete, captureComplete: frozen.manifest.captureComplete,
-          selectionPolicy: 'original_capture_only', timebase: 'per_track_capture',
+          selectionPolicy: 'original_capture_only', timebase: mixed ? 'mix' : 'per_track_capture',
           capture: frozen.manifest.tracks.map(({track, captureComplete, gapCount, droppedFrames}) => ({track, captureComplete, gapCount, droppedFrames}))}),
         tracks: frozen.tracks.map(({track, name, mediaType, formatVersion, bytes, sha256}) => ({track, name, mediaType, formatVersion, bytes, sha256})),
+        ...(mixed ? {mix: mixed.mix} : {}),
+        // S128: a physical fact about the caller-side track this job read; absent when that track was not
+        // usable (Ogg, empty, all-zero, voiceless, or the provider heard no speech in it). dialog.ts reads it.
+        ...(callerTail && !skippedTracks.some((skipped) => skipped.track === callerTail!.track) ? {callerTailActive: callerTail.active} : {}),
         skippedTracks},
       text, segments,
-      providers: transcripts.map(({track, result}) => ({track: track.track, provider: result.provider, model: result.model, version: result.version,
+      providers: mixed ? [mixed.provider] : transcripts.map(({track, result}) => ({track: track.track, provider: result.provider, model: result.model, version: result.version,
         ...('attempts' in result ? {attempts: result.attempts} : {})})),
       enrichment: classified.provider && classified.model ? {
         provider: classified.provider,

@@ -1,6 +1,7 @@
 import type {QueryResult} from 'pg';
 import {tx,type Db} from '../db.js';
 import {AiRunError,assertLeaseOrJustEnded} from './repository.js';
+import {markUnplayed} from '../transcription/dialog.js';
 
 type Queryable={query:(sql:string,params?:unknown[])=>Promise<QueryResult<any>>};
 
@@ -53,12 +54,26 @@ export async function appendAiTranscript(
  return {accepted:true,stored:q.rowCount??0};
 }
 
-/** Owner-scoped read; the call's snapshot owner is the only principal allowed to see it. */
+/**
+ * Owner-scoped read; the call's snapshot owner is the only principal allowed to see it.
+ *
+ * S128: `cut` repeats the conditions under which `GET …/transcript` marks its dialog (routes.ts + `buildDialog`):
+ * an AI-answered call that the owner did not take over, whose LATEST transcript job succeeded with
+ * `recording.callerTailActive` true. The job is picked first and tested after, so a newer job without the
+ * flag wins over an older one with it. The marker itself is applied by the shared `markUnplayed`.
+ */
 export async function readCallTranscript(db:Queryable,ownerUserId:string,callId:string):Promise<{role:'ai'|'caller';text:string;at:Date}[]|null>{
- const call=await db.query(`SELECT id FROM call_records WHERE id=$1 AND snapshot_owner_id=$2`,[callId,ownerUserId]);
+ const call=await db.query(
+  `SELECT c.id,(c.answered_by_platform='ai' AND c.answered_at IS NOT NULL
+     AND NOT EXISTS(SELECT 1 FROM ai_call_runs r WHERE r.id=c.ai_run_id AND r.failure_code='owner_joined')
+     AND COALESCE((SELECT j.state='succeeded' AND j.result->'recording'->'callerTailActive'='true'::jsonb
+       FROM transcript_jobs j WHERE j.call_id=c.id AND j.snapshot_owner_id=$2
+       ORDER BY j.created_at DESC,j.id DESC LIMIT 1),false)) cut
+   FROM call_records c WHERE c.id=$1 AND c.snapshot_owner_id=$2`,[callId,ownerUserId]);
  if(!call.rowCount)return null;
  const q=await db.query(`SELECT role,text,at FROM ai_run_transcripts WHERE call_id=$1 ORDER BY sequence,id`,[callId]);
- return q.rows.map(row=>({role:row.role,text:row.text,at:row.at}));
+ const items=q.rows.map(row=>({role:row.role,text:row.text,at:row.at}));
+ return call.rows[0].cut===true?markUnplayed(items):items;
 }
 
 /**

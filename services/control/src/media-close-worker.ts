@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { safeRollback, withClient, type Db } from './db.js';
 import { MediaBridgeClient } from './media-client.js';
 import { diag, errorReason, workerError } from './diag.js';
+import { liveCallSql } from './live-calls.js';
 type MediaCloser=MediaBridgeClient|{close(callId:string,nodeId:string,mediaEpoch:number):Promise<void>};
 type Job={callId:string;nodeId:string;mediaEpoch:number;attempts:number;closeMode:'force'|'wait_terminal'};
-export type MediaCloseWorkerOptions={intervalMs?:number;concurrency?:number;leaseSeconds?:number;gatewayOfflineSeconds?:number};
+export type MediaCloseWorkerOptions={intervalMs?:number;concurrency?:number;leaseSeconds?:number;gatewayOfflineSeconds?:number;activeCallGraceSeconds?:number};
 
 export class MediaCloseWorker {
   private readonly owner=randomUUID();
@@ -12,6 +13,7 @@ export class MediaCloseWorker {
   private readonly concurrency:number;
   private readonly leaseSeconds:number;
   private readonly gatewayOfflineSeconds:number;
+  private readonly activeCallGraceSeconds:number;
   private timer:NodeJS.Timeout|null=null;
   private running:Promise<void>|null=null;
   private stopped=true;
@@ -21,6 +23,7 @@ export class MediaCloseWorker {
     this.concurrency=Math.min(8,Math.max(1,options.concurrency??4));
     this.leaseSeconds=Math.min(300,Math.max(10,options.leaseSeconds??30));
     this.gatewayOfflineSeconds=Math.min(600,Math.max(10,options.gatewayOfflineSeconds??45));
+    this.activeCallGraceSeconds=Math.min(600,Math.max(0,Math.trunc(Number(options.activeCallGraceSeconds??0))||0));
   }
 
   start(){
@@ -57,13 +60,15 @@ export class MediaCloseWorker {
       // S18 decision 1: control shutdown and gateway offline stay immediate; a withdrawn
       // mediaReady only ends a call that never pinned a media node or whose withdrawal
       // has been sustained (>=3 heartbeats or >=15 s). S72b: a call answered on the gateway device
-      // itself has no remote media, so mediaReady never ends it.
+      // itself has no remote media, so mediaReady never ends it. GATEWAY_ACTIVE_CALL_GRACE_SECONDS: an
+      // `active` call on a pinned node rides out a longer heartbeat gap (GREATEST keeps 0 = today).
       const calls=await client.query(`UPDATE call_records call SET state='unknown',failure_reason='gateway_media_unavailable'
-        FROM gateways gateway WHERE call.gateway_id=gateway.id AND call.state NOT IN ('ending','ended','failed','unknown')
+        FROM gateways gateway WHERE call.gateway_id=gateway.id AND ${liveCallSql('call')}
         AND call.originating_platform IS DISTINCT FROM 'pixel'
-        AND (NOT gateway.control_enabled OR gateway.last_seen_at IS NULL OR gateway.last_seen_at<now()-$1::int*interval '1 second'
+        AND (NOT gateway.control_enabled OR gateway.last_seen_at IS NULL OR gateway.last_seen_at<now()-(CASE WHEN call.state='active' AND call.media_node_id IS NOT NULL
+            THEN GREATEST($1::int,$2::int) ELSE $1::int END)*interval '1 second'
           OR (NOT gateway.media_ready AND call.answered_by_platform IS DISTINCT FROM 'device' AND (call.media_node_id IS NULL OR gateway.media_unready_heartbeats>=3
-            OR gateway.media_unready_since<=now()-interval '15 seconds'))) RETURNING call.id`,[this.gatewayOfflineSeconds]);
+            OR gateway.media_unready_since<=now()-interval '15 seconds'))) RETURNING call.id`,[this.gatewayOfflineSeconds,this.activeCallGraceSeconds]);
       if(calls.rowCount)await client.query(`INSERT INTO media_close_jobs(call_id,node_id,media_epoch,next_attempt_at)
         SELECT id,COALESCE(media_node_id,'relay-primary'),media_epoch,now() FROM call_records WHERE id=ANY($1::uuid[])
         ON CONFLICT(call_id) DO NOTHING`,[calls.rows.map(row=>row.id)]);

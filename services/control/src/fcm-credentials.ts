@@ -21,11 +21,17 @@ function cancellable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
+/** Unref'd one-shot timer; returns its cancel. Injectable so tests can fire the refresh by hand. */
+export type RefreshScheduler = (run: () => void, delayMs: number) => () => void;
+const unrefTimer: RefreshScheduler = (run, delayMs) => { const timer = setTimeout(run, delayMs); timer.unref(); return () => clearTimeout(timer); };
+
 export function serviceAccountTokenProvider(
   projectId: string,
   credentials: ServiceAccount,
   fetcher: typeof fetch = fetch,
   now: () => number = Date.now,
+  schedule: RefreshScheduler = unrefTimer,
+  random: () => number = Math.random,
 ): FcmAccessTokenProvider {
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)
     || credentials.type !== 'service_account' || credentials.project_id !== projectId
@@ -40,6 +46,19 @@ export function serviceAccountTokenProvider(
   }
   let cached: { token: string; expires: number } | undefined;
   let pending: Promise<string> | undefined;
+  let cancelProactive: (() => void) | undefined;
+  const shared = () => pending ??= refresh().finally(() => { pending = undefined; });
+  // The ring path never waits for an OAuth round trip in steady state: the token is replaced about
+  // five minutes before it expires (jittered by up to a minute), never sooner than half its lifetime.
+  // A failed background refresh retries in 30 s while the old token is still usable; once it is not,
+  // the next delivery refreshes inline exactly as before.
+  const proactive = (delayMs: number) => {
+    cancelProactive?.();
+    cancelProactive = schedule(() => {
+      cancelProactive = undefined;
+      shared().catch(() => { if (cached && now() < cached.expires && !cancelProactive) proactive(30_000); });
+    }, delayMs);
+  };
   async function refresh(): Promise<string> {
     const issued = Math.floor(now() / 1000);
     const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
@@ -82,6 +101,7 @@ export function serviceAccountTokenProvider(
         // A timed-out response must never populate the token cache.
         if (controller.signal.aborted) throw new Error('FCM OAuth timeout');
         cached = { token: value.access_token, expires: now() + (value.expires_in - 60) * 1000 };
+        proactive(Math.max(value.expires_in * 500, (value.expires_in - 300) * 1000 - Math.floor(random() * 60_000)));
         return value.access_token as string;
       };
       return await Promise.race([work(), deadline]);
@@ -92,8 +112,7 @@ export function serviceAccountTokenProvider(
     getAccessToken(signal) {
       if (signal?.aborted) return Promise.reject(new Error('FCM credentials request cancelled'));
       if (cached && now() < cached.expires) return cancellable(Promise.resolve(cached.token), signal);
-      if (!pending) pending = refresh().finally(() => { pending = undefined; });
-      return cancellable(pending, signal);
+      return cancellable(shared(), signal);
     },
   };
 }

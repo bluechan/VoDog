@@ -25,7 +25,7 @@ export class PushWorker {
   await Promise.all(jobs.rows.map(job=>this.deliver(job)));
  }
  private async deliver(job:any){
-  const row=(await this.db.query(`SELECT p.voip_token,p.environment,c.remote_number,c.snapshot_owner_id,sim.country_iso,c.internal_call,
+  const row=(await this.db.query(`SELECT p.platform,p.voip_token,p.environment,c.remote_number,c.snapshot_owner_id,sim.country_iso,c.internal_call,
    (SELECT COALESCE(NULLIF(ps.label,''),ps.phone_label) FROM sims ps WHERE ps.id=c.peer_sim_id) peer_sim_label,COALESCE(NULLIF(sim.label,''),sim.phone_label) sim_label
    FROM push_registrations p JOIN sessions s ON s.id=p.session_id
    JOIN call_records c ON c.id=$1 AND c.snapshot_owner_id=p.user_id JOIN gateways g ON g.id=c.gateway_id
@@ -36,10 +36,13 @@ export class PushWorker {
    AND g.last_seen_at>now()-($4::text||' seconds')::interval`,[job.call_id,job.registration_id,job.session_id,this.onlineSeconds])).rows[0];
   if(!row){await this.finish(job,'cancelled','destination_or_call_inactive');return;}
   // S21 §A: the caller's own address-book name so CallKit can show it. Never the number itself.
-  const contactName=await annotateNumbers(this.db,row.snapshot_owner_id,[{remoteNumber:row.remote_number,countryIso:row.country_iso}],'call')
-   .then(([annotation])=>annotation?.contactName??null).catch(()=>null);
+  // S96: the same annotation carries the caller's home location.
+  const annotation=await annotateNumbers(this.db,row.snapshot_owner_id,[{remoteNumber:row.remote_number,countryIso:row.country_iso}],'call')
+   .then(([value])=>value).catch(()=>undefined);
+  const contactName=annotation?.contactName??null;
   try{
-   const result=await this.sender.sendIncoming({token:row.voip_token,environment:row.environment,callId:job.call_id,notificationId:job.id,contactName,remoteNumber:row.remote_number,internal:row.internal_call===true,peerSimLabel:row.peer_sim_label??null,simLabel:row.sim_label??null});
+   job.platform=row.platform;
+   const result=await this.sender.sendIncoming({platform:row.platform,token:row.voip_token,environment:row.environment,callId:job.call_id,notificationId:job.id,contactName,remoteNumber:row.remote_number,internal:row.internal_call===true,peerSimLabel:row.peer_sim_label??null,simLabel:row.sim_label??null,remoteLocation:annotation?.remoteLocation??null});
    if(result.status===200){await this.finish(job,'delivered',null);return;}
    if(result.status===410||result.reason==='BadDeviceToken'||result.reason==='DeviceTokenNotForTopic')await this.db.query('UPDATE push_registrations SET voip_token=NULL,updated_at=now() WHERE id=$1 AND voip_token=$2 AND environment=$3',[job.registration_id,row.voip_token,row.environment]);
    const retry=(result.status===429||result.status>=500)&&job.attempts<3;
@@ -48,7 +51,7 @@ export class PushWorker {
  }
  private async finish(job:any,state:string,error:string|null){
   // S36 C3: queued -> delivered/failed latency for the VoIP push that wakes an iPhone.
-  if(state==='delivered'||state==='failed')diag(this.db,'push.apns',{platform:'ios',state,ms:Date.now()-new Date(job.created_at).getTime(),attempt:Number(job.attempts),reason:error},{callId:job.call_id,level:state==='failed'?'warn':'info'});
+  if(state==='delivered'||state==='failed')diag(this.db,'push.apns',{platform:job.platform??'ios',state,ms:Date.now()-new Date(job.created_at).getTime(),attempt:Number(job.attempts),reason:error},{callId:job.call_id,level:state==='failed'?'warn':'info'});
   await this.db.query(`UPDATE push_deliveries SET state=$3,last_error=$4,lease_id=NULL,lease_until=NULL,next_attempt_at=now()+interval '5 seconds',updated_at=now() WHERE id=$1 AND lease_id=$2`,[job.id,job.lease_id,state,error]);
  }
 }

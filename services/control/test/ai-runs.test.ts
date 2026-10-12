@@ -366,6 +366,69 @@ test('the caller hangup keeps the run identity so the worker last transcript bat
   await cleanupCall(call.callId);
 });
 
+// S128: `GET …/ai-transcript` marks the last AI row under the same rule as the `GET …/transcript` dialog.
+test('S128 ai-transcript marks the last AI row exactly when the transcript dialog does',async()=>{
+  await heartbeat();const call=await incoming();await snapshot(call);const run=await claimRun();
+  const committed=await app.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/commit-answer`,headers:leaseHeaders(run.leaseToken),payload:worker});assert.equal(committed.statusCode,200,committed.body);
+  const at=new Date().toISOString(),M='（未播完）';
+  const posted=await app.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/transcript`,headers:leaseHeaders(run.leaseToken),
+    payload:{...worker,items:[{role:'ai',sequence:0,text:'你好，我是 AI 助理',at},{role:'caller',sequence:1,text:'我找王先生',at},{role:'ai',sequence:2,text:'他现在不方便接电话',at},{role:'caller',sequence:3,text:'那算了',at}]}});
+  assert.equal(posted.statusCode,200,posted.body);
+  await db.query(`UPDATE call_records SET answered_at=COALESCE(answered_at,now()) WHERE id=$1`,[call.callId]);
+  const facts=(await db.query(`SELECT answered_by_platform,ai_run_id FROM call_records WHERE id=$1`,[call.callId])).rows[0];
+  assert.equal(facts.answered_by_platform,'ai');assert.equal(facts.ai_run_id,run.id,'the owner_joined guard reads the run through call_records.ai_run_id');
+  const plain=['你好，我是 AI 助理','我找王先生','他现在不方便接电话','那算了'],marked=[plain[0],plain[1],plain[2]+M,plain[3]];
+  // Both views are read every time, so they cannot drift apart unnoticed.
+  let dialogChecks=0;
+  const texts=async()=>{
+    const view=await app.inject({method:'GET',url:`/api/v1/calls/${call.callId}/ai-transcript`,headers:auth(userToken)});assert.equal(view.statusCode,200,view.body);
+    const items=view.json().items.map((item:any)=>item.text);
+    const transcript=await app.inject({method:'GET',url:`/api/v1/calls/${call.callId}/transcript`,headers:auth(userToken)});assert.equal(transcript.statusCode,200,transcript.body);
+    const dialog=transcript.json().transcript?.dialog;
+    if(dialog){dialogChecks++;assert.deepEqual(dialog.turns.map((turn:any)=>turn.text),items,'dialog and AI conversation disagree');}
+    return items;
+  };
+  const job=(fingerprint:string,age:string,result:unknown)=>db.query(
+    `INSERT INTO transcript_jobs(call_id,snapshot_owner_id,manifest,manifest_fingerprint,state,result,completed_at,created_at)
+     VALUES($1,$2,'{}',$3,'succeeded',$4,now(),now()-$5::interval) RETURNING id`,[call.callId,userId,fingerprint.repeat(64),JSON.stringify(result),age]).then(q=>q.rows[0].id as string);
+  const setResult=(id:string,result:unknown)=>db.query(`UPDATE transcript_jobs SET state='succeeded',result=$2,completed_at=now() WHERE id=$1`,[id,JSON.stringify(result)]);
+
+  assert.deepEqual(await texts(),plain,'no job');
+  const older=await job('a','1 hour',{text:'x',recording:{callerTailActive:true}});
+  assert.deepEqual(await texts(),marked,'flag true: only the last AI row, once; the caller row after it untouched');
+  assert.equal((await db.query(`SELECT text FROM ai_run_transcripts WHERE run_id=$1 AND sequence=2`,[run.id])).rows[0].text,plain[2],'the stored row is never rewritten');
+
+  await db.query(`UPDATE ai_run_transcripts SET text=$2 WHERE run_id=$1 AND sequence=2`,[run.id,plain[2]+M]);
+  assert.deepEqual(await texts(),marked,'Voice already marked it: not doubled');
+  await db.query(`UPDATE ai_run_transcripts SET text=$2 WHERE run_id=$1 AND sequence=2`,[run.id,plain[2]]);
+
+  await db.query(`UPDATE ai_call_runs SET failure_code='owner_joined' WHERE id=$1`,[run.id]);
+  assert.deepEqual(await texts(),plain,'owner_joined');
+  await db.query(`UPDATE ai_call_runs SET failure_code=NULL WHERE id=$1`,[run.id]);
+  assert.deepEqual(await texts(),marked);
+
+  await setResult(older,{text:'x',recording:{callerTailActive:false}});assert.deepEqual(await texts(),plain,'flag false');
+  await setResult(older,{text:'x',recording:{}});assert.deepEqual(await texts(),plain,'flag absent');
+  await setResult(older,{text:'x'});assert.deepEqual(await texts(),plain,'no recording object');
+  await db.query(`UPDATE transcript_jobs SET state='failed',result=NULL,error_code='x',error_message='x' WHERE id=$1`,[older]);
+  assert.deepEqual(await texts(),plain,'job not succeeded');
+  await setResult(older,{text:'x',recording:{callerTailActive:true}});assert.deepEqual(await texts(),marked);
+
+  const newer=await job('b','0 seconds',{text:'x',recording:{}});
+  assert.deepEqual(await texts(),plain,'a newer job without the flag wins over an older job with it');
+  await db.query(`UPDATE transcript_jobs SET state='queued',result=NULL,completed_at=NULL WHERE id=$1`,[newer]);
+  assert.deepEqual(await texts(),plain,'a newer unfinished job wins too');
+  await db.query(`DELETE FROM transcript_jobs WHERE id=$1`,[newer]);
+  assert.deepEqual(await texts(),marked);
+
+  await db.query(`UPDATE call_records SET answered_by_platform='android' WHERE id=$1`,[call.callId]);
+  assert.deepEqual(await texts(),plain,'not AI-answered: the dialog takes its ASR branch, so no marker here either');
+  await db.query(`UPDATE call_records SET answered_by_platform='ai' WHERE id=$1`,[call.callId]);
+  assert.ok(dialogChecks>=10,`the dialog was compared only ${dialogChecks} times`);
+  await db.query(`DELETE FROM transcript_jobs WHERE call_id=$1`,[call.callId]);
+  await cleanupCall(call.callId);
+});
+
 test('the reconciler hangup path keeps the same identity and accepts the late batch too',async()=>{
   await heartbeat();const call=await incoming();await snapshot(call);const run=await claimRun();
   // The reconciler only selects a `preparing` run once its lease is due, so expire it before the tick.
@@ -603,4 +666,77 @@ test('S94 owner-joined checks the capture binding creation time and refuses call
     SELECT id,gateway_id,snapshot_owner_id,device_call_id,41,$2,'relay-primary',1 FROM call_records WHERE id=$1`,[call.callId,deviceEpoch]);
   const mismatch=await app.inject({method:'POST',url,headers:auth(deviceToken),payload:{...payload,eventId:crypto.randomUUID()}});assert.equal(mismatch.statusCode,409);assert.equal(mismatch.json().error.code,'DEVICE_CALL_MISMATCH');
   await cleanupCall(call.callId);
+});
+
+test('an idle claim is a cheap 204 with the hold off, and a stale worker still gets its 409 before any run exists',async()=>{
+  await heartbeat();
+  const startedAt=Date.now();
+  const idle=await app.inject({method:'POST',url:'/internal/v1/ai/runs/claim',headers:internal,payload:worker});
+  assert.equal(idle.statusCode,204,idle.body);assert.ok(Date.now()-startedAt<1000,'AI_CLAIM_HOLD_MS unset never holds the claim');
+  const stranger={instanceId:'00000000-0000-4000-8000-000000000031',bootId:'00000000-0000-4000-8000-000000000032'};
+  const stale=await app.inject({method:'POST',url:'/internal/v1/ai/runs/claim',headers:internal,payload:stranger});
+  assert.equal(stale.statusCode,409,stale.body);assert.equal(stale.json().error.code,'AI_WORKER_STALE');
+});
+
+test('AI_CLAIM_HOLD_MS: a claim held before the run exists returns it within tens of ms of the incoming commit',async()=>{
+  const holdApp=await buildApp(db,{...config,AI_CLAIM_HOLD_MS:2000} as never);
+  try{
+    await heartbeat();await holdApp.ready();
+    const heldAt=Date.now();
+    const held=holdApp.inject({method:'POST',url:'/internal/v1/ai/runs/claim',headers:internal,payload:worker});
+    await new Promise(resolve=>setTimeout(resolve,150));
+    const deviceCallId=crypto.randomUUID(),observedAt=new Date().toISOString();
+    const created=await holdApp.inject({method:'POST',url:'/api/v1/gateway/calls/incoming',headers:auth(deviceToken),payload:{eventId:crypto.randomUUID(),generation:deviceEpoch,deviceCallId,simId,remoteNumber:'+15550176',observedAt}});
+    assert.equal(created.statusCode,201,created.body);const committedAt=Date.now();
+    const claim=await held;const wokeMs=Date.now()-committedAt;
+    assert.equal(claim.statusCode,200,claim.body);assert.equal(claim.json().run.callId,created.json().call.id);
+    assert.ok(wokeMs<250,`the held claim woke ${wokeMs} ms after the commit`);assert.ok(Date.now()-heldAt<2000,'woken, not timed out');
+    await cleanupCall(created.json().call.id);
+  }finally{await holdApp.close();}
+});
+
+test('commit-answer waits for the ringing snapshot that lands inside its window instead of a 409',async()=>{
+  await heartbeat();const call=await incoming();const run=await claimRun();
+  const startedAt=Date.now();
+  const pending=app.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/commit-answer`,headers:leaseHeaders(run.leaseToken),payload:worker});
+  await new Promise(resolve=>setTimeout(resolve,400));
+  await snapshot(call);
+  const committed=await pending;
+  assert.equal(committed.statusCode,200,committed.body);assert.equal(committed.json().replayed,false);
+  assert.ok(Date.now()-startedAt<2000);
+  assert.equal((await db.query(`SELECT count(*)::int n FROM commands WHERE call_id=$1 AND kind='answer'`,[call.callId])).rows[0].n,1);
+  await cleanupCall(call.callId);
+});
+
+test('commit-answer still answers 409 AI_RINGING_NOT_CONFIRMED when the snapshot never lands, inside the worker timeout',async()=>{
+  await heartbeat();const call=await incoming();const run=await claimRun();
+  const startedAt=Date.now();
+  const refused=await app.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/commit-answer`,headers:leaseHeaders(run.leaseToken),payload:worker});
+  const elapsed=Date.now()-startedAt;
+  assert.equal(refused.statusCode,409,refused.body);assert.equal(refused.json().error.code,'AI_RINGING_NOT_CONFIRMED');
+  assert.ok(elapsed>=1500&&elapsed<2800,`bounded wait, got ${elapsed} ms`);
+  const state=(await db.query(`SELECT state,answer_command_id FROM ai_call_runs WHERE id=$1`,[run.id])).rows[0];
+  assert.equal(state.state,'preparing');assert.equal(state.answer_command_id,null);
+  await cleanupCall(call.callId);
+});
+
+test('GATEWAY_ACTIVE_CALL_GRACE_SECONDS keeps AI audio through a heartbeat gap only for an active pinned call',async()=>{
+  const graceApp=await buildApp(db,{...config,GATEWAY_ACTIVE_CALL_GRACE_SECONDS:120} as never);
+  await heartbeat();const call=await incoming();await snapshot(call);const run=await claimRun();
+  try{
+    const committed=await app.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/commit-answer`,headers:leaseHeaders(run.leaseToken),payload:worker});assert.equal(committed.statusCode,200,committed.body);
+    const active=await app.inject({method:'POST',url:`/api/v1/gateway/calls/${call.callId}/events`,headers:auth(deviceToken),payload:{eventId:crypto.randomUUID(),generation:deviceEpoch,state:'active'}});assert.equal(active.statusCode,200,active.body);
+    const read=async(target:FastifyInstance)=>{const r=await target.inject({method:'GET',url:`/internal/v1/ai/runs/${run.id}?instanceId=${worker.instanceId}&bootId=${worker.bootId}`,headers:leaseHeaders(run.leaseToken)});assert.equal(r.statusCode,200,r.body);return r.json().audioAllowed as boolean;};
+    assert.equal(await read(app),true);assert.equal(await read(graceApp),true);
+    await db.query(`UPDATE gateways SET last_seen_at=now()-interval '60 seconds' WHERE id=$1`,[gatewayId]);
+    assert.equal(await read(app),false,'flag at 0: a 60 s heartbeat gap withdraws audio as before');
+    assert.equal(await read(graceApp),true,'inside the 120 s grace the active pinned call keeps its audio');
+    const options=await graceApp.inject({method:'POST',url:`/internal/v1/ai/runs/${run.id}/media/options`,headers:leaseHeaders(run.leaseToken),payload:{...worker,transport:'udp'}});
+    assert.equal(options.statusCode,409,'new media authorizations still need a gateway seen within GATEWAY_ONLINE_SECONDS');
+    await db.query(`UPDATE gateways SET last_seen_at=now()-interval '121 seconds' WHERE id=$1`,[gatewayId]);
+    assert.equal(await read(graceApp),false,'past the grace audio is withdrawn');
+  }finally{
+    await db.query(`UPDATE gateways SET last_seen_at=now() WHERE id=$1`,[gatewayId]);
+    await graceApp.close();await cleanupCall(call.callId);
+  }
 });
