@@ -55,6 +55,8 @@ class GatewayForegroundService : Service() {
      *  and SMS intents feed the same channel, so a wake without a doorbell ring reports nothing. */
     private val doorbellWakeAtMs = AtomicLong(0L)
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    /** The default network as `network.transport` last saw it (wifi / cellular / other / none), for heartbeat.summary. */
+    @Volatile private var networkTransport: String? = null
     // Exactly one open replay database per identity. Re-opening it twice per heartbeat leaked an
     // SQLiteConnection every 2 s and produced "database is locked" storms in logcat.
     private val replayStores = linkedMapOf<GatewayCommandIdentity, GatewayReplayHorizonStore>()
@@ -81,6 +83,7 @@ class GatewayForegroundService : Service() {
                     else -> "other"
                 }
                 GatewayEndpoint.onDefaultNetwork(transport)
+                networkTransport = transport
                 val validated = capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                 if ("$transport/$validated" == last) return
                 last = "$transport/$validated"
@@ -89,6 +92,7 @@ class GatewayForegroundService : Service() {
             }
 
             override fun onLost(network: android.net.Network) {
+                networkTransport = "none"
                 if (last == "none") return
                 last = "none"
                 GatewayDiag.log("network.transport", mapOf("transport" to "none") + noNetworkCause(),
@@ -183,6 +187,11 @@ class GatewayForegroundService : Service() {
             GatewayDeviceStatus.start(this)
             // S41 §决策4 / S55: catches up now, then follows the provider (2 s debounce) and a 60 s turn.
             GatewaySystemBlocklistMirror.start(this)
+            // The WebRTC native library loads here, off the main thread, instead of inside the first
+            // call's media setup. Nothing in it opens a socket.
+            if (ownedMediaProbe != null) ownedScope.launch(Dispatchers.Default) {
+                runCatching { org.vodog.gateway.media.GatewayDataChannelTransport.prewarm(applicationContext) }
+            }
             loopJob = ownedScope.launch {
                 heartbeatLoop(credential, commandIdentity, ownedTransport, ownedMediaSetup, ownedMediaProbe, ownedScope)
             }
@@ -216,6 +225,10 @@ class GatewayForegroundService : Service() {
         var authorizedDialGraceUntilMs = 0L
         var lastHeartbeatStartedAtMs: Long? = null
         val rtt = HeartbeatRttWindow()
+        /** S97: a heartbeat confirmed [identity] in this loop; reset when a migration swaps it. */
+        var identityAccepted = false
+        /** S97: server call IDs Control already got as ACTIVE (or an early snapshot was tried for). */
+        val activeReported = mutableSetOf<String>()
     }
 
     private class HeartbeatCycleInputs(
@@ -280,6 +293,7 @@ class GatewayForegroundService : Service() {
                     continue
                 }
                 loop.identity = resumedIdentity
+                loop.identityAccepted = false
             }
             try {
                 when (runHeartbeatCycle(loop)) {
@@ -299,6 +313,7 @@ class GatewayForegroundService : Service() {
 
     private suspend fun runHeartbeatCycle(loop: HeartbeatLoopContext): CycleEnd {
         val runtime = loop.runtime
+        syncEarlyActiveSnapshot(loop)
         val inputs = prepareHeartbeatCycle(loop)
         val sent = sendHeartbeat(loop, inputs)
         val result = sent.result
@@ -322,6 +337,7 @@ class GatewayForegroundService : Service() {
         val settings = GatewaySettingsCoordinator(this, runtime, loop.api, loop.identity, replayStore)
         val dtmf = GatewayDtmfCoordinator(loop.api, loop.identity, replayStore)
         val (telecom, syncFailureDetail) = syncTelecom(loop)
+        telecom?.let { loop.activeReported += it.confirmedActiveCallIds }
         flushAndRefreshReplayEvidence(loop, replayStore, sms, calls)
         executeCommands(loop, inputs, sent, replayStore, commands, sms, calls, settings, dtmf)
         replayStore.maybeMarkReady(result.serverSequence)
@@ -458,7 +474,9 @@ class GatewayForegroundService : Service() {
             ),
             level = if (rttMs > VERY_SLOW_HEARTBEAT_MS) "warn" else "debug",
         )
-        loop.rtt.due(heartbeatStartedAtMs)?.let { GatewayDiag.log("heartbeat.summary", it) }
+        loop.rtt.due(heartbeatStartedAtMs)?.let {
+            GatewayDiag.log("heartbeat.summary", it + mapOf("relay" to GatewayEndpoint.relay, "networkTransport" to networkTransport))
+        }
         return SentHeartbeat(result, commandsReceivedAtMs, carriedPowerResult)
     }
 
@@ -471,6 +489,7 @@ class GatewayForegroundService : Service() {
         loop.identity = runtime.confirmServerIdentity(
             result.gatewayId, result.deviceEpoch, loop.token,
         )
+        loop.identityAccepted = true
         val replayStore = replayStore(loop.identity)
         result.replayHorizonEnrollment?.let(replayStore::applyEnrollment)
         if (result.replayHorizon != null && inputs.requestReplayStore == null) {
@@ -489,6 +508,7 @@ class GatewayForegroundService : Service() {
             if (applied || modeChanged) GatewaySystemBlocklistMirror.schedule(this)
         }
         runtime.earlyMedia = result.earlyMedia
+        runtime.aiEarlyLeg = result.aiEarlyLeg
         // S69: the first accepted heartbeat after a failure run closes it.
         loop.connectionState.takeIf { it.consecutiveFailures > 0 }?.let { down ->
             GatewayDiag.log("heartbeat.recovered", mapOf(
@@ -512,6 +532,33 @@ class GatewayForegroundService : Service() {
             else -> "已连接 · 状态同步"
         })
         return replayStore to commands
+    }
+
+    /**
+     * S97 §3: a remote-answered incoming call that just went ACTIVE is reported before this cycle's
+     * heartbeat, so Control's capture gate and `ai_run.activated` no longer wait one heartbeat RTT.
+     * Same constraints as the normal path: runs inside the single loop coroutine after the replay
+     * barrier check, only once a heartbeat has accepted this identity, and the S21 interception
+     * outbox is flushed before the snapshot. At most once per call; the normal sync is unchanged.
+     */
+    private fun syncEarlyActiveSnapshot(loop: HeartbeatLoopContext) {
+        if (!loop.identityAccepted || lastHeartbeatFailed) return
+        val records = DeviceCallJournal(this).recordsForSnapshot()
+        loop.activeReported.retainAll(records.mapNotNull { it.serverCallId }.toSet())
+        val pending = earlyActiveSnapshotCallIds(records, loop.activeReported)
+        if (pending.isEmpty()) return
+        loop.activeReported += pending
+        val startedAtMs = SystemClock.elapsedRealtime()
+        GatewayInterceptionReporter(this, loop.api).flush()
+        val (telecom, failure) = syncTelecom(loop)
+        telecom?.let { loop.activeReported += it.confirmedActiveCallIds }
+        pending.forEach { callId ->
+            GatewayDiag.log("telephony.early_active_snapshot", mapOf(
+                "ms" to SystemClock.elapsedRealtime() - startedAtMs,
+                "confirmed" to (telecom?.confirmedActiveCallIds?.contains(callId) == true),
+                "failed" to (failure != null),
+            ), callId = callId)
+        }
     }
 
     /** Refresh SIM identities before applying any command frozen to an assignment. */
@@ -1062,9 +1109,12 @@ internal class HeartbeatRttWindow(private val windowMs: Long = 300_000L) {
     private var slowCount = 0L
     private var maxGapMs = 0L
     private var dueAtMs = 0L
+    /** Round trips of this window for p50/p95; a 1 s call-time cycle fills 300, the cap only guards a burst. */
+    private val samples = ArrayList<Long>()
 
     fun sample(rttMs: Long, slow: Boolean = false, gapMs: Long? = null) {
         min = minOf(min, rttMs); max = maxOf(max, rttMs); sum += rttMs; count++
+        if (samples.size < MAX_SAMPLES) samples += rttMs
         if (slow) slowCount++
         if (gapMs != null) maxGapMs = maxOf(maxGapMs, gapMs)
     }
@@ -1073,10 +1123,20 @@ internal class HeartbeatRttWindow(private val windowMs: Long = 300_000L) {
     fun due(nowMs: Long): Map<String, Any?>? {
         if (dueAtMs == 0L) { dueAtMs = nowMs + windowMs; return null }
         if (nowMs < dueAtMs || count == 0L) return null
+        val sorted = samples.sorted()
         val fields = mapOf("count" to count, "minMs" to min, "avgMs" to sum / count, "maxMs" to max,
+            "p50Ms" to nearestRank(sorted, 50), "p95Ms" to nearestRank(sorted, 95),
             "slowCount" to slowCount, "maxGapMs" to maxGapMs)
         min = Long.MAX_VALUE; max = 0L; sum = 0L; count = 0L; slowCount = 0L; maxGapMs = 0L; dueAtMs = nowMs + windowMs
+        samples.clear()
         return fields
+    }
+
+    private companion object {
+        const val MAX_SAMPLES = 1_024
+        /** Nearest-rank percentile of an ascending, non-empty list. */
+        fun nearestRank(sorted: List<Long>, percentile: Int): Long =
+            sorted[((percentile * sorted.size + 99) / 100 - 1).coerceIn(0, sorted.lastIndex)]
     }
 }
 
@@ -1114,6 +1174,12 @@ internal fun gatewayCallOrAudioActive(
     authorizedDialTransition: Boolean,
     audioSessionActive: Boolean,
 ): Boolean = exactNonTerminalCall || anyNonTerminalCall || authorizedDialTransition || audioSessionActive
+
+/** S97 §3: remote-answered (AI or owner client) incoming calls now ACTIVE that Control has not been told about. */
+internal fun earlyActiveSnapshotCallIds(records: List<DeviceCallRecord>, alreadyReported: Set<String>): Set<String> =
+    records.filter {
+        it.direction == DeviceCallDirection.INCOMING && it.remoteAnswered && it.state == DeviceCallState.ACTIVE
+    }.mapNotNull { it.serverCallId }.filterNot(alreadyReported::contains).toSet()
 
 /** How long accepted reachability evidence keeps counting after its reuse window expired. */
 internal const val PROBE_STALE_RETENTION_SECONDS = 300L

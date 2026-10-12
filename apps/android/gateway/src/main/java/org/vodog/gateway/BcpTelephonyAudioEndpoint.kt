@@ -31,6 +31,9 @@ class BcpTelephonyAudioEndpoint(
     context: Context,
     // S56: an early-media leg starts capture only; [arm] adds the uplink AudioTrack and the watchdog at ACTIVE.
     private val earlyMedia: Boolean = false,
+    // S123 决策 3: an AI early leg opens no AudioRecord while ringing; [arm] starts capture with the track,
+    // so not one frame reaches the bridge (and Voice's greeting trigger) before ACTIVE.
+    private val deferCapture: Boolean = false,
 ) : TelephonyAudioEndpoint {
     private val context = context.applicationContext
     private val lifecycleLock = Any()
@@ -45,8 +48,11 @@ class BcpTelephonyAudioEndpoint(
     @Volatile private var failureCallback: (TelephonyAudioEndpoint.Failure) -> Unit = {}
     @Volatile private var watchdog: ZeroPcmWatchdog? = null
     @Volatile private var uplinkSupplier: (() -> ByteArray?)? = null
+    @Volatile private var downlinkSink: ((ByteArray, Long) -> Unit)? = null
     @Volatile private var heardAudio = false
     @Volatile private var actualCaptureRate: Int? = null
+    /** The last AudioTrack.getMinBufferSize reading, for the `audio.endpoint` start row. */
+    @Volatile private var playbackMinBufferBytes = 0
 
     override fun captureSampleRate(): Int? = actualCaptureRate
 
@@ -72,6 +78,9 @@ class BcpTelephonyAudioEndpoint(
         onFailure: (TelephonyAudioEndpoint.Failure) -> Unit,
     ): Result<Unit> {
         var cleanupRequired = false
+        val startedMs = SystemClock.elapsedRealtime()
+        var trackBufferFrames: Int? = null
+        var captureBufferFrames: Int? = null
         val result = runCatching {
             synchronized(lifecycleLock) {
                 check(
@@ -87,18 +96,20 @@ class BcpTelephonyAudioEndpoint(
                     "telephony audio capability unavailable"
                 }
 
-                val record = buildCapture()
+                val record = if (deferCapture) null else buildCapture()
                 capture.set(record)
                 val track = if (earlyMedia) null else try {
                     buildPlayback()
                 } catch (error: Exception) {
-                    releaseCapture(record)
+                    record?.let(::releaseCapture)
                     throw error
                 }
                 playback.set(track)
+                captureBufferFrames = record?.let { runCatching { it.bufferSizeInFrames }.getOrNull() }
+                trackBufferFrames = track?.let { runCatching { it.bufferSizeInFrames }.getOrNull() }
                 try {
-                    record.startRecording()
-                    check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    record?.startRecording()
+                    check(record == null || record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                         "VOICE_DOWNLINK did not enter RECORDSTATE_RECORDING"
                     }
                     track?.play()
@@ -107,7 +118,7 @@ class BcpTelephonyAudioEndpoint(
                     }
                 } catch (error: Exception) {
                     track?.let(::releasePlayback)
-                    releaseCapture(record)
+                    record?.let(::releaseCapture)
                     throw error
                 }
 
@@ -115,27 +126,34 @@ class BcpTelephonyAudioEndpoint(
                 heardAudio = false
                 watchdog = if (earlyMedia) null else ZeroPcmWatchdog()
                 uplinkSupplier = nextUplinkPcm
-                val captureWorker = Thread(
-                    { captureLoop(record, onDownlinkPcm) }, "VoDog.telephony.capture",
-                )
+                downlinkSink = onDownlinkPcm
+                val captureWorker = record?.let {
+                    Thread({ captureLoop(it, onDownlinkPcm) }, "VoDog.telephony.capture")
+                }
                 val playbackWorker = track?.let {
                     Thread({ playbackLoop(it, nextUplinkPcm) }, "VoDog.telephony.playback")
                 }
                 captureThread.set(captureWorker)
                 playbackThread.set(playbackWorker)
                 try {
-                    captureWorker.start()
+                    captureWorker?.start()
                     if (playbackWorker != null) playbackWorker.start()
                 } catch (error: Exception) {
                     running.set(false)
                     unblockIo()
-                    captureWorker.interrupt()
+                    captureWorker?.interrupt()
                     playbackWorker?.interrupt()
                     throw error
                 }
             }
         }
-        GatewayDiag.log("audio.endpoint", mapOf("phase" to "start", "ok" to result.isSuccess, "reason" to result.exceptionOrNull()?.message?.take(120)), level = if (result.isSuccess) "info" else "error")
+        GatewayDiag.log("audio.endpoint", mapOf(
+            "phase" to "start", "ok" to result.isSuccess, "reason" to result.exceptionOrNull()?.message?.take(120),
+            "ms" to SystemClock.elapsedRealtime() - startedMs,
+            "trackBufferFrames" to trackBufferFrames, "captureBufferFrames" to captureBufferFrames,
+            // AudioTrack.getMinBufferSize in bytes; absent on a capture-only early-media start.
+            "minBuf" to playbackMinBufferBytes.takeIf { trackBufferFrames != null && it > 0 },
+        ), level = if (result.isSuccess) "info" else "error")
         if (result.isFailure) {
             if (cleanupRequired) {
                 reportFailure(
@@ -182,6 +200,7 @@ class BcpTelephonyAudioEndpoint(
         val min = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
         )
+        playbackMinBufferBytes = min
         check(min > 0) { "AudioTrack buffer unavailable: $min" }
         val track = AudioTrack.Builder()
             .setBufferSizeInBytes(maxOf(min, FRAME_BYTES * 2))
@@ -343,6 +362,19 @@ class BcpTelephonyAudioEndpoint(
             synchronized(lifecycleLock) {
                 if (!running.get() || playback.get() != null) return
                 watchdog = zeroPcmWatchdogAtArm(heardAudio)
+                if (deferCapture && capture.get() == null) {
+                    // S123 决策 3/10: the deferred VOICE_DOWNLINK capture; its frames go to Voice from now on.
+                    val record = buildCapture()
+                    capture.set(record)
+                    record.startRecording()
+                    check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        "VOICE_DOWNLINK did not enter RECORDSTATE_RECORDING"
+                    }
+                    val sink = checkNotNull(downlinkSink)
+                    val worker = Thread({ captureLoop(record, sink) }, "VoDog.telephony.capture")
+                    captureThread.set(worker)
+                    worker.start()
+                }
                 val track = buildPlayback()
                 playback.set(track)
                 track.play()

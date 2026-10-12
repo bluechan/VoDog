@@ -12,7 +12,11 @@ import org.vodog.gateway.media.GatewayMediaHttpException
 import org.vodog.gateway.media.HttpGatewayMediaSignaling
 import org.vodog.gateway.media.IceTransport
 import org.vodog.gateway.media.MediaCaptureRequest
+import org.vodog.gateway.media.MediaSetupTimeline
 import org.vodog.gateway.media.MediaTransportMemory
+import org.vodog.gateway.media.connectInitialMediaLeg
+import org.vodog.gateway.media.mediaSetupCancelled
+import org.vodog.gateway.media.mediaRevoked
 import org.vodog.gateway.media.OpusPlayoutProfile
 import org.vodog.gateway.media.parseCaptureBinding
 import org.vodog.gateway.media.retryMediaNodePending
@@ -157,8 +161,13 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
         setupOwner: GatewayMediaSetupOwner,
         probeReadiness: org.vodog.gateway.media.GatewayProbeReadinessProvider,
         api: GatewayApi,
-    ): Unit = LIFECYCLE_MUTEX.withLock {
-        if (!preflightReady()) return@withLock
+    ) {
+        // S124 决策 1: an early leg armed here gets its capture binding after the mutex is released.
+        var armedEarly: GatewayActiveAudioSession.Holder? = null
+        LIFECYCLE_MUTEX.withLock {
+        // S123 决策 4/5: a deferred AI answer is settled first; every exit below that builds no leg for it answers now.
+        val pendingAi = settleDeferredAiAnswers(api)
+        if (!preflightReady()) { pendingAi?.let { answerAi(it, "no_leg") }; return@withLock }
         val current = GatewayActiveAudioSession.current()
         if (current?.failed?.get() == true) {
             val armed = current.armed.get()
@@ -173,37 +182,42 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
         val answered = exactActiveCall()
         // S56: the flag only gates new legs, so turning it off lets an in-flight early leg reach hangup.
         val active = answered ?: (if (current?.armed?.get() == false || runtime.earlyMedia) exactEarlyCall() else null)
+            ?: exactAiEarlyCall(current?.takeIf { !it.armed.get() }?.deviceCallId)
         if (active == null) {
             if (current != null) stopAndRestoreNow("ended")
+            pendingAi?.let { answerAi(it, "no_leg") }
             return@withLock
         }
         if (current != null) {
             if (current.serverCallId != active.serverCallId || current.deviceCallId != active.deviceCallId ||
                 current.creationTimeMillis != active.creationTimeMillis) stopFailedLeg(current.armed.get())
-            else if (answered != null && current.armed.compareAndSet(false, true)) armEarlySession(current, api)
+            else if (answered != null && current.armed.compareAndSet(false, true) && armNow(current, "reconcile")) armedEarly = current
             return@withLock
         }
         // S94: a call the owner took over keeps its audio on the phone; Voice has left, so a new leg would
         // only fail its prebuffer and hang up. A restarted process must not rebuild one either.
-        if (active.ownerJoined) return@withLock
+        if (active.ownerJoined) { pendingAi?.let { answerAi(it, "no_leg") }; return@withLock }
         val early = answered == null
-        if (DeviceProtectedAudioHandoffJournal(context).read().phase != AudioHandoffPhase.ACQUIRED) return@withLock
-        if (early && !GatewayEarlyMediaAttempt.claim(requireNotNull(active.serverCallId))) return@withLock
+        // S123 决策 3: only the AI path selects an incoming call before ACTIVE.
+        val aiEarly = early && active.direction == DeviceCallDirection.INCOMING
+        if (DeviceProtectedAudioHandoffJournal(context).read().phase != AudioHandoffPhase.ACQUIRED) {
+            pendingAi?.let { answerAi(it, "no_leg") }; return@withLock
+        }
+        if (early && !GatewayEarlyMediaAttempt.claim(requireNotNull(active.serverCallId))) {
+            if (aiEarly) answerAi(active, "no_leg")
+            return@withLock
+        }
         val staged = StagedCloseables()
         var signaling: HttpGatewayMediaSignaling? = null
         var stage = "signaling"
         val setupStartedMs = android.os.SystemClock.elapsedRealtime()
+        val timeline = MediaSetupTimeline(android.os.SystemClock::elapsedRealtime)
+        timeline.put("activeToReconcileMs", if (early) null else activeToReconcileMs(active.deviceCallId))
         val playoutProfile = mediaPlayoutProfile(active.answeredByAi)
-        // S24 decision 1: the probe generation is only a memory key here. A failure to read it must
-        // never block setup - signaling re-reads it under its own fence a moment later - but a
-        // cancelled scope still owns this coroutine's death and must not be swallowed.
-        val networkGeneration = try {
-            probeReadiness.ensureCurrent().networkGeneration
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            null
-        }
+        // S24 decision 1: the probe generation is only a memory key here, read without waiting on (or
+        // starting) a probe round. A failure to read it must never block setup - signaling fences on
+        // the generation itself a moment later.
+        val networkGeneration = runCatching { probeReadiness.currentNetworkGeneration() }.getOrNull()
         val plannedTransport = mediaPlannedTransport(active.answeredByAi, MediaTransportMemory.INSTANCE.preferred(networkGeneration))
         Log.i(MEDIA_LOG_TAG, "setup_begin call=${active.serverCallId?.take(8)} answeredByAi=${active.answeredByAi}" +
             " playoutDelayMs=${playoutProfile.delayMs} transport=${plannedTransport.wireValue}")
@@ -220,19 +234,16 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
             signaling = ownedSignaling
             stage = "owner_register"
             if (!setupOwner.register(ownedSignaling)) {
+                if (aiEarly) answerAi(active, "no_leg")
                 stopFailedLeg(!early)
                 return@withLock
             }
             val ingress = GatewayAudioPacketIngress()
             stage = "data_channel_connect"
-            val channel = GatewayDataChannelTransport.connect(
-                context, requireNotNull(active.serverCallId), ownedSignaling, ingress, plannedTransport,
-            ) { from, to, reason ->
-                Log.w(MEDIA_LOG_TAG, "transport_fallback call=${active.serverCallId?.take(8)}" +
-                    " from=${from.wireValue} to=${to.wireValue} reason=$reason")
-                GatewayDiag.log("media.transport_fallback", mapOf("from" to from.wireValue, "to" to to.wireValue,
-                    "reason" to reason.toString()), callId = active.serverCallId, level = "warn")
-            }
+            val channel = connectInitialLeg(active, early, ownedSignaling, ingress, plannedTransport, timeline)
+            timeline.put("transport", channel.negotiatedTransport.wireValue)
+            timeline.put("attempt", channel.negotiationAttempt)
+            timeline.put("relayTurn", channel.relayTurn)
             val transport = staged.own(DataChannelAudioSessionTransport(channel))
             // S25 决策 7: an AI leg's TLS-first outcome must not steer the next human call, which
             // keeps UDP-first for latency; only human legs teach the per-network memory.
@@ -241,7 +252,7 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
             Log.i(MEDIA_LOG_TAG, "data_channel_connected call=${active.serverCallId?.take(8)}" +
                 " ms=${android.os.SystemClock.elapsedRealtime() - setupStartedMs}" +
                 " transport=${channel.negotiatedTransport.wireValue} attempt=${channel.negotiationAttempt}")
-            if (!preflightReady() || !sameExactActiveCall(active, exactActiveCall() ?: (if (early) exactEarlyCall() else null))) {
+            if (!preflightReady() || !sameExactActiveCall(active, exactActiveCall() ?: (if (early) exactEarlyCall() ?: exactAiEarlyCall(active.deviceCallId) else null))) {
                 staged.close(); if (!early) handoff.release(); return@withLock
             }
             stage = "codec"
@@ -259,15 +270,8 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
             // it) into the same ingress. Never taught to MediaTransportMemory: it is not a first choice.
             val serverCallId = requireNotNull(active.serverCallId)
             val rejoiner = object : MediaLegRejoiner {
-                override fun isOffline(error: Throwable): Boolean = defaultNetwork().let { (internet, validated) ->
-                    org.vodog.gateway.media.isOfflineRejoinFailure(error, internet, validated)
-                }
-                // ponytail: 500 ms ConnectivityManager poll, not the service's default-network callback.
-                // The first poll always sleeps, so a DNS failure on a network that looks up cannot spin.
-                override suspend fun awaitNetwork(budgetMs: Long): Boolean = kotlinx.coroutines.withTimeoutOrNull(budgetMs) {
-                    do kotlinx.coroutines.delay(500) while (!defaultNetwork().first)
-                    true
-                } ?: false
+                override fun isOffline(error: Throwable): Boolean = isOfflineMediaFailure(error)
+                override suspend fun awaitNetwork(budgetMs: Long): Boolean = awaitDefaultNetwork(budgetMs)
                 override suspend fun connect(transport: IceTransport, budgetMs: Long): AudioSessionTransport {
                     val armed = holderRef[0]?.armed?.get() ?: !early
                     val rejoinSignaling = HttpGatewayMediaSignaling(
@@ -279,11 +283,12 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
                     )
                     return DataChannelAudioSessionTransport(GatewayDataChannelTransport.connect(
                         context, serverCallId, rejoinSignaling, ingress, transport, fallback = false, budgetMs = budgetMs,
+                        answeredByAi = active.answeredByAi,
                     ))
                 }
             }
             val session = GatewayAudioMediaSession(
-                BcpTelephonyAudioEndpoint(context, earlyMedia = early), codec, transport, recorder,
+                BcpTelephonyAudioEndpoint(context, earlyMedia = early, deferCapture = aiEarly), codec, transport, recorder,
                 PersistentGatewayMuteLease(context, active.deviceCallId, requireNotNull(active.creationTimeMillis)),
                 onFatal = { code ->
                     holderRef[0]?.failureCode = code
@@ -321,13 +326,17 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
             stage = "session_start"
             // Transfer makes the holder visible for terminal cleanup, but permission/OFF/call
             // identity must still be valid immediately before any endpoint or mute work starts.
-            if (!preflightReady() || !sameExactActiveCall(active, exactActiveCall() ?: (if (early) exactEarlyCall() else null))) {
+            if (!preflightReady() || !sameExactActiveCall(active, exactActiveCall() ?: (if (early) exactEarlyCall() ?: exactAiEarlyCall(active.deviceCallId) else null))) {
                 Log.w(MEDIA_LOG_TAG, "setup_failed code=prestart_revoked")
                 logSetupFailed("prestart_revoked", active, setupStartedMs, null)
                 stopFailedLeg(!early)
                 return@withLock
             }
             val start = session.start()
+            // S123 决策 4 leg_ready / leg_failed: before the row, so it carries the answer trigger.
+            if (aiEarly) answerAi(active, if (start.isSuccess) "leg_ready" else "leg_failed")
+            logMediaSetup(timeline, ownedSignaling, session, active, early,
+                start.exceptionOrNull()?.let { mediaSetupFailureCode(stage, it) })
             if (start.isFailure) {
                 start.exceptionOrNull()?.let {
                     // The prebuffer window and the answer route are what distinguish "the AI never
@@ -345,9 +354,29 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
                     start.exceptionOrNull()?.let { mediaSetupFailureCode(stage, it) } ?: "session_start_failed")
             } else if (early) GatewayDiag.log("media.early_started", emptyMap(), callId = active.serverCallId)
         } catch (error: Exception) {
-            Log.w(MEDIA_LOG_TAG, "setup_failed code=${mediaSetupFailureCode(stage, error)} type=${error.javaClass.simpleName}" +
-                " ms=${android.os.SystemClock.elapsedRealtime() - setupStartedMs}" + mediaSetupFailureDetail(error))
-            logSetupFailed(mediaSetupFailureCode(stage, error), active, setupStartedMs, null)
+            // S124 决策 3: a hangup cancelling setup is not a failure (shared with S56 human early legs and
+            // normal legs, which get the same downgrade). Cleanup here is non-suspending, so it survives the rethrow.
+            val cancelled = setupCancelledFailureCode(error, mediaCallTerminal(
+                GatewayTelecomCallRegistry.snapshot(active.deviceCallId)?.state,
+                runCatching { DeviceCallJournal(context).find(active.deviceCallId)?.state }.getOrNull(),
+            ))
+            if (cancelled != null) {
+                Log.i(MEDIA_LOG_TAG, "setup_cancelled code=$cancelled stage=$stage")
+                logMediaSetup(timeline, signaling, null, active, early, cancelled, level = "info")
+                staged.close()
+                stopFailedLeg(!early)
+                throw error
+            }
+            // S125 决策 2: Control already ended the call; an info row, no setup_failed. The hangup below stays.
+            val revoked = mediaRevoked(error)
+            if (revoked) Log.i(MEDIA_LOG_TAG, "setup_revoked stage=$stage") else {
+                Log.w(MEDIA_LOG_TAG, "setup_failed code=${mediaSetupFailureCode(stage, error)} type=${error.javaClass.simpleName}" +
+                    " ms=${android.os.SystemClock.elapsedRealtime() - setupStartedMs}" + mediaSetupFailureDetail(error))
+                logSetupFailed(mediaSetupFailureCode(stage, error), active, setupStartedMs, null)
+            }
+            if (aiEarly) answerAi(active, "leg_failed")
+            logMediaSetup(timeline, signaling, null, active, early, mediaSetupFailureCode(stage, error),
+                level = if (revoked) "info" else "warn")
             // Signaling/codec/recorder construction failure must not strand legacy components off.
             staged.close()
             stopFailedLeg(!early)
@@ -357,18 +386,87 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
                 setupOwner.clear(owned)
                 runCatching(owned::close)
             }
+            // S123 决策 4: any other exit (revalidation, owner transfer) is a failed leg; a no-op once answered.
+            if (aiEarly) answerAi(active, "leg_failed")
         }
+        }
+        armedEarly?.let { attachRecorderAsync(it, api) }
     }
 
     /**
-     * S56 Pixel 网关合同: the one-time ACTIVE arm of an early-media leg. Injection and the watchdog come
-     * first; the recorder waits for Control's capture binding, and failing that only loses the archive.
+     * S124 决策 1: the ACTIVE-callback arm of an S123 AI early leg, so it no longer waits for the heartbeat cycle.
+     * Never gates on [preflightReady]: a coordinator built outside the loop has not run [recoverStartup].
+     * Losing the CAS to the loop's reconcile (or any failed check) returns silently.
      */
-    private suspend fun armEarlySession(holder: GatewayActiveAudioSession.Holder, api: GatewayApi) {
-        if (!holder.session.arm()) return
-        GatewayDiag.log("media.early_armed", mapOf(
-            "earlyMs" to android.os.SystemClock.elapsedRealtime() - holder.earlyStartedMs,
+    internal suspend fun armAiEarlyLegNow() {
+        val holder = LIFECYCLE_MUTEX.withLock {
+            val current = GatewayActiveAudioSession.current()
+            if (current == null || !shouldArmAiEarlyLegNow(current.serverCallId, current.deviceCallId,
+                    current.creationTimeMillis, current.armed.get(), current.failed.get(), current.api != null,
+                    exactActiveCall())) return
+            if (!current.armed.compareAndSet(false, true) || !armNow(current, "active_callback")) return
+            current
+        }
+        attachRecorderAsync(holder, requireNotNull(holder.api))
+    }
+
+    /**
+     * S123 决策 4/5, once per reconcile: a restarted process (deadline passed or new boot) answers at once, a live
+     * window re-arms its budget timer, and an ACTIVE nobody issued is the owner picking up on the Pixel.
+     * Returns the call still waiting on its leg, if any.
+     */
+    private suspend fun settleDeferredAiAnswers(api: GatewayApi): DeviceCallRecord? {
+        var pending: DeviceCallRecord? = null
+        val records = runCatching { DeviceCallJournal(context).recordsForSnapshot() }.getOrDefault(emptyList())
+        records.filter { it.aiAnswerDeadlineMs != null && it.aiAnswerIssuedMs == null }.forEach { record ->
+            val actual = GatewayTelecomCallRegistry.snapshot(record.deviceCallId)?.state
+            when (aiAnswerStep(record, actual, android.os.SystemClock.elapsedRealtime(), gatewayBootId(context))) {
+                AiAnswerStep.RESTART -> answerAi(record, "restart")
+                AiAnswerStep.WAIT -> {
+                    GatewayAiAnswerBudget.schedule(context, record.deviceCallId, requireNotNull(record.aiAnswerDeadlineMs))
+                    pending = record
+                }
+                AiAnswerStep.OWNER_LOCAL -> ownerAnsweredDuringAiWindow(record, api)
+                null -> Unit
+            }
+        }
+        return pending
+    }
+
+    /**
+     * S123 决策 5: the S94 owner-join outcome without a session. The unarmed leg goes without injecting, mute or
+     * hangup, and the handoff stays (as S94's owner-local leg) so mediaReady is not withdrawn mid-call.
+     */
+    private fun ownerAnsweredDuringAiWindow(record: DeviceCallRecord, api: GatewayApi) {
+        DeviceCallJournal(context).markOwnerAnsweredDuringAiWindow(record.deviceCallId)
+        GatewayActiveAudioSession.current()?.takeIf { it.deviceCallId == record.deviceCallId && !it.armed.get() }
+            ?.let { GatewayActiveAudioSession.stop("ended") }
+        GatewayDiag.log("telephony.ai_answer", mapOf("trigger" to "owner_local", "result" to "owner_local"),
+            callId = record.serverCallId)
+        GatewayOwnerLocalJoin.reportAiWindow(context, api, record)
+    }
+
+    private suspend fun answerAi(record: DeviceCallRecord, trigger: String) {
+        runCatching { AndroidGatewayTelecomController(context).answerIfRinging(record.deviceCallId, trigger) }
+    }
+
+    /**
+     * S56 Pixel 网关合同: the one-time ACTIVE arm of an early-media leg, under [LIFECYCLE_MUTEX]. Injection and
+     * the watchdog come first; [attachRecorderAsync] then waits for Control's capture binding.
+     */
+    private fun armNow(holder: GatewayActiveAudioSession.Holder, via: String): Boolean {
+        if (!holder.session.arm()) return false
+        GatewayDiag.log("media.early_armed", earlyArmedFields(
+            android.os.SystemClock.elapsedRealtime() - holder.earlyStartedMs, via,
         ), callId = holder.serverCallId)
+        return true
+    }
+
+    /**
+     * S124 决策 1: outside the mutex. An arm ahead of the S97 snapshot meets 409 CAPTURE_NOT_CONFIRMED until
+     * Control sees ACTIVE (0.3–1.5 s); the 12 s retry covers it. Failing that only loses the archive.
+     */
+    private suspend fun attachRecorderAsync(holder: GatewayActiveAudioSession.Holder, api: GatewayApi) {
         try {
             val binding = if (!GatewayRecordingArchiveApproval.APPROVED) null else {
                 val capture = MediaCaptureRequest(holder.deviceCallId, holder.creationTimeMillis)
@@ -394,6 +492,118 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
             GatewayDiag.log("media.early_capture_failed", mapOf(
                 "reason" to (error.message ?: error.javaClass.simpleName).take(120),
             ), callId = holder.serverCallId, level = "warn")
+        }
+    }
+
+    /**
+     * The initial leg: the planned negotiation with its S24 transport fallback, then - for an armed leg
+     * only, since S56 gives an early leg one attempt per call - the bounded S73-classified retry
+     * ([connectInitialMediaLeg]) before the caller may hang the cellular call up. Every attempt shares
+     * [signaling], so OFF cancellation, the owner transfer and the capture binding keep one owner; it
+     * is closed here once negotiation is over, as the single-attempt connect used to close it.
+     */
+    private suspend fun connectInitialLeg(
+        active: DeviceCallRecord,
+        early: Boolean,
+        signaling: HttpGatewayMediaSignaling,
+        ingress: GatewayAudioPacketIngress,
+        planned: IceTransport,
+        timeline: MediaSetupTimeline,
+    ): GatewayDataChannelTransport {
+        val serverCallId = requireNotNull(active.serverCallId)
+        val onFallback: (IceTransport, IceTransport, String) -> Unit = { from, to, reason ->
+            Log.w(MEDIA_LOG_TAG, "transport_fallback call=${serverCallId.take(8)}" +
+                " from=${from.wireValue} to=${to.wireValue} reason=$reason")
+            GatewayDiag.log("media.transport_fallback", mapOf("from" to from.wireValue, "to" to to.wireValue,
+                "reason" to reason), callId = serverCallId, level = "warn")
+        }
+        try {
+            if (early) return GatewayDataChannelTransport.connect(context, serverCallId, signaling, ingress, planned,
+                answeredByAi = active.answeredByAi, closeSignaling = false, timeline = timeline, onTransportFallback = onFallback)
+            var retries = 0
+            return connectInitialMediaLeg(
+                nowMs = android.os.SystemClock::elapsedRealtime,
+                sleep = { kotlinx.coroutines.delay(it) },
+                onRetry = { retry, error, offline ->
+                    GatewayDiag.log("media.setup_retry", mapOf("retry" to retry, "offline" to offline,
+                        "kind" to org.vodog.gateway.media.classifyMediaRejoinFailure(error).name.lowercase(),
+                        "http" to (error as? GatewayMediaHttpException)?.status,
+                        "error" to (error.message ?: error.javaClass.simpleName).take(120)),
+                        callId = serverCallId, level = "warn")
+                },
+                offline = ::isOfflineMediaFailure,
+                awaitNetwork = ::awaitDefaultNetwork,
+                shouldContinue = { preflightReady() && sameExactActiveCall(active, exactActiveCall()) },
+            ) { budgetMs ->
+                if (budgetMs == null) {
+                    GatewayDataChannelTransport.connect(context, serverCallId, signaling, ingress, planned,
+                        answeredByAi = active.answeredByAi, closeSignaling = false, timeline = timeline, onTransportFallback = onFallback)
+                } else {
+                    timeline.put("retries", ++retries)
+                    GatewayDataChannelTransport.connect(context, serverCallId, signaling, ingress, planned,
+                        fallback = false, budgetMs = budgetMs, answeredByAi = active.answeredByAi,
+                        closeSignaling = false, timeline = timeline)
+                }
+            }
+        } finally {
+            runCatching { signaling.close() }
+        }
+    }
+
+    /** S73b: (default network with INTERNET, validated) says this failure is the network's, not the leg's. */
+    private fun isOfflineMediaFailure(error: Throwable): Boolean = defaultNetwork().let { (internet, validated) ->
+        org.vodog.gateway.media.isOfflineRejoinFailure(error, internet, validated)
+    }
+
+    // ponytail: 500 ms ConnectivityManager poll, not the service's default-network callback.
+    // The first poll always sleeps, so a DNS failure on a network that looks up cannot spin.
+    private suspend fun awaitDefaultNetwork(budgetMs: Long): Boolean = kotlinx.coroutines.withTimeoutOrNull(budgetMs) {
+        do kotlinx.coroutines.delay(500) while (!defaultNetwork().first)
+        true
+    } ?: false
+
+    /** Wall-clock ms since Telecom reported the call connected; null when unknown or implausible. */
+    private fun activeToReconcileMs(deviceCallId: String): Long? = runCatching {
+        GatewayTelecomCallRegistry.call(deviceCallId)?.details?.connectTimeMillis?.takeIf { it > 0L }
+            ?.let { System.currentTimeMillis() - it }?.takeIf { it in 0L..600_000L }
+    }.getOrNull()
+
+    /**
+     * One `media.setup` row per setup that reached negotiation. A started session's row waits
+     * [MEDIA_SETUP_ROW_DELAY_MS] on the diag thread so it can carry the first sent frame; a failed one
+     * goes out at once. The stage fields are snapshotted now, so the wait never shows in `totalMs`.
+     */
+    private fun logMediaSetup(
+        timeline: MediaSetupTimeline,
+        signaling: HttpGatewayMediaSignaling?,
+        session: GatewayAudioMediaSession?,
+        active: DeviceCallRecord,
+        early: Boolean,
+        failureCode: String?,
+        level: String = "warn",
+    ) {
+        signaling?.let {
+            timeline.put("ensureCurrentMs", it.ensureCurrentMs)
+            timeline.put("optionsAttempts", it.optionsAttempts)
+            timeline.put("optionsHttp", it.optionsHttp?.let(::httpTimingDiagJson))
+            timeline.put("offerHttp", it.offerHttp?.let(::httpTimingDiagJson))
+        }
+        timeline.put("relay", GatewayEndpoint.relay)
+        timeline.put("answeredByAi", active.answeredByAi)
+        timeline.put("early", early)
+        // S123 决策 12: how the deferred AI answer went (null on every call answered at once).
+        val answer = runCatching { DeviceCallJournal(context).find(active.deviceCallId) }.getOrNull()
+        aiAnswerSetupFields(early && active.direction == DeviceCallDirection.INCOMING, answer,
+            GatewayAiAnswerBudget.trigger(active.deviceCallId), gatewayBootId(context)).forEach { (key, value) -> timeline.put(key, value) }
+        val stages = timeline.fields()
+        val callId = active.serverCallId
+        if (failureCode == null && session != null) {
+            GatewayDiag.postDelayed(MEDIA_SETUP_ROW_DELAY_MS) {
+                GatewayDiag.log("media.setup", mediaSetupDiagFields(stages, session.setupTimings(), null), callId = callId)
+            }
+        } else {
+            GatewayDiag.log("media.setup", mediaSetupDiagFields(stages, session?.setupTimings().orEmpty(), failureCode),
+                callId = callId, level = level)
         }
     }
 
@@ -445,7 +655,7 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
         val result = runCatching { AndroidGatewayTelecomController(context).hangUp(deviceCallId) }
             .getOrElse { if (it is kotlinx.coroutines.CancellationException) throw it; TelecomActionResult.Unknown(it.javaClass.simpleName) }
         if (result is TelecomActionResult.Executed) {
-            GatewayDiag.localEnd(deviceCallId, serverCallId, "media_terminal_failure", mapOf("reason" to reason))
+            GatewayDiag.localEnd(deviceCallId, serverCallId, "media_terminal_failure", mapOf("reason" to reason, "code" to reason))
         }
         GatewayDiag.log("media.hangup_after_failure", mapOf("reason" to reason, "result" to when (result) {
             TelecomActionResult.Executed -> "executed"
@@ -475,6 +685,12 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
 
     private fun exactEarlyCall(): DeviceCallRecord? = DeviceCallJournal(context).recordsForSnapshot().filter {
         isEarlyMediaCall(it, GatewayTelecomCallRegistry.snapshot(it.deviceCallId)?.state)
+    }.singleOrNull()
+
+    /** S123 决策 3: a new AI early leg, or the one [keepDeviceCallId] already has across answer-issued → ACTIVE. */
+    private fun exactAiEarlyCall(keepDeviceCallId: String?): DeviceCallRecord? = DeviceCallJournal(context).recordsForSnapshot().filter {
+        val actual = GatewayTelecomCallRegistry.snapshot(it.deviceCallId)?.state
+        isAiEarlyLegCall(it, actual, runtime.aiEarlyLeg) || (it.deviceCallId == keepDeviceCallId && isAiEarlyLegLive(it, actual))
     }.singleOrNull()
 
     private fun exactNonTerminalCall(): DeviceCallRecord? {
@@ -511,6 +727,56 @@ internal object GatewayEarlyMediaAttempt {
     }
 }
 
+/** S124 决策 1: process scope for the ACTIVE-callback arm; never the main thread (the mute lease uses onMain). */
+internal object GatewayAiEarlyArm {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Main thread, after the journal observed ACTIVE. Cheap pre-check; the coordinator re-checks under the mutex. */
+    fun onActive(context: Context, deviceCallId: String) {
+        val holder = GatewayActiveAudioSession.current()?.takeIf { it.deviceCallId == deviceCallId } ?: return
+        val record = runCatching { DeviceCallJournal(context).find(deviceCallId) }.getOrNull()
+        if (!shouldArmAiEarlyLegNow(holder.serverCallId, holder.deviceCallId, holder.creationTimeMillis,
+                holder.armed.get(), holder.failed.get(), holder.api != null, record)) return
+        val appContext = context.applicationContext
+        scope.launch { runCatching { GatewayAudioLifecycleCoordinator(appContext).armAiEarlyLegNow() } }
+    }
+}
+
+/**
+ * S124 决策 1, pure: only an unarmed, unfailed S123 AI early leg (answer issued) whose holder is exactly [record]
+ * and still has its heartbeat API is armed from the ACTIVE callback.
+ */
+internal fun shouldArmAiEarlyLegNow(
+    serverCallId: String,
+    deviceCallId: String,
+    creationTimeMillis: Long,
+    armed: Boolean,
+    failed: Boolean,
+    hasApi: Boolean,
+    record: DeviceCallRecord?,
+): Boolean = !armed && !failed && hasApi && record != null && record.aiAnswerIssuedMs != null &&
+    record.serverCallId == serverCallId && record.deviceCallId == deviceCallId && record.creationTimeMillis == creationTimeMillis
+
+/** S124 决策 5: `media.early_armed`; `via` is `active_callback` or `reconcile`. */
+internal fun earlyArmedFields(earlyMs: Long, via: String): Map<String, Any?> = mapOf("earlyMs" to earlyMs, "via" to via)
+
+/** S124 决策 3: the call is gone (Telecom no longer has it, or it disconnected, or the journal ended it). */
+internal fun mediaCallTerminal(actual: ActualTelecomState?, journal: DeviceCallState?): Boolean =
+    actual == null || actual == ActualTelecomState.DISCONNECTED || journal == DeviceCallState.ENDED
+
+/** [mediaCallTerminal] keyed by the server call id, for the media package (which has no device call id). */
+internal fun mediaCallEnded(context: Context, serverCallId: String): Boolean = runCatching {
+    val record = DeviceCallJournal(context).recordsForSnapshot().lastOrNull { it.serverCallId == serverCallId }
+    record == null || mediaCallTerminal(GatewayTelecomCallRegistry.snapshot(record.deviceCallId)?.state, record.state)
+}.getOrDefault(false)
+
+/**
+ * S124 决策 3, pure: a setup coroutine cancelled because the call ended gets this code instead of a failure;
+ * null keeps [mediaSetupFailureCode] (a timeout, or a cancellation of a live call such as OFF).
+ */
+internal fun setupCancelledFailureCode(error: Throwable, terminal: Boolean): String? =
+    if (terminal && mediaSetupCancelled(error)) "setup_cancelled_call_ended" else null
+
 /**
  * S94 a/b: IO half of an owner joining an AI-answered call on the Pixel. The main thread already set
  * the session atomic and cleared the mute lease; this persists the takeover, reports it to Control
@@ -528,14 +794,35 @@ internal object GatewayOwnerLocalJoin {
             val api = holder.api
             val generation = runCatching { GatewayRuntimeStore(appContext).deviceEpoch }.getOrDefault(0L)
             if (api == null || generation <= 0) settled.complete("no_api")
-            else launch { report(api, holder, generation, settled) }
+            else launch { report(api, holder.serverCallId, holder.deviceCallId, holder.creationTimeMillis, generation, settled) }
             runCatching { holder.session.enterOwnerLocal(settled) }
+        }
+    }
+
+    /**
+     * S123 决策 5: the owner answered on the Pixel while the AI answer was deferred. No session to hand over
+     * (the leg was never armed), so only the report: Control ends the AI run `owner_joined` and Voice leaves.
+     * S94's own detection (armed leg, mute lease) is untouched.
+     */
+    fun reportAiWindow(context: Context, api: GatewayApi, record: DeviceCallRecord) {
+        val serverCallId = record.serverCallId ?: return
+        val creationTimeMillis = record.creationTimeMillis ?: return
+        val appContext = context.applicationContext
+        scope.launch {
+            GatewayDiag.log("call.owner_joined_local", mapOf("deviceCallId" to record.deviceCallId, "aiWindow" to true),
+                callId = serverCallId)
+            val generation = runCatching { GatewayRuntimeStore(appContext).deviceEpoch }.getOrDefault(0L)
+            if (generation <= 0) return@launch
+            report(api, serverCallId, record.deviceCallId, creationTimeMillis, generation,
+                java.util.concurrent.CompletableFuture())
         }
     }
 
     private suspend fun report(
         api: GatewayApi,
-        holder: GatewayActiveAudioSession.Holder,
+        serverCallId: String,
+        deviceCallId: String,
+        creationTimeMillis: Long,
         generation: Long,
         settled: java.util.concurrent.CompletableFuture<String>,
     ) {
@@ -547,16 +834,16 @@ internal object GatewayOwnerLocalJoin {
                 attempts++
                 val outcome = ownerJoinedOutcome {
                     withContext(Dispatchers.IO) {
-                        api.reportOwnerJoined(holder.serverCallId, eventId, generation, holder.deviceCallId, holder.creationTimeMillis)
+                        api.reportOwnerJoined(serverCallId, eventId, generation, deviceCallId, creationTimeMillis)
                     }
                 }
-                val callLive = GatewayTelecomCallRegistry.snapshot(holder.deviceCallId)?.state
+                val callLive = GatewayTelecomCallRegistry.snapshot(deviceCallId)?.state
                     .let { it == ActualTelecomState.ACTIVE || it == ActualTelecomState.HOLDING }
                 val final = outcome ?: if (callLive) null else "call_ended"
                 if (final != null) {
                     settled.complete(final)
                     GatewayDiag.log("call.owner_joined_reported", mapOf("result" to final, "attempts" to attempts),
-                        callId = holder.serverCallId, level = if (final == "ok") "info" else "warn")
+                        callId = serverCallId, level = if (final == "ok") "info" else "warn")
                     return
                 }
                 kotlinx.coroutines.delay(backoffMs)
@@ -645,6 +932,53 @@ internal fun isEarlyMediaCall(record: DeviceCallRecord, actual: ActualTelecomSta
         actual in setOf(ActualTelecomState.DIALING, ActualTelecomState.CONNECTING, ActualTelecomState.ACTIVE) &&
         !(record.state == DeviceCallState.ACTIVE && actual == ActualTelecomState.ACTIVE)
 
+/** S123 决策 1: Control's ANSWER(answeredBy=ai) for a still-ringing VoDog incoming call is deferred. */
+internal fun shouldDeferAiAnswer(flag: Boolean, answeredByAi: Boolean, record: DeviceCallRecord, actual: ActualTelecomState?): Boolean =
+    flag && answeredByAi && record.direction == DeviceCallDirection.INCOMING && record.serverCallId != null &&
+        record.creationTimeMillis != null && !record.deviceOriginated &&
+        record.state == DeviceCallState.RINGING && actual == ActualTelecomState.RINGING
+
+/**
+ * S123 决策 1/3: a deferred AI answer whose early leg may be built now. Separate from [isEarlyMediaCall]
+ * (S56 human outgoing), which stays as it was.
+ */
+internal fun isAiEarlyLegCall(record: DeviceCallRecord, actual: ActualTelecomState?, flag: Boolean): Boolean =
+    flag && record.direction == DeviceCallDirection.INCOMING && record.answeredByAi && record.remoteAnswered &&
+        record.serverCallId != null && record.creationTimeMillis != null && !record.deviceOriginated &&
+        record.state == DeviceCallState.RINGING && actual == ActualTelecomState.RINGING &&
+        record.aiAnswerDeadlineMs != null && record.aiAnswerIssuedMs == null
+
+/**
+ * S123: an AI early leg already built is kept from the issued answer until both sides read ACTIVE (then
+ * [GatewayAudioLifecycleCoordinator.exactActiveCall] owns it and arms it), as [isEarlyMediaCall] does for S56.
+ */
+internal fun isAiEarlyLegLive(record: DeviceCallRecord, actual: ActualTelecomState?): Boolean =
+    record.direction == DeviceCallDirection.INCOMING && record.answeredByAi && record.remoteAnswered &&
+        record.serverCallId != null && record.creationTimeMillis != null && record.aiAnswerDeadlineMs != null &&
+        record.state in setOf(DeviceCallState.RINGING, DeviceCallState.ACTIVE) &&
+        actual in setOf(ActualTelecomState.RINGING, ActualTelecomState.ACTIVE) &&
+        !(record.state == DeviceCallState.ACTIVE && actual == ActualTelecomState.ACTIVE)
+
+/** S123 决策 4/5: what a reconcile does with a deferred, not yet issued AI answer. */
+internal enum class AiAnswerStep { WAIT, RESTART, OWNER_LOCAL }
+
+/**
+ * Pure. Still ringing: inside the window keep waiting for leg/budget, past it (or on a new boot, where
+ * `elapsedRealtime` restarted) answer as `restart`. ACTIVE with no issue: the owner picked up on the Pixel.
+ * Anything else (the caller hung up) needs nothing: the leg goes with `active == null`, the timer no-ops.
+ */
+internal fun aiAnswerStep(record: DeviceCallRecord, actual: ActualTelecomState?, nowMs: Long, bootId: String?): AiAnswerStep? {
+    val deadline = record.aiAnswerDeadlineMs ?: return null
+    if (record.aiAnswerIssuedMs != null) return null
+    return when {
+        actual == ActualTelecomState.RINGING ->
+            if (record.aiAnswerBootId != bootId || nowMs >= deadline) AiAnswerStep.RESTART else AiAnswerStep.WAIT
+        (actual == ActualTelecomState.ACTIVE || actual == ActualTelecomState.HOLDING) &&
+            record.answeredByAi && record.remoteAnswered -> AiAnswerStep.OWNER_LOCAL
+        else -> null
+    }
+}
+
 /**
  * S22 decision 9: an AI-answered call waits longer for its first caller frame than a human one.
  *
@@ -688,6 +1022,27 @@ internal fun mediaPlannedTransport(answeredByAi: Boolean, remembered: IceTranspo
     // UDP from 4G is the reliable path; only an options `relay: true` grant (control-node via the tunnel) is TLS-only.
     if (answeredByAi) IceTransport.TLS else remembered
 
+/** S123 决策 12: the `media.setup` answer fields; the trigger only once this call's answer was issued. */
+internal fun aiAnswerSetupFields(aiEarly: Boolean, record: DeviceCallRecord?, trigger: String?, bootId: String?): Map<String, Any?> = mapOf(
+    "aiEarly" to aiEarly,
+    "answerTrigger" to trigger?.takeIf { record?.aiAnswerIssuedMs != null },
+    "answerDeferredMs" to record?.let { aiAnswerDeferredMs(it, bootId) },
+)
+
+/** How long a started leg's `media.setup` row waits for the session's first sent frame. */
+internal const val MEDIA_SETUP_ROW_DELAY_MS = 2_000L
+
+/**
+ * The `media.setup` row: the setup timeline (signaling, ICE, data channel), the session's start phases
+ * (prebuffer, mute, endpoint, first sent frame) and the outcome. `code` is the bounded setup failure
+ * code, absent on success.
+ */
+internal fun mediaSetupDiagFields(
+    stages: Map<String, Any?>,
+    session: Map<String, Long?>,
+    failureCode: String?,
+): Map<String, Any?> = stages + session + mapOf("ok" to (failureCode == null), "code" to failureCode)
+
 /** S22: the HTTP status and Control error code are the only way to tell which side refused the media leg. */
 internal fun mediaSetupFailureDetail(error: Throwable): String = when (error) {
     is org.vodog.gateway.media.GatewayMediaHttpException ->
@@ -696,6 +1051,7 @@ internal fun mediaSetupFailureDetail(error: Throwable): String = when (error) {
 }
 
 internal fun mediaSetupFailureCode(stage: String, error: Throwable): String = when {
+    mediaRevoked(error) -> "media_revoked" // S125 决策 2
     stage == "session_start" && error is TimeoutException -> "prebuffer_timeout"
     stage == "session_start" && error.message == "valid caller audio prebuffer unavailable" -> "prebuffer_unavailable"
     stage == "session_start" && error.message == "audio media session not approved" -> "approval_revoked"

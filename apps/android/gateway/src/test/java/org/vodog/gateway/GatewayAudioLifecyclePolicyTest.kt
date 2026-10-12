@@ -1,9 +1,14 @@
 package org.vodog.gateway
 
+import org.vodog.gateway.media.GatewayMediaHttpException
 import org.vodog.gateway.media.IceTransport
+import org.vodog.gateway.media.MEDIA_INITIAL_RETRY_BUDGET_MS
+import org.vodog.gateway.media.connectInitialMediaLeg
 import org.vodog.gateway.media.MediaCaptureRequest
 import org.vodog.gateway.media.optionsCaptureBinding
 import org.vodog.gateway.media.OpusPlayoutProfile
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.json.JSONObject
@@ -241,6 +246,38 @@ class GatewayAudioLifecyclePolicyTest {
         assertTrue(mediaSetupFailureCode("session_start", IllegalStateException("audio media session stopped during prebuffer")) == "session_cancelled")
         assertTrue(mediaSetupFailureCode("data_channel_connect", IllegalStateException("secret detail")) == "data_channel_connect_failed")
         assertTrue(mediaSetupFailureCode("unexpected", IllegalStateException("secret detail")) == "media_setup_failed")
+        assertEquals("media_revoked", mediaSetupFailureCode("data_channel_connect",
+            org.vodog.gateway.media.GatewayMediaHttpException(409, "MEDIA_REVOKED", "revoked")))
+    }
+
+    /**
+     * The coordinator hangs a live cellular call up only when the initial-leg retry gives up. This pins
+     * when that is: after both extra attempts (300 + 800 ms of backoff) for a retryable failure, at
+     * once for a refusal, and never while a later attempt still succeeds.
+     */
+    @Test fun initialMediaFailureHangsUpOnlyAfterTheRetryBudget() {
+        fun run(failure: (Int) -> Throwable?): Pair<Int, Long?> {
+            var clock = 0L
+            var attempts = 0
+            var hungUpAtMs: Long? = null
+            runBlocking {
+                try {
+                    connectInitialMediaLeg({ clock }, { clock += it }) {
+                        attempts++
+                        clock += 100
+                        failure(attempts)?.let { error -> throw error }
+                        "leg"
+                    }
+                } catch (_: Exception) {
+                    hungUpAtMs = clock
+                }
+            }
+            return attempts to hungUpAtMs
+        }
+        assertEquals(3 to 1_400L, run { java.io.IOException("reset") })
+        assertEquals(1 to 100L, run { GatewayMediaHttpException(404, "NOT_FOUND", "call gone") })
+        assertEquals(3 to null, run { attempt -> if (attempt < 3) java.io.IOException("reset") else null })
+        assertTrue(MEDIA_INITIAL_RETRY_BUDGET_MS <= 8_000L)
     }
 
     private fun allowed(values: BooleanArray) = audioPreflightAllowed(

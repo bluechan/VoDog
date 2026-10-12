@@ -285,6 +285,196 @@ class GatewayTransportFallbackTest {
         assertThrows(IllegalArgumentException::class.java) { mediaOfferReadyAtMs(100, null, settleMs = -1) }
     }
 
+    @Test fun `S97 only an AI leg on TLS takes the short settle window`() {
+        assertEquals(100L, mediaRelaySettleMs(answeredByAi = true, transport = IceTransport.TLS))
+        assertEquals(MEDIA_RELAY_SETTLE_MS, mediaRelaySettleMs(answeredByAi = true, transport = IceTransport.UDP))
+        assertEquals(MEDIA_RELAY_SETTLE_MS, mediaRelaySettleMs(answeredByAi = false, transport = IceTransport.TLS))
+        assertEquals(MEDIA_RELAY_SETTLE_MS, mediaRelaySettleMs(answeredByAi = false, transport = IceTransport.UDP))
+        assertEquals(200L, mediaOfferReadyAtMs(100, null, settleMs = MEDIA_RELAY_SETTLE_AI_TLS_MS))
+    }
+
+    // Options runs ahead of a fallback-plan attempt's clock (S97 follow-up), on real ms-scale suspension.
+
+    @Test fun `slow options does not consume the ICE budget of a fallback-plan attempt`() = runBlocking {
+        val fallbacks = mutableListOf<RecordedFallback>()
+        val plan = mediaTransportPlan(IceTransport.TLS, fallbackEnabled = true, attemptBudgetMs = 60, relayCandidateDeadlineMs = 20)
+        val opened = withMediaTransportFallback(plan, recorder(fallbacks)) { attempt ->
+            try {
+                runMediaAttemptClocks(attempt.budgetMs, optionsTimeoutMs = 1_000, options = { delay(150); "grant" }) { grant ->
+                    delay(30)
+                    attempt to grant
+                }
+            } catch (timeout: TimeoutCancellationException) {
+                throw MediaTransportTimeoutException(attempt.transport, MediaTransportStage.GATHERING, timeout)
+            }
+        }
+        // Options alone outlasts the whole 60 ms budget, yet the preferred transport opens the leg.
+        assertEquals(IceTransport.TLS, opened.first.transport)
+        assertEquals("grant", opened.second)
+        assertTrue(fallbacks.isEmpty())
+    }
+
+    @Test fun `without an options guard the same slow options still spends the hard budget`() {
+        // A rejoin / retry attempt keeps options inside its window: its budget is the whole window left.
+        assertThrows(TimeoutCancellationException::class.java) {
+            runBlocking {
+                runMediaAttemptClocks(60, optionsTimeoutMs = null, options = { delay(150); "grant" }) { it }
+            }
+        }
+        // And the guard bounds options on its own.
+        assertThrows(TimeoutCancellationException::class.java) {
+            runBlocking {
+                runMediaAttemptClocks(10_000, optionsTimeoutMs = 40, options = { delay(1_000); "grant" }) { it }
+            }
+        }
+        assertEquals(12_000L, MEDIA_OPTIONS_TIMEOUT_MS)
+    }
+
+    @Test fun `an options timeout is HTTP-shaped and never switches the transport`() {
+        val fallbacks = mutableListOf<RecordedFallback>()
+        assertNull(mediaTransportFallbackReason(MediaTransportTimeoutException(IceTransport.TLS, MediaTransportStage.OPTIONS)))
+        val failure = MediaTransportTimeoutException(IceTransport.TLS, MediaTransportStage.OPTIONS)
+        var attempts = 0
+        val thrown = assertThrows(MediaTransportTimeoutException::class.java) {
+            runBlocking {
+                withMediaTransportFallback(mediaTransportPlan(IceTransport.TLS, fallbackEnabled = true), recorder(fallbacks)) {
+                    attempts += 1
+                    throw failure
+                }
+            }
+        }
+        assertSame(failure, thrown)
+        assertEquals(1, attempts)
+        assertTrue(fallbacks.isEmpty())
+        // Every later stage still earns the fallback exactly as before.
+        assertEquals("gathering_timeout",
+            mediaTransportFallbackReason(MediaTransportTimeoutException(IceTransport.TLS, MediaTransportStage.GATHERING)))
+    }
+
+    // Initial-leg bounded retry, on a fake clock: each connect costs 100 ms unless the case says otherwise.
+    private class InitialRun(val clock: FakeClock = FakeClock()) {
+        val budgets = mutableListOf<Long?>()
+        val retries = mutableListOf<Pair<Int, Boolean>>()
+        var networkWaits = 0
+    }
+
+    private fun initial(
+        run: InitialRun,
+        offline: (Throwable) -> Boolean = { false },
+        shouldContinue: () -> Boolean = { true },
+        outcome: (call: Int, budgetMs: Long?) -> String,
+    ): String = runBlocking {
+        connectInitialMediaLeg(
+            nowMs = { run.clock.ms },
+            sleep = { run.clock.sleeps += it; run.clock.ms += it },
+            onRetry = { retry, _, isOffline -> run.retries += retry to isOffline },
+            offline = offline,
+            awaitNetwork = { run.networkWaits++; run.clock.ms += 500; true },
+            shouldContinue = shouldContinue,
+        ) { budgetMs ->
+            run.budgets += budgetMs
+            run.clock.ms += 100
+            outcome(run.budgets.size, budgetMs)
+        }
+    }
+
+    @Test fun `a lost options or offer response is retried once on a fresh leg`() {
+        val run = InitialRun()
+        val leg = initial(run) { call, _ -> if (call == 1) throw java.io.IOException("connection reset") else "leg" }
+        assertEquals("leg", leg)
+        // The first attempt is the planned negotiation (no budget); the retry gets what is left of 8 s.
+        assertEquals(listOf(null, MEDIA_INITIAL_RETRY_BUDGET_MS - 300), run.budgets)
+        assertEquals(listOf(300L), run.clock.sleeps)
+        assertEquals(listOf(1 to false), run.retries)
+    }
+
+    @Test fun `a bridge conflict backs off 300 then 800 ms and stops after two extra attempts`() {
+        val run = InitialRun()
+        val conflict = GatewayMediaHttpException(503, "MEDIA_BRIDGE_UNAVAILABLE", "bridge said 409")
+        val thrown = assertThrows(GatewayMediaHttpException::class.java) {
+            initial(run) { _, _ -> throw conflict }
+        }
+        assertSame(conflict, thrown)
+        assertEquals(3, run.budgets.size)
+        assertEquals(listOf(300L, 800L), run.clock.sleeps)
+        val succeeded = InitialRun()
+        assertEquals("leg", initial(succeeded) { call, _ -> if (call < 3) throw conflict else "leg" })
+        assertEquals(listOf(300L, 800L), succeeded.clock.sleeps)
+    }
+
+    @Test fun `a refusal other than 409 ends the setup at once`() {
+        val run = InitialRun()
+        assertThrows(GatewayMediaHttpException::class.java) {
+            initial(run) { _, _ -> throw GatewayMediaHttpException(403, "MEDIA_REVOKED", "revoked") }
+        }
+        assertEquals(1, run.budgets.size)
+        assertTrue(run.clock.sleeps.isEmpty())
+        assertTrue(run.retries.isEmpty())
+    }
+
+    @Test fun `media revoked ends the initial setup at once`() {
+        val run = InitialRun()
+        assertThrows(GatewayMediaHttpException::class.java) {
+            initial(run) { _, _ -> throw GatewayMediaHttpException(409, "MEDIA_REVOKED", "revoked") }
+        }
+        assertEquals(1, run.budgets.size)
+        assertTrue(run.clock.sleeps.isEmpty())
+        assertTrue(run.retries.isEmpty())
+    }
+
+    @Test fun `an offline failure waits for the network and spends no attempt`() {
+        val run = InitialRun()
+        val leg = initial(run, offline = { it is java.net.UnknownHostException }) { call, _ ->
+            when (call) {
+                1 -> throw java.net.UnknownHostException("no network")
+                2, 3 -> throw java.io.IOException("reset")
+                else -> "leg"
+            }
+        }
+        // Both extra attempts are still available after the offline wait.
+        assertEquals("leg", leg)
+        assertEquals(1, run.networkWaits)
+        assertEquals(4, run.budgets.size)
+        assertEquals(listOf(300L, 800L), run.clock.sleeps)
+        assertEquals(listOf(0 to true, 1 to false, 2 to false), run.retries)
+    }
+
+    @Test fun `extra attempts never run past the 8 s budget`() {
+        val run = InitialRun()
+        assertThrows(MediaTransportTimeoutException::class.java) {
+            initial(run) { _, budget ->
+                if (budget != null) run.clock.ms += budget
+                throw MediaTransportTimeoutException(IceTransport.UDP, MediaTransportStage.DATA_CHANNEL)
+            }
+        }
+        // The single retry spent its whole budget; no third attempt starts with less than the minimum.
+        assertEquals(2, run.budgets.size)
+        val firstFailureAt = 100L
+        assertTrue(run.clock.ms - firstFailureAt <= MEDIA_INITIAL_RETRY_BUDGET_MS + 100)
+    }
+
+    @Test fun `a setup whose call is gone stops retrying`() {
+        val run = InitialRun()
+        var live = true
+        assertThrows(java.io.IOException::class.java) {
+            initial(run, shouldContinue = { live }) { _, _ -> live = false; throw java.io.IOException("reset") }
+        }
+        assertEquals(1, run.budgets.size)
+    }
+
+    @Test fun `our own cancellation ends the initial retry without another attempt`() {
+        var attempts = 0
+        runBlocking {
+            val job = launch {
+                connectInitialMediaLeg<String>({ 0L }, { delay(it) }) { attempts++; throw java.io.IOException("reset") }
+            }
+            delay(100) // inside the 300 ms backoff after the first failure
+            job.cancel(); job.join()
+            assertTrue(job.isCancelled)
+        }
+        assertEquals(1, attempts)
+    }
+
     // S73 D3 rejoin policy, on a fake clock.
     private class FakeClock { var ms = 0L; val sleeps = mutableListOf<Long>() }
     private fun rejoin(clock: FakeClock, relay: Boolean = false, original: IceTransport = IceTransport.UDP,
@@ -379,10 +569,22 @@ class GatewayTransportFallbackTest {
         assertEquals(MEDIA_NEGOTIATION_TIMEOUT_MS, budgets.first())
     }
 
-    @Test fun `other 4xx stops rejoining at once`() {
+    @Test fun `media revoked stops rejoining at once`() {
+        // S125 决策 1: the real refusal is 409 MEDIA_REVOKED, which must not back off like a conflict.
         val clock = FakeClock(); var calls = 0
-        assertNull(rejoin(clock) { _, _ -> calls++; throw GatewayMediaHttpException(403, "MEDIA_REVOKED", "revoked") })
+        assertNull(rejoin(clock) { _, _ -> calls++; throw GatewayMediaHttpException(409, "MEDIA_REVOKED", "revoked") })
         assertEquals(1, calls); assertTrue(clock.sleeps.isEmpty())
+    }
+
+    @Test fun `rejoin refusals are classified by code`() {
+        fun kind(status: Int, code: String) = classifyMediaRejoinFailure(GatewayMediaHttpException(status, code, "x"))
+        assertEquals(MediaRejoinFailure.REVOKED, kind(409, "MEDIA_REVOKED"))
+        for (code in listOf("MEDIA_LEG_CONNECTED", "MEDIA_NODE_PENDING", "CAPTURE_NOT_ACTIVE", "CAPTURE_NOT_CONFIRMED")) {
+            assertEquals(code, MediaRejoinFailure.CONFLICT, kind(409, code))
+        }
+        assertEquals(MediaRejoinFailure.FATAL, kind(403, "FORBIDDEN"))
+        assertEquals(MediaRejoinFailure.CONFLICT, kind(503, "MEDIA_BRIDGE_UNAVAILABLE"))
+        assertEquals(MediaRejoinFailure.RETRY, classifyMediaRejoinFailure(java.io.IOException("reset")))
     }
 
     @Test fun `slow attempts never run past the 60 s window`() {

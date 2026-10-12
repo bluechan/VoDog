@@ -39,6 +39,11 @@ class GatewayRuntimeStore(context: Context) {
         get() = prefs.getBoolean(KEY_EARLY_MEDIA, false)
         set(value) { if (value != earlyMedia) prefs.edit().putBoolean(KEY_EARLY_MEDIA, value).commit() }
 
+    /** S123 决策 6: the heartbeat's `aiEarlyLeg`, persisted like [earlyMedia]; read when an AI answer arrives. */
+    var aiEarlyLeg: Boolean
+        get() = prefs.getBoolean(KEY_AI_EARLY_LEG, false)
+        set(value) { if (value != aiEarlyLeg) prefs.edit().putBoolean(KEY_AI_EARLY_LEG, value).commit() }
+
     /**
      * The outcome of the last remote power request, waiting for a request that can carry it. Whichever
      * channel is alive sends it — the standby beacon while OFF, the heartbeat while ON — and clears it
@@ -316,6 +321,7 @@ class GatewayRuntimeStore(context: Context) {
         const val KEY_STANDBY_STATE = "standby_state"
         const val KEY_STANDBY_BACKOFF_MS = "standby_backoff_ms"
         private const val KEY_EARLY_MEDIA = "early_media"
+        private const val KEY_AI_EARLY_LEG = "ai_early_leg"
         private const val MAX_POWER_RESULT_LENGTH = 400
 
         /**

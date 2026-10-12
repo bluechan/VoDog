@@ -1,10 +1,12 @@
 package org.vodog.gateway
 
+import org.vodog.gateway.media.DownlinkLeveler
 import org.vodog.gateway.media.EncodedOpusFrame
 import org.vodog.gateway.media.GatewayDataChannelTransport
 import org.vodog.gateway.media.GatewayDataChannelListener
 import org.vodog.gateway.media.IceTransport
 import org.vodog.gateway.media.rejoinMediaLeg
+import org.vodog.gateway.media.mediaRevoked
 import org.vodog.gateway.media.MediaDirection
 import org.vodog.gateway.media.MediaPacket
 import org.vodog.gateway.media.MediaSendResult
@@ -270,6 +272,8 @@ class GatewayAudioMediaSession(
     @Volatile private var recorder: LocalCallRecorder? = recorder
     // S56 决策 2: an early-media leg (no recorder yet) discards caller frames at injection until [arm].
     private val injectionArmed = AtomicBoolean(recorder != null)
+    // S126: encode-copy leveler; an early-media leg holds the fixed initial gain until [arm].
+    private val leveler = DownlinkLeveler().apply { adaptive = recorder != null }
     private val timelineOriginUs = monotonicUs()
     private val running = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
@@ -349,6 +353,22 @@ class GatewayAudioMediaSession(
     private val definitiveTerminal = CountDownLatch(1)
     private val nextRemoteTimelineUs = AtomicLong(-1L)
     private val carrierAudioCodecSource: () -> String? = carrierAudioCodec
+    // `media.setup` stamps: phase durations and instants in relativeNow() microseconds; -1 / 0 = not reached.
+    private val prebufferWaitUs = AtomicLong(-1L)
+    private val muteSetupUs = AtomicLong(-1L)
+    private val endpointStartUs = AtomicLong(-1L)
+    private val endpointStartedAtUs = AtomicLong(0L)
+    private val firstTxAtUs = AtomicLong(0L)
+
+    /** This session's start phases and its first sent frame after the endpoint started, in ms; null = not reached. */
+    internal fun setupTimings(): Map<String, Long?> = mapOf(
+        "prebufferMs" to prebufferWaitUs.get().takeIf { it >= 0L }?.div(1_000),
+        "muteMs" to muteSetupUs.get().takeIf { it >= 0L }?.div(1_000),
+        "endpointStartMs" to endpointStartUs.get().takeIf { it >= 0L }?.div(1_000),
+        "firstTxFrameMs" to endpointStartedAtUs.get().takeIf { it > 0L }?.let { started ->
+            firstTxAtUs.get().takeIf { it > 0L }?.let { ((it - started) / 1_000).coerceAtLeast(0L) }
+        },
+    )
 
     fun start(): Result<Unit> {
         val result = synchronized(setupLock) {
@@ -357,22 +377,28 @@ class GatewayAudioMediaSession(
                 check(!ingressStopped.get()) { "audio media session ingress already stopped" }
                 check(running.compareAndSet(false, true)) { "audio media session already running" }
                 startWorkers()
+                val prebufferStartedUs = relativeNow()
                 check(prebufferReady.get(prebufferTimeoutMs, TimeUnit.MILLISECONDS) == true) {
                     // With the S37 window, hanging up mid-connect is the common way out of this
                     // wait; it must not be reported as "the remote leg never produced audio".
                     if (ingressStopped.get()) "audio media session stopped during prebuffer"
                     else "valid caller audio prebuffer unavailable"
                 }
+                prebufferWaitUs.set(relativeNow() - prebufferStartedUs)
                 check(approved() && running.get() && !ingressStopped.get()) {
                     "audio media session stopped before mute setup"
                 }
                 // S56: Telecom mutes only an ACTIVE call, so an early leg takes the lease in [arm].
                 if (injectionArmed.get()) {
                     muteAttempted.set(true)
+                    val muteStartedUs = relativeNow()
                     check(muteLease.acquireAndMute()) { "failed to acquire mute lease" }
+                    muteSetupUs.set(relativeNow() - muteStartedUs)
                 }
                 check(running.get() && !ingressStopped.get()) { "audio media session stopped during mute setup" }
+                val endpointStartingUs = relativeNow()
                 endpoint.start(::onCellularDownlink, ::nextPlaybackFrame, ::onEndpointFailure).getOrThrow()
+                relativeNow().let { endpointStartUs.set(it - endpointStartingUs); endpointStartedAtUs.set(it.coerceAtLeast(1L)) }
                 check(running.get() && !ingressStopped.get()) {
                     "audio media session stopped during endpoint setup"
                 }
@@ -515,6 +541,7 @@ class GatewayAudioMediaSession(
             "remotePacketDrops" to packetDrops.get(), "injectionDrops" to injectionDrops.get(),
             "turnHost" to transport.turnHost, "transport" to transport.iceTransport,
             "rejoins" to rejoins.get(),
+            "downlinkLevel" to org.json.JSONObject(leveler.snapshot()),
         )
     }
 
@@ -567,17 +594,26 @@ class GatewayAudioMediaSession(
             val original = IceTransport.entries.firstOrNull { it.wireValue == failed.iceTransport } ?: IceTransport.UDP
             // Frees the TURN allocation and lets the bridge see the old leg go (fewer 409s).
             runCatching { failed.close() }
+            // S125 决策 2: set when Control refused with MEDIA_REVOKED (that refusal ends the loop).
+            var revoked = false
             val next = rejoinMediaLeg(original, failed.relayTurn, { relativeNow() / 1_000 }, { delay(it) },
                 { attempt, used, ok, error, attemptMs ->
+                    revoked = error != null && mediaRevoked(error)
                     // S75 共同约定: ms = this attempt, downMs = since the leg dropped.
-                    GatewayDiag.log("media.rejoin", mapOf("attempt" to attempt, "reason" to reason,
+                    GatewayDiag.log("media.rejoin", mapOf("attempt" to attempt, "reason" to if (revoked) "revoked" else reason,
                         "transport" to used.wireValue, "ms" to attemptMs, "downMs" to (relativeNow() - lostUs) / 1_000,
                         "ok" to ok) +
                         (error?.let { mapOf("error" to (it.message ?: it.javaClass.simpleName).take(120),
                             "offline" to rejoiner.isOffline(it)) } ?: emptyMap()),
-                        callId = diagCallId, level = if (ok) "info" else "warn")
+                        callId = diagCallId, level = if (ok || revoked) "info" else "warn")
                 }, rejoiner::isOffline, rejoiner::awaitNetwork) { used, budgetMs -> rejoiner.connect(used, budgetMs) }
-            if (next == null) { if (!ownerLocal.get()) signalFatal("transport_disconnected"); return@launch }
+            // S125 决策 1: a revoked rejoin still goes through the fatal path, so the coordinator hangs up.
+            if (next == null) {
+                if (!ownerLocal.get()) {
+                    if (revoked) signalFatal("media_revoked", level = "info") else signalFatal("transport_disconnected")
+                }
+                return@launch
+            }
             val installed = synchronized(setupLock) {
                 if (!running.get() || ingressStopped.get() || ownerLocal.get()) false
                 else { transport = next; newLeg.set(true); rejoins.incrementAndGet(); true }
@@ -596,6 +632,7 @@ class GatewayAudioMediaSession(
         muteAttempted.set(true)
         if (!muteLease.acquireAndMute()) { signalFatal("mute_acquire_failed"); return false }
         injectionArmed.set(true)
+        leveler.adaptive = true
         endpoint.arm()
         synchronized(playoutLock) { playout?.trimSetupBacklog() }
         playbackOwnsClock.set(true)
@@ -688,7 +725,7 @@ class GatewayAudioMediaSession(
         val transportStats = transportStatsResult.getOrDefault(emptyMap())
         val recorder = recorder
         val recordingFinished = if (workersStopped && recorder == null) true else if (workersStopped && recorder != null) {
-            if (requestedTerminalState.get() == "failed" && fatalCode.get() == "transport_disconnected" &&
+            if (requestedTerminalState.get() == "failed" && upgradableFatal(fatalCode.get()) &&
                 terminalUpgradeGraceMs > 0) {
                 definitiveTerminal.await(terminalUpgradeGraceMs, TimeUnit.MILLISECONDS)
             }
@@ -764,7 +801,7 @@ class GatewayAudioMediaSession(
         postRecord(RecordWork(OriginalAudioTrack.REMOTE_ORIGINAL, pcm.copyOf(), timelineUs, timestampUs))
         // Recording and network are independent; a network queue/drop never changes captureComplete.
         // S70: a full encode queue drops its oldest frame, so the newest audio still goes out.
-        val work = PcmWork(pcm.copyOf(), timelineUs)
+        val work = PcmWork(pcm.copyOf().also(leveler::process), timelineUs)
         while (!encodeQueue.offer(work)) {
             if (encodeQueue.poll() != null) encodeQueueDrops.incrementAndGet()
         }
@@ -831,7 +868,10 @@ class GatewayAudioMediaSession(
         if (ownerTransportClosed.get()) return
         val packet = MediaPacket(MediaDirection.CELLULAR_DOWNLINK, FRAME_MS,
             sequence.getAndIncrement() and 0xffff_ffffL, encoded.presentationTimeUs, encoded.payload)
-        if (transport.send(packet) == MediaSendResult.SENT) txPackets.incrementAndGet() else transportSendDrops.incrementAndGet()
+        if (transport.send(packet) == MediaSendResult.SENT) {
+            txPackets.incrementAndGet()
+            if (firstTxAtUs.get() == 0L) firstTxAtUs.compareAndSet(0L, relativeNow().coerceAtLeast(1L))
+        } else transportSendDrops.incrementAndGet()
     }
 
     /**
@@ -1041,21 +1081,23 @@ class GatewayAudioMediaSession(
     private fun onEndpointFailure(failure: TelephonyAudioEndpoint.Failure) =
         signalFatal("endpoint_${failure.stage.name.lowercase()}_${failure.code.name.lowercase()}")
 
-    private fun signalFatal(code: String) {
+    private fun signalFatal(code: String, level: String = "error") {
         if (!fatalSignaled.compareAndSet(false, true)) return
         fatalCode.set(code)
         requestTerminalState("failed")
         prebufferReady.complete(false)
         GatewayDiag.log("media.session_failed", mapOf("code" to code, "ms" to relativeNow() / 1_000),
-            callId = diagCallId, level = "error")
+            callId = diagCallId, level = level)
         runCatching { onFatal(code) }
         if (running.get()) Thread { stop("failed") }.start()
     }
+    /** S125: a revoked rejoin is upgraded like a lost transport, so an AI-ended call still archives `ended`. */
+    private fun upgradableFatal(code: String?) = code == "transport_disconnected" || code == "media_revoked"
     internal fun requestTerminalState(value: String) {
         if (value in setOf("ended", "completed")) {
             while (true) {
                 val current = requestedTerminalState.get()
-                val mayUpgradeFailure = current == "failed" && fatalCode.get() == "transport_disconnected"
+                val mayUpgradeFailure = current == "failed" && upgradableFatal(fatalCode.get())
                 if (current == "failed" && !mayUpgradeFailure) break
                 if (requestedTerminalState.compareAndSet(current, value)) {
                     if (mayUpgradeFailure) terminalUpgradedAfterFailure.set(true)

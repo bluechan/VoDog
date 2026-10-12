@@ -45,14 +45,17 @@ object GatewayApiRoutes {
     /**
      * S71: POST routes Control already deduplicates (by eventId / commandId) or that only report
      * current state, so a second copy after a lost response is harmless and may go to the other
-     * endpoint. Everything else (media grants, pairing, migrations, SMS events) is sent once.
+     * endpoint. `media/options` re-runs the same authorization and its capture binding is
+     * `ON CONFLICT DO NOTHING`, so it qualifies too. Everything else (the media offer, pairing,
+     * migrations, SMS events) is sent once.
      */
     private val IDEMPOTENT_POSTS = setOf(HEARTBEAT, SIM_SYNC, TELECOM_SNAPSHOT, INCOMING_CALL, OUTGOING_OBSERVED,
         INCOMING_SMS, OUTGOING_SMS_OBSERVED, BLOCKLIST_PHONE_CHANGES, CALL_LOG_PURGE_ACK)
 
     internal fun isIdempotent(path: String): Boolean =
         path in IDEMPOTENT_POSTS || (path.startsWith("/gateway/commands/") && path.endsWith("/ack")) ||
-            (path.startsWith("/gateway/calls/") && path.endsWith("/owner-joined"))
+            (path.startsWith("/gateway/calls/") && path.endsWith("/owner-joined")) ||
+            (path.startsWith("/gateway/calls/") && path.endsWith("/media/options"))
 
     internal fun encodePathSegment(value: String): String = buildString {
         value.toByteArray(Charsets.UTF_8).forEach { byte ->
@@ -94,6 +97,8 @@ data class HeartbeatResult(
     val desiredPower: String? = null,
     /** S56: Control's `EARLY_MEDIA_ENABLED`, sent on every heartbeat; absent reads as false. */
     val earlyMedia: Boolean = false,
+    /** S123: Control's `AI_EARLY_LEG_ENABLED`, sent on every heartbeat; absent reads as false. */
+    val aiEarlyLeg: Boolean = false,
 )
 
 /** One hanging doorbell round. `wake` means the control service has command work to collect now. */
@@ -310,6 +315,7 @@ class GatewayApi(
             commandDoorbellMaxHoldMs = parseCommandDoorbellMaxHoldMs(response),
             desiredPower = parseDesiredPower(response, accepted = "off"),
             earlyMedia = response.optBoolean("earlyMedia", false),
+            aiEarlyLeg = response.optBoolean("aiEarlyLeg", false),
         )
     }
 
@@ -579,6 +585,11 @@ class GatewayApi(
             idempotent = GatewayApiRoutes.isIdempotent(path),
             alternateRetry = alternateRetry,
         ))
+        response.timing?.let { timing ->
+            apiTimingRoute(path)?.takeIf { timing.totalMs > API_TIMING_LOG_THRESHOLD_MS }?.let { route ->
+                GatewayDiag.log("api.timing", apiTimingDiagFields(route, response.status, timing))
+            }
+        }
         check(shouldContinue()) { "gateway disabled" }
         if (response.status !in 200..299) {
             val error = runCatching { JSONObject(response.body).getJSONObject("error") }.getOrNull()
@@ -599,6 +610,19 @@ class GatewayApi(
         const val CALL_LOG_PURGE_ACK_LIMIT = 50
     }
 }
+
+/** Only a command ACK or a Telecom snapshot slower than this becomes an `api.timing` row. */
+internal const val API_TIMING_LOG_THRESHOLD_MS = 800L
+
+/** The heartbeat-cycle POSTs whose slow round trips are worth a row of their own; null for the rest. */
+internal fun apiTimingRoute(path: String): String? = when {
+    path == GatewayApiRoutes.TELECOM_SNAPSHOT -> "telecom_snapshot"
+    path.startsWith("/gateway/commands/") && path.endsWith("/ack") -> "command_ack"
+    else -> null
+}
+
+internal fun apiTimingDiagFields(route: String, status: Int, timing: GatewayHttpTiming): Map<String, Any?> =
+    mapOf("route" to route, "status" to status, "relay" to GatewayEndpoint.relay) + timing.diagFields()
 
 /** A non-2xx control-plane response, typed so callers can retry only the recoverable rejections. */
 internal class GatewayApiHttpError(

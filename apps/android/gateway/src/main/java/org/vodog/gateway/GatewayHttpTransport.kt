@@ -35,9 +35,82 @@ data class GatewayHttpRequest(
     val idempotent: Boolean = method == "GET" || headers.keys.any { it.equals("Idempotency-Key", ignoreCase = true) },
     /** S71: false opts a request out of the alternate-endpoint retry (the S21 standby long-poll). */
     val alternateRetry: Boolean = true,
+    /** Per-request TCP+TLS connect bound; null keeps the owner's 10 s (media signaling uses 4 s). */
+    val connectTimeoutMs: Long? = null,
+    /** S123 决策 9: the view that sent this on a shared transport; [OwnedGatewayHttpTransport.cancelInFlight] keys on it. */
+    val owner: Any? = null,
 )
 
-data class GatewayHttpResponse(val status: Int, val body: String)
+/**
+ * One HTTP exchange's network phases, in ms (null = the phase did not happen on this call, e.g. no
+ * DNS/TCP/TLS on a [reused] connection). [ttfbMs] runs from the last request byte to the response
+ * headers (server time plus one round trip); [totalMs] from call start to the last body byte read.
+ * Byte counts are bodies only. Content-free: no URL, header or body ever lands here.
+ */
+data class GatewayHttpTiming(
+    val dnsMs: Long?,
+    val tcpMs: Long?,
+    val tlsMs: Long?,
+    val reused: Boolean,
+    val protocol: String?,
+    val ttfbMs: Long?,
+    val totalMs: Long,
+    val reqBytes: Long,
+    val respBytes: Long,
+) {
+    fun diagFields(): Map<String, Any?> = mapOf(
+        "dnsMs" to dnsMs, "tcpMs" to tcpMs, "tlsMs" to tlsMs, "reused" to reused, "protocol" to protocol,
+        "ttfbMs" to ttfbMs, "totalMs" to totalMs, "reqBytes" to reqBytes, "respBytes" to respBytes,
+    )
+}
+
+data class GatewayHttpResponse(val status: Int, val body: String, val timing: GatewayHttpTiming? = null)
+
+/** Fed by [OwnedGatewayHttpTransport]'s event listener; travels with its request as an OkHttp tag. */
+internal class GatewayHttpTimingRecorder(private val nanoTime: () -> Long = System::nanoTime) {
+    private val createdNs = nanoTime()
+    @Volatile private var callStartNs = 0L
+    @Volatile private var dnsStartNs = 0L
+    @Volatile private var dnsEndNs = 0L
+    @Volatile private var connectStartNs = 0L
+    @Volatile private var secureStartNs = 0L
+    @Volatile private var secureEndNs = 0L
+    @Volatile private var connectEndNs = 0L
+    @Volatile private var requestEndNs = 0L
+    @Volatile private var responseHeadersNs = 0L
+    @Volatile private var protocol: String? = null
+    @Volatile private var reqBytes = 0L
+    @Volatile private var respBytes = -1L
+
+    fun callStart() { if (callStartNs == 0L) callStartNs = nanoTime() }
+    fun dnsStart() { if (dnsStartNs == 0L) dnsStartNs = nanoTime() }
+    fun dnsEnd() { dnsEndNs = nanoTime() }
+    fun connectStart() { if (connectStartNs == 0L) connectStartNs = nanoTime() }
+    fun secureConnectStart() { if (secureStartNs == 0L) secureStartNs = nanoTime() }
+    fun secureConnectEnd() { secureEndNs = nanoTime() }
+    fun connectEnd() { connectEndNs = nanoTime() }
+    fun connectionAcquired(value: String) { protocol = value }
+    fun requestEnd(bodyBytes: Long?) { requestEndNs = nanoTime(); bodyBytes?.let { reqBytes = it } }
+    fun responseHeadersStart() { if (responseHeadersNs == 0L) responseHeadersNs = nanoTime() }
+    fun responseBodyEnd(bytes: Long) { respBytes = bytes }
+
+    /** Called once the body has been read; [bodyBytes] backs up a body-end event that never fired. */
+    fun snapshot(bodyBytes: Long): GatewayHttpTiming {
+        val end = nanoTime()
+        fun span(from: Long, to: Long): Long? = if (from > 0L && to >= from) (to - from) / 1_000_000 else null
+        return GatewayHttpTiming(
+            dnsMs = span(dnsStartNs, dnsEndNs),
+            tcpMs = span(connectStartNs, secureStartNs.takeIf { it > 0L } ?: connectEndNs),
+            tlsMs = span(secureStartNs, secureEndNs),
+            reused = connectStartNs == 0L,
+            protocol = protocol,
+            ttfbMs = span(requestEndNs, responseHeadersNs),
+            totalMs = ((end - (callStartNs.takeIf { it > 0L } ?: createdNs)) / 1_000_000).coerceAtLeast(0L),
+            reqBytes = reqBytes,
+            respBytes = respBytes.takeIf { it >= 0L } ?: bodyBytes,
+        )
+    }
+}
 
 fun interface GatewayHttpTransport : Closeable {
     fun execute(request: GatewayHttpRequest): GatewayHttpResponse
@@ -62,15 +135,36 @@ class OwnedGatewayHttpTransport internal constructor(
     readTimeoutSeconds: Long = DEFAULT_READ_TIMEOUT_SECONDS,
 ) : GatewayHttpTransport {
     private val lock = Any()
-    private val active = mutableSetOf<Call>()
+    private val active = mutableMapOf<Call, Any?>()
+    private val cancelledOwners = java.util.Collections.newSetFromMap(java.util.WeakHashMap<Any, Boolean>())
     private var closed = false
     private val client = OkHttpClient.Builder()
         .connectionPool(pool)
         .dispatcher(dispatcher)
         .socketFactory(socketFactory)
-        .eventListenerFactory {
+        // S118: process-global last-known-good / built-in fallback when system DNS fails.
+        .dns(GatewayDns)
+        .eventListenerFactory { created ->
+            val timing = created.request().tag(GatewayHttpTimingRecorder::class.java)
             object : EventListener() {
+                override fun callStart(call: Call) { timing?.callStart() }
+                override fun dnsStart(call: Call, domainName: String) { timing?.dnsStart() }
+                override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<java.net.InetAddress>) { timing?.dnsEnd() }
+                override fun connectStart(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy) {
+                    timing?.connectStart()
+                }
+                override fun secureConnectStart(call: Call) { timing?.secureConnectStart() }
+                override fun secureConnectEnd(call: Call, handshake: okhttp3.Handshake?) { timing?.secureConnectEnd() }
+                override fun connectEnd(
+                    call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy, protocol: Protocol?,
+                ) { timing?.connectEnd() }
+                override fun requestHeadersEnd(call: Call, request: Request) { timing?.requestEnd(null) }
+                override fun requestBodyEnd(call: Call, byteCount: Long) { timing?.requestEnd(byteCount) }
+                override fun responseHeadersStart(call: Call) { timing?.responseHeadersStart() }
+                override fun responseBodyEnd(call: Call, byteCount: Long) { timing?.responseBodyEnd(byteCount) }
+
                 override fun connectionAcquired(call: Call, connection: Connection) {
+                    timing?.connectionAcquired(connection.protocol().toString())
                     if (isClosed()) {
                         call.cancel()
                         closeOwnedConnection(connection)
@@ -92,6 +186,16 @@ class OwnedGatewayHttpTransport internal constructor(
         .writeTimeout(15, TimeUnit.SECONDS)
         .apply { interceptor?.let(::addInterceptor); protocols?.let(::protocols) }
         .build()
+    /**
+     * Same pool, dispatcher, socket factory and event listener as [client] (so OFF still reaches
+     * every socket), only a shorter connect bound. One per distinct [GatewayHttpRequest.connectTimeoutMs].
+     */
+    private val connectBoundClients = java.util.concurrent.ConcurrentHashMap<Long, OkHttpClient>()
+
+    private fun clientFor(request: GatewayHttpRequest): OkHttpClient =
+        request.connectTimeoutMs?.takeIf { it > 0L }?.let { bound ->
+            connectBoundClients.getOrPut(bound) { client.newBuilder().connectTimeout(bound, TimeUnit.MILLISECONDS).build() }
+        } ?: client
 
     override fun execute(request: GatewayHttpRequest): GatewayHttpResponse {
         require(request.responseLimitBytes > 0)
@@ -100,7 +204,7 @@ class OwnedGatewayHttpTransport internal constructor(
         } catch (failure: IOException) {
             // S71: a network-layer failure (no HTTP status) tries the other Control endpoint once.
             val alternate = GatewayEndpoint.alternateUrl(request.url)
-            if (failure is ResponseTooLargeException || isClosed() || alternate == null ||
+            if (failure is ResponseTooLargeException || isClosed() || isCancelled(request.owner) || alternate == null ||
                 !request.idempotent || !request.alternateRetry) throw failure
             runCatching { GatewayDiag.log("api.alternate_retry", mapOf(
                 "relay" to !GatewayEndpoint.relay, "errorType" to failure.javaClass.simpleName,
@@ -115,8 +219,10 @@ class OwnedGatewayHttpTransport internal constructor(
     }
 
     private fun executeOnce(request: GatewayHttpRequest, url: String): GatewayHttpResponse {
+        val timing = GatewayHttpTimingRecorder()
         val builder = Request.Builder().url(url)
             .header("Accept", "application/json")
+            .tag(GatewayHttpTimingRecorder::class.java, timing)
         request.authorization?.let { builder.header("Authorization", it) }
         request.headers.forEach { (name, value) -> builder.header(name, value) }
         val body = when {
@@ -125,12 +231,12 @@ class OwnedGatewayHttpTransport internal constructor(
             else -> null
         }
         builder.method(request.method, body)
-        val call = client.newCall(builder.build()).also {
+        val call = clientFor(request).newCall(builder.build()).also {
             it.timeout().timeout(request.timeoutMs, TimeUnit.MILLISECONDS)
         }
         synchronized(lock) {
-            check(!closed) { "gateway network owner closed" }
-            active += call
+            check(!closed && (request.owner == null || request.owner !in cancelledOwners)) { "gateway network owner closed" }
+            active[call] = request.owner
         }
         try {
             onCallRegistered?.invoke(call)
@@ -147,10 +253,10 @@ class OwnedGatewayHttpTransport internal constructor(
                     if (buffer.size > request.responseLimitBytes) throw ResponseTooLargeException()
                     buffer.readByteArray()
                 } ?: ByteArray(0)
-                return GatewayHttpResponse(response.code, bytes.toString(Charsets.UTF_8))
+                return GatewayHttpResponse(response.code, bytes.toString(Charsets.UTF_8), timing.snapshot(bytes.size.toLong()))
             }
         } finally {
-            val ownerClosed = synchronized(lock) { active -= call; closed }
+            val ownerClosed = synchronized(lock) { active.remove(call); closed }
             // evictAll only closes idle connections. An HTTP/2 stream cancelled during
             // close() may release its connection after that first eviction. The response
             // is closed above, so evict again here instead of retaining it for five minutes.
@@ -162,7 +268,7 @@ class OwnedGatewayHttpTransport internal constructor(
         val calls = synchronized(lock) {
             if (closed) return
             closed = true
-            active.toList().also { active.clear() }
+            active.keys.toList().also { active.clear() }
         }
         socketFactory.close()
         calls.forEach { runCatching(it::cancel) }
@@ -170,6 +276,21 @@ class OwnedGatewayHttpTransport internal constructor(
         runCatching(pool::evictAll)
         runCatching { dispatcher.executorService.shutdownNow() }
     }
+
+    /**
+     * S123 决策 9: OFF for one view of a shared transport. Cancels [owner]'s in-flight calls and refuses
+     * its later ones; the pool, dispatcher, socket factory and every other owner's calls stay up, so the
+     * warm connection survives. No eviction: OkHttp health-checks a pooled connection before reuse.
+     */
+    internal fun cancelInFlight(owner: Any) {
+        val calls = synchronized(lock) {
+            cancelledOwners += owner
+            active.filterValues { it === owner }.keys.toList()
+        }
+        calls.forEach { runCatching(it::cancel) }
+    }
+
+    private fun isCancelled(owner: Any?): Boolean = owner != null && synchronized(lock) { owner in cancelledOwners }
 
     internal fun isClosed(): Boolean = synchronized(lock) { closed }
 
@@ -202,7 +323,7 @@ internal class UrlConnectionGatewayHttpTransport(
             GatewayHttpConnectionPolicy.apply(connection)
             connection.instanceFollowRedirects = false
             connection.requestMethod = request.method
-            connection.connectTimeout = minOf(10_000, request.timeoutMs.toInt())
+            connection.connectTimeout = minOf(request.connectTimeoutMs ?: 10_000L, request.timeoutMs).toInt()
             connection.readTimeout = request.timeoutMs.toInt()
             connection.setRequestProperty("Accept", "application/json")
             request.authorization?.let { connection.setRequestProperty("Authorization", it) }

@@ -14,6 +14,10 @@ import java.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import org.vodog.gateway.PROBE_STALE_RETENTION_SECONDS
 
 class GatewayMediaProbeTest {
     @Test fun `media options generation fence rejects a network change after response`() = runBlocking {
@@ -280,6 +284,108 @@ class GatewayMediaProbeTest {
         Unit
     }
 
+    @Test fun `ensureCurrent returns fresh cached evidence while a slow refresh holds the lock`(): Unit = runBlocking {
+        var now = Instant.parse("2026-09-10T00:00:00Z")
+        var gate: CompletableDeferred<Unit>? = null
+        var entered: CompletableDeferred<Unit>? = null
+        var optionsCalls = 0
+        val coordinator = GatewayMediaProbeCoordinator(
+            object : GatewayProbeControl {
+                override suspend fun options(networkGeneration: String): GatewayProbeOptions {
+                    optionsCalls += 1
+                    entered?.complete(Unit)
+                    gate?.await()
+                    return GatewayProbeOptions(networkGeneration, now.plusSeconds(120).toString(), listOf(node("server-node")))
+                }
+                override suspend fun results(networkGeneration: String, samples: List<GatewayProbeSample>) =
+                    now.plusSeconds(120).toString()
+            },
+            GatewayProbeGeneration { "network" },
+            GatewayProbeRunner { node -> node.grants.map { GatewayProbeSample(node.nodeId, "ok", 8.0) } },
+            now = { now },
+        )
+        val first = coordinator.ensureCurrent()
+
+        // A forced heartbeat refresh holds the mutex; valid evidence must not queue behind it.
+        gate = CompletableDeferred()
+        entered = CompletableDeferred()
+        val heldRefresh = async { coordinator.ensureCurrent(forceRefresh = true) }
+        entered!!.await()
+        val cached = withTimeout(1_000) { coordinator.ensureCurrent() }
+        assertEquals(first.acceptedAt, cached.acceptedAt)
+        assertTrue(cached.hasReachableNode)
+        gate!!.complete(Unit)
+        heldRefresh.await()
+        assertEquals(2, optionsCalls)
+
+        // Expired evidence still waits for the refresh in flight and takes its result.
+        now = now.plusSeconds(31)
+        gate = CompletableDeferred()
+        entered = CompletableDeferred()
+        val expiredRefresh = async { coordinator.ensureCurrent(forceRefresh = true) }
+        entered!!.await()
+        val waiter = async { coordinator.ensureCurrent() }
+        delay(50)
+        assertFalse(waiter.isCompleted)
+        gate!!.complete(Unit)
+        val refreshed = expiredRefresh.await()
+        assertEquals(refreshed.acceptedAt, waiter.await().acceptedAt)
+        assertEquals(3, optionsCalls)
+    }
+
+    @Test fun `relay mode options take the generation without ever awaiting a probe`(): Unit = runBlocking {
+        val provider = object : GatewayProbeReadinessProvider {
+            override suspend fun ensureCurrent(): GatewayProbeReadiness = awaitCancellation()
+            override fun requireCurrent(networkGeneration: String) = Unit
+            override fun currentNetworkGeneration() = "network-now"
+        }
+        assertEquals("network-now", withTimeout(200) { mediaOptionsNetworkGeneration(provider, relay = true) })
+    }
+
+    @Test fun `a provider without a cheap generation keeps the probe path in both modes`(): Unit = runBlocking {
+        // Fakes written before currentNetworkGeneration existed still compile and still work.
+        val provider = object : GatewayProbeReadinessProvider {
+            override suspend fun ensureCurrent() = GatewayProbeReadiness("network-p", false, Instant.MAX)
+            override fun requireCurrent(networkGeneration: String) = Unit
+        }
+        assertEquals(null, provider.currentNetworkGeneration())
+        assertEquals("network-p", mediaOptionsNetworkGeneration(provider, relay = true))
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { mediaOptionsNetworkGeneration(provider, relay = false) }
+        }
+    }
+
+    @Test fun `non-relay options never wait past the bound and fall back to retained evidence`(): Unit = runBlocking {
+        val now = Instant.parse("2026-09-10T00:10:00Z")
+        var last: GatewayProbeReadiness? = GatewayProbeReadiness("network", true, now.minusSeconds(60), now.minusSeconds(90))
+        var refresh: suspend () -> GatewayProbeReadiness = { awaitCancellation() }
+        val provider = object : GatewayProbeReadinessProvider {
+            override suspend fun ensureCurrent() = refresh()
+            override fun requireCurrent(networkGeneration: String) = Unit
+            override fun lastAcceptedReadiness() = last
+        }
+        val started = System.nanoTime()
+        assertEquals("network", boundedProbeReadiness(provider, waitMs = 50, now = { now }).networkGeneration)
+        assertTrue((System.nanoTime() - started) / 1_000_000 < 1_000)
+
+        // A failed refresh does not fail setup while retained evidence exists ...
+        refresh = { throw GatewayMediaHttpException(503, "MEDIA_PROBE_UNAVAILABLE", "down") }
+        assertTrue(boundedProbeReadiness(provider, waitMs = 50, now = { now }).hasReachableNode)
+        // ... but evidence past the heartbeat's retention window no longer counts, and the failure surfaces.
+        last = GatewayProbeReadiness("network", true, now.minusSeconds(600), now.minusSeconds(PROBE_STALE_RETENTION_SECONDS + 1))
+        assertThrows(GatewayMediaHttpException::class.java) {
+            runBlocking { boundedProbeReadiness(provider, waitMs = 50, now = { now }) }
+        }
+        last = null
+        refresh = { awaitCancellation() }
+        assertThrows(IllegalStateException::class.java) {
+            runBlocking { boundedProbeReadiness(provider, waitMs = 50, now = { now }) }
+        }
+        // Fresh evidence answers at once and wins over the retained one.
+        refresh = { GatewayProbeReadiness("network-2", true, now.plusSeconds(30), now) }
+        assertEquals("network-2", boundedProbeReadiness(provider, waitMs = 50, now = { now }).networkGeneration)
+    }
+
     @Test fun `one cycle reports each grant and qualifies two successes without clearing cached evidence`() = runBlocking {
         var optionsCalls = 0
         var resultCalls = 0
@@ -375,6 +481,27 @@ class GatewayMediaProbeTest {
                 }
             }
         }
+    }
+
+    @Test fun `S97 capture 409 retries are capped while node-pending keeps its backoff`(): Unit = runBlocking {
+        for (code in listOf("CAPTURE_NOT_ACTIVE", "CAPTURE_NOT_CONFIRMED")) {
+            var attempts = 0
+            // Two uncapped 2 s waits would blow the 1.5 s budget; two capped ones take ~0.6 s.
+            val value = retryMediaNodePending(timeoutMs = 1_500, delays = longArrayOf(2_000), captureRetryCapMs = CAPTURE_RETRY_CAP_MS) {
+                attempts += 1
+                if (attempts < 3) throw GatewayMediaHttpException(409, code, "not yet")
+                "ready"
+            }
+            assertEquals("ready", value)
+        }
+        assertThrows(kotlinx.coroutines.TimeoutCancellationException::class.java) {
+            runBlocking {
+                retryMediaNodePending(timeoutMs = 1_500, delays = longArrayOf(2_000), captureRetryCapMs = CAPTURE_RETRY_CAP_MS) {
+                    throw GatewayMediaHttpException(409, "MEDIA_NODE_PENDING", "pending")
+                }
+            }
+        }
+        assertEquals(300L, CAPTURE_RETRY_CAP_MS)
     }
 
     @Test fun `S22 capture binding 409s are retried within the same bounded window`(): Unit = runBlocking {

@@ -56,7 +56,9 @@ class GatewayEndpointTest {
         assertTrue(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.HEARTBEAT))
         assertTrue(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.ack("c1")))
         assertFalse(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.STANDBY))
-        assertFalse(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.mediaOptions("c1")))
+        // Control re-authorizes options and its capture binding is ON CONFLICT DO NOTHING; the offer is sent once.
+        assertTrue(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.mediaOptions("c1")))
+        assertFalse(GatewayApiRoutes.isIdempotent(GatewayApiRoutes.mediaOffer("c1")))
     }
 
     @Test fun `non-idempotent and standby requests are never retried`() {

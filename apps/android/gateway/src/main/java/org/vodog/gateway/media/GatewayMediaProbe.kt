@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import org.vodog.gateway.GatewayHttpRequest
 import org.vodog.gateway.GatewayHttpResponse
 import org.vodog.gateway.GatewayHttpTransport
+import org.vodog.gateway.PROBE_STALE_RETENTION_SECONDS
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -15,6 +16,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
@@ -81,6 +83,46 @@ data class GatewayProbeReadiness(
 interface GatewayProbeReadinessProvider {
     suspend fun ensureCurrent(): GatewayProbeReadiness
     fun requireCurrent(networkGeneration: String)
+    /**
+     * The current network generation without awaiting (or starting) a probe; null when unknown. It is
+     * all a setup needs for its transport-memory key, and all relay-mode options need (S71: the relay
+     * path never uses the reachability evidence).
+     */
+    fun currentNetworkGeneration(): String? = null
+    /** The most recent accepted evidence, expired or not; [boundedProbeReadiness] falls back to it. */
+    fun lastAcceptedReadiness(): GatewayProbeReadiness? = null
+}
+
+/** How long non-relay media options wait on a probe refresh before the last accepted evidence answers. */
+internal const val MEDIA_PROBE_WAIT_MS = 1_500L
+
+/**
+ * Non-relay media options need reachability evidence, but a refresh (options POST, three serial 2 s
+ * probe POSTs per node, results POST) must never hold or fail call setup. Fresh evidence answers at
+ * once; a refresh slower than [waitMs] or a failed one falls back to the last accepted evidence still
+ * inside the heartbeat's own retention window ([PROBE_STALE_RETENTION_SECONDS]). Only with no such
+ * evidence does the refresh's failure surface. The caller's generation fence still refuses evidence
+ * taken on another network.
+ */
+internal suspend fun boundedProbeReadiness(
+    provider: GatewayProbeReadinessProvider,
+    waitMs: Long = MEDIA_PROBE_WAIT_MS,
+    now: () -> Instant = Instant::now,
+): GatewayProbeReadiness {
+    var failure: Exception? = null
+    val fresh = try {
+        withTimeoutOrNull(waitMs) { provider.ensureCurrent() }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        failure = error
+        null
+    }
+    if (fresh != null) return fresh
+    val retained = provider.lastAcceptedReadiness()?.takeIf {
+        !now().isAfter(it.acceptedAt.plusSeconds(PROBE_STALE_RETENTION_SECONDS))
+    }
+    return retained ?: throw (failure ?: IllegalStateException("gateway media probe evidence unavailable"))
 }
 
 internal class GatewayMediaProbeCoordinator(
@@ -112,7 +154,14 @@ internal class GatewayMediaProbeCoordinator(
         check(generation.current() == expected) { "probe network generation changed" }
     }
 
-    suspend fun ensureCurrent(forceRefresh: Boolean = false): GatewayProbeReadiness = mutex.withLock {
+    suspend fun ensureCurrent(forceRefresh: Boolean = false): GatewayProbeReadiness {
+        // Valid same-network evidence never queues behind an in-flight refresh, which holds the mutex
+        // for a whole probe round. Waiters that do queue re-check the cache under the lock below.
+        if (!forceRefresh) peekCurrent()?.let { return it }
+        return refreshUnderLock(forceRefresh)
+    }
+
+    private suspend fun refreshUnderLock(forceRefresh: Boolean): GatewayProbeReadiness = mutex.withLock {
         val current = generation.current()
         if (!forceRefresh) accepted?.takeIf { it.generation == current && now().isBefore(it.expiresAt) }
             ?.let { return@withLock GatewayProbeReadiness(current, it.hasReachableNode, it.expiresAt, it.acceptedAt) }

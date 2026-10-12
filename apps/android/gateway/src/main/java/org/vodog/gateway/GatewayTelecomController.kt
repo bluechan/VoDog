@@ -6,13 +6,18 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.telecom.Call
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.IdentityHashMap
 import java.util.UUID
@@ -65,6 +70,8 @@ interface GatewayTelecomController {
     suspend fun dial(dialNumber: String, phoneAccount: PhoneAccountHandle): TelecomActionResult
     suspend fun answer(localCallId: String): TelecomActionResult
     suspend fun hangUp(localCallId: String): TelecomActionResult
+    /** S123 决策 4: answers a deferred AI call once; null = nothing to do (issued already, or no longer ringing). */
+    suspend fun answerIfRinging(deviceCallId: String, trigger: String): TelecomActionResult?
     fun actualState(): List<TelecomCallSnapshot>
     fun actualState(localCallId: String): TelecomCallSnapshot?
 }
@@ -136,6 +143,32 @@ class AndroidGatewayTelecomController(
         TelecomAction.ANSWER, localCallId
     ) { it.answer(VideoProfile.STATE_AUDIO_ONLY) }
 
+    /**
+     * S123 决策 4: the single entry for leg_ready / budget / leg_failed / no_leg / restart. Ringing is checked
+     * first and the issued mark is durable before `Call.answer()`: a racing ACTIVE then reads as the AI path,
+     * and an owner who picked up first never gets a mark (决策 5). A refused answer clears the mark again.
+     */
+    override suspend fun answerIfRinging(deviceCallId: String, trigger: String): TelecomActionResult? {
+        val journal = DeviceCallJournal(context)
+        val record = journal.find(deviceCallId) ?: return null
+        if (!shouldIssueAiAnswer(record, GatewayTelecomCallRegistry.snapshot(deviceCallId)?.state)) return null
+        val issuedMs = SystemClock.elapsedRealtime()
+        if (!journal.markAiAnswerIssued(deviceCallId, issuedMs)) return null
+        val result = answer(deviceCallId)
+        if (result is TelecomActionResult.Rejected) journal.clearAiAnswerIssued(deviceCallId)
+        else GatewayAiAnswerBudget.issued(deviceCallId, trigger)
+        GatewayDiag.log("telephony.ai_answer", mapOf(
+            "trigger" to trigger,
+            "deferredMs" to aiAnswerDeferredMs(record.copy(aiAnswerIssuedMs = issuedMs), gatewayBootId(context)),
+            "result" to when (result) {
+                TelecomActionResult.Executed -> "executed"
+                is TelecomActionResult.Rejected -> "rejected:${result.reason}"
+                is TelecomActionResult.Unknown -> "unknown:${result.reason}"
+            },
+        ), callId = record.serverCallId, level = if (result == TelecomActionResult.Executed) "info" else "warn")
+        return result
+    }
+
     override suspend fun hangUp(localCallId: String): TelecomActionResult = actOnCall(
         TelecomAction.HANG_UP, localCallId, Call::disconnect
     )
@@ -171,6 +204,50 @@ class AndroidGatewayTelecomController(
         }
     }
 
+}
+
+/** S123 决策 6: a constant, not a switch; the only switch is Control's `AI_EARLY_LEG_ENABLED`. */
+internal const val AI_EARLY_LEG_BUDGET_MS = 5_000L
+
+internal fun shouldIssueAiAnswer(record: DeviceCallRecord, actual: ActualTelecomState?): Boolean =
+    record.aiAnswerDeadlineMs != null && record.aiAnswerIssuedMs == null && actual == ActualTelecomState.RINGING
+
+/** S123 决策 12: ms the answer waited after Control's ANSWER; null across a reboot (`elapsedRealtime` restarted). */
+internal fun aiAnswerDeferredMs(record: DeviceCallRecord, bootId: String?): Long? {
+    val deadline = record.aiAnswerDeadlineMs ?: return null
+    val issued = record.aiAnswerIssuedMs ?: return null
+    return if (record.aiAnswerBootId == bootId) issued - (deadline - AI_EARLY_LEG_BUDGET_MS) else null
+}
+
+/** S123 决策 4: `elapsedRealtime` deadlines are only comparable within one boot. */
+internal fun gatewayBootId(context: Context): String? = runCatching {
+    android.provider.Settings.Global.getInt(context.contentResolver, android.provider.Settings.Global.BOOT_COUNT).toString()
+}.getOrNull()
+
+/**
+ * S123 决策 4 `budget`: one process-owned timer per deferred answer, never on the heartbeat or the media
+ * reconcile (single-flight, and it holds the lifecycle mutex across setup). A timer that outlived the call
+ * (caller hung up) finds it not ringing and does nothing. Also remembers each call's answer trigger for `media.setup`.
+ */
+internal object GatewayAiAnswerBudget {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scheduled = mutableSetOf<String>()
+    private val triggers = mutableMapOf<String, String>()
+
+    fun schedule(context: Context, deviceCallId: String, deadlineMs: Long) {
+        if (!synchronized(this) { scheduled.add(deviceCallId) }) return
+        val appContext = context.applicationContext
+        scope.launch {
+            try {
+                delay((deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+                runCatching { AndroidGatewayTelecomController(appContext).answerIfRinging(deviceCallId, "budget") }
+            } finally { synchronized(this@GatewayAiAnswerBudget) { scheduled.remove(deviceCallId) } }
+        }
+    }
+
+    // ponytail: one short entry per deferred call for the process lifetime; prune if that ever matters.
+    @Synchronized fun issued(deviceCallId: String, trigger: String) { triggers[deviceCallId] = trigger }
+    @Synchronized fun trigger(deviceCallId: String): String? = triggers[deviceCallId]
 }
 
 internal object GatewayDialNumberPolicy {

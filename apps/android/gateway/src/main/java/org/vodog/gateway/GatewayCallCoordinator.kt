@@ -163,6 +163,16 @@ class GatewayCallCoordinator(
                 // Durable before Telecom accepts: the call may reach ACTIVE - and the media
                 // reconcile may read the record - before this coroutine resumes.
                 callJournal.markAnswerRoute(target.deviceCallId, spec.answeredByAi)
+                // S123 决策 2: an AI answer waits up to the budget for its early leg. The ACK still says
+                // submitted (this gateway now owns answering in time); the media reconcile later in this
+                // cycle builds the leg, and the timer answers if nothing else did. Nothing waits here.
+                val record = callJournal.find(target.deviceCallId)
+                if (record != null && shouldDeferAiAnswer(runtime.aiEarlyLeg, spec.answeredByAi, record, target.state)) {
+                    val deadlineMs = android.os.SystemClock.elapsedRealtime() + AI_EARLY_LEG_BUDGET_MS
+                    callJournal.markAiAnswerDeferred(target.deviceCallId, deadlineMs, gatewayBootId(context))
+                    GatewayAiAnswerBudget.schedule(context, target.deviceCallId, deadlineMs)
+                    return CallEffectResult.Submitted(target.deviceCallId, ActualTelecomState.RINGING)
+                }
                 controller.answer(target.deviceCallId)
                     .toEffect(target.deviceCallId, ActualTelecomState.RINGING)
             }

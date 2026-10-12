@@ -5,6 +5,7 @@ import org.vodog.gateway.BuildConfig
 import org.vodog.gateway.GatewayApiRoutes
 import org.vodog.gateway.GatewayEndpoint
 import org.vodog.gateway.GatewayHttpRequest
+import org.vodog.gateway.GatewayHttpTiming
 import org.vodog.gateway.GatewayHttpTransport
 import org.vodog.gateway.OwnedGatewayHttpTransport
 import org.json.JSONArray
@@ -68,27 +69,41 @@ class HttpGatewayMediaSignaling(
     context: Context,
     private val deviceToken: String,
     private val apiBaseUrlOverride: String? = null,
-    private val transport: GatewayHttpTransport = OwnedGatewayHttpTransport(),
+    // S123 决策 9: a view of the process-wide pool; close() cancels only this instance's calls.
+    private val transport: GatewayHttpTransport = GatewayMediaSignalingTransport.forSignaling(),
     private val captureRequest: MediaCaptureRequest? = null,
     private val probeReadiness: GatewayProbeReadinessProvider,
 ) : GatewayMediaSignaling {
     @Volatile var captureBinding: MediaCaptureBinding? = null
         private set
     @Volatile private var authorizedNetworkGeneration: String? = null
+    /** The last options/offer exchange, read once for the `media.setup` diag row. Content-free. */
+    @Volatile var ensureCurrentMs: Long? = null
+        private set
+    @Volatile var optionsAttempts = 0
+        private set
+    @Volatile var optionsHttp: GatewayHttpTiming? = null
+        private set
+    @Volatile var offerHttp: GatewayHttpTiming? = null
+        private set
+
     override suspend fun options(callId: String, transport: IceTransport): MediaOptions {
         authorizedNetworkGeneration = null
-        val probe = probeReadiness.ensureCurrent()
         // S71: the relay path goes through the relay-node tunnel, not the probed node path.
         val relay = GatewayEndpoint.relay
-        require(relay || probe.hasReachableNode) { "gateway has no reachable media node" }
-        val networkGeneration = probe.networkGeneration
+        val probeStartedNs = System.nanoTime()
+        val networkGeneration = mediaOptionsNetworkGeneration(probeReadiness, relay)
+        ensureCurrentMs = (System.nanoTime() - probeStartedNs) / 1_000_000
         val body = mediaOptionsRequestBody(transport, networkGeneration, relay, captureRequest)
-        val json = retryMediaNodePending {
+        var attempts = 0
+        val json = retryMediaNodePending(captureRetryCapMs = CAPTURE_RETRY_CAP_MS) {
             withProbeGenerationFence(probeReadiness, networkGeneration) {
+                attempts += 1
+                optionsAttempts = attempts
                 post(
                     GatewayApiRoutes.mediaOptions(callId),
                     body,
-                )
+                ) { optionsHttp = it }
             }
         }
         captureBinding = optionsCaptureBinding(json, callId, captureRequest)
@@ -110,7 +125,7 @@ class HttpGatewayMediaSignaling(
                 post(
                     GatewayApiRoutes.mediaOffer(callId),
                     JSONObject().put("type", offer.type).put("sdp", offer.sdp),
-                )
+                ) { offerHttp = it }
             }
         }
         return MediaSessionDescription(json.getString("type"), json.getString("sdp")).also {
@@ -119,16 +134,16 @@ class HttpGatewayMediaSignaling(
         }
     }
 
-    private suspend fun post(path: String, body: JSONObject): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun post(
+        path: String,
+        body: JSONObject,
+        onTiming: (GatewayHttpTiming?) -> Unit,
+    ): JSONObject = withContext(Dispatchers.IO) {
         require(deviceToken.isNotBlank())
-        val response = transport.execute(GatewayHttpRequest(
-            url = (apiBaseUrlOverride ?: GatewayEndpoint.baseUrl()) + path,
-            method = "POST",
-            authorization = "Bearer $deviceToken",
-            jsonBody = body.toString().toByteArray(),
-            timeoutMs = 20_000,
-            responseLimitBytes = MAX_SIGNALING_RESPONSE_BYTES,
-        ))
+        val response = transport.execute(
+            gatewayMediaPostRequest(apiBaseUrlOverride ?: GatewayEndpoint.baseUrl(), path, deviceToken, body),
+        )
+        onTiming(response.timing)
         if (response.status !in 200..299) {
             val error = runCatching { JSONObject(response.body).getJSONObject("error") }.getOrNull()
             val code = error?.optString("code").orEmpty().ifBlank { "HTTP_${response.status}" }
@@ -204,6 +219,10 @@ internal class GatewayMediaProbeOwner(
         coordinator.requireCurrentGeneration(networkGeneration)
         check(!closed.get()) { "gateway media probe owner closed" }
     }
+
+    override fun currentNetworkGeneration(): String? = if (closed.get()) null else runCatching(generation::current).getOrNull()
+
+    override fun lastAcceptedReadiness(): GatewayProbeReadiness? = peekLastAccepted()
 
     fun peekCurrent(): GatewayProbeReadiness? = if (closed.get()) null else coordinator.peekCurrent()
 
@@ -303,6 +322,38 @@ internal class GatewayMediaHttpException(
 ) : Exception(message)
 
 /**
+ * The generation media options are fenced on. S71 relay mode never uses the reachability evidence,
+ * so it takes the generation without waiting on a probe at all; only without one (closed owner,
+ * unknown network) does it fall back to the bounded probe. Non-relay mode needs reachable evidence,
+ * but never waits longer than [MEDIA_PROBE_WAIT_MS] for it ([boundedProbeReadiness]).
+ */
+internal suspend fun mediaOptionsNetworkGeneration(provider: GatewayProbeReadinessProvider, relay: Boolean): String {
+    if (relay) provider.currentNetworkGeneration()?.let { return it }
+    val probe = boundedProbeReadiness(provider)
+    require(relay || probe.hasReachableNode) { "gateway has no reachable media node" }
+    return probe.networkGeneration
+}
+
+/** A black-holed Control endpoint costs this much per media POST instead of the owner's 10 s. */
+internal const val MEDIA_CONNECT_TIMEOUT_MS = 4_000L
+
+/**
+ * One media signaling POST. `media/options` may be repeated on the other Control endpoint after a
+ * network failure (S71; Control re-authorizes and its capture binding is ON CONFLICT DO NOTHING);
+ * `media/offer` never is - a lost answer is only ever recovered by a whole new negotiation.
+ */
+internal fun gatewayMediaPostRequest(baseUrl: String, path: String, deviceToken: String, body: JSONObject) = GatewayHttpRequest(
+    url = baseUrl + path,
+    method = "POST",
+    authorization = "Bearer $deviceToken",
+    jsonBody = body.toString().toByteArray(),
+    timeoutMs = 20_000,
+    responseLimitBytes = MAX_SIGNALING_RESPONSE_BYTES,
+    idempotent = GatewayApiRoutes.isIdempotent(path),
+    connectTimeoutMs = MEDIA_CONNECT_TIMEOUT_MS,
+)
+
+/**
  * Control answers 409 with one of these while a fact it needs is still in flight: the winning
  * client has not pinned a media node yet, or (S22) the gateway's own next Telecom snapshot has not
  * yet confirmed the call it just answered as active. Media setup starts on the device's ACTIVE
@@ -314,9 +365,16 @@ internal val MEDIA_SETUP_TRANSIENT_409_CODES = setOf("MEDIA_NODE_PENDING", "CAPT
 internal fun isTransientMediaSetupError(error: GatewayMediaHttpException): Boolean =
     error.status == 409 && error.code in MEDIA_SETUP_TRANSIENT_409_CODES
 
+/**
+ * S97 §3: options waiting only for Control to learn ACTIVE from the gateway's own snapshot polls at
+ * this cap, so the binding lands sub-second after that snapshot. MEDIA_NODE_PENDING keeps [delays].
+ */
+internal const val CAPTURE_RETRY_CAP_MS = 300L
+
 internal suspend fun <T> retryMediaNodePending(
     timeoutMs: Long = 12_000,
     delays: LongArray = longArrayOf(250, 500, 1_000, 1_500, 2_000, 2_500, 3_000),
+    captureRetryCapMs: Long = Long.MAX_VALUE,
     action: suspend () -> T,
 ): T = withTimeout(timeoutMs) {
     require(delays.isNotEmpty() && delays.all { it >= 0 })
@@ -326,7 +384,8 @@ internal suspend fun <T> retryMediaNodePending(
             return@withTimeout action()
         } catch (error: GatewayMediaHttpException) {
             if (!isTransientMediaSetupError(error)) throw error
-            delay(delays[minOf(attempt, delays.lastIndex)])
+            val wait = delays[minOf(attempt, delays.lastIndex)]
+            delay(if (error.code.startsWith("CAPTURE_NOT_")) minOf(wait, captureRetryCapMs) else wait)
             attempt += 1
         }
     }

@@ -64,6 +64,8 @@ class GatewayInCallService : InCallService() {
                     call.deviceState(),
                     call.remoteNumber(),
                 )
+                // S124 决策 1: after the journal reads ACTIVE, so the coordinator's exactActiveCall() sees it.
+                if (state == Call.STATE_ACTIVE) GatewayAiEarlyArm.onActive(this@GatewayInCallService, deviceCallId)
                 wakeGatewayIfEnabled()
             }
         }

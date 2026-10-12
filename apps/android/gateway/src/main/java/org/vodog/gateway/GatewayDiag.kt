@@ -208,6 +208,11 @@ object GatewayDiag {
         runCatching { worker.execute { runCatching { task() } } }
     }
 
+    /** [task] on the diag thread after [delayMs]; the same never-blocks, never-throws contract as [post]. */
+    internal fun postDelayed(delayMs: Long, task: () -> Unit) {
+        runCatching { worker.schedule({ runCatching { task() } }, delayMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS) }
+    }
+
     /** The diag thread, handed to the platform listeners that take an executor. */
     internal fun executor(): Executor = worker
 
@@ -314,4 +319,9 @@ internal fun killedAgoSeconds(cleanShutdown: Boolean, lastAliveMs: Long?, nowMs:
     if (cleanShutdown || lastAliveMs == null) return null
     val agoMs = nowMs - lastAliveMs
     return if (agoMs in 0 until KILLED_REPORT_WINDOW_MS) agoMs / 1000 else null
+}
+
+/** One HTTP exchange's [GatewayHttpTiming] as a nested diag object; absent phases are left out. */
+internal fun httpTimingDiagJson(timing: GatewayHttpTiming): JSONObject = JSONObject().also { json ->
+    timing.diagFields().forEach { (key, value) -> if (value != null) json.put(key, value) }
 }

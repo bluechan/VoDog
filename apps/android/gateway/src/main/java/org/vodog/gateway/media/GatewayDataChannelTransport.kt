@@ -4,12 +4,16 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import org.vodog.gateway.GatewayDiag
+import org.vodog.gateway.GatewayDns
+import org.vodog.gateway.mediaCallEnded
+import org.vodog.gateway.pinTurnUrl
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.webrtc.CandidatePairChangeEvent
 import org.webrtc.DataChannel
@@ -25,6 +29,17 @@ import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+
+/** S124 决策 3: a coroutine cancellation that is not a timeout (those stay `media.failed reason=timeout`). */
+internal fun mediaSetupCancelled(error: Throwable): Boolean =
+    error is CancellationException && error !is TimeoutCancellationException
+
+/** S124 决策 3: `media.setup_cancelled`; `reason` is `call_ended` once the call is terminal, else `cancelled`. */
+internal fun mediaSetupCancelledFields(stage: String, callEnded: Boolean): Map<String, Any?> =
+    mapOf("stage" to stage, "reason" to if (callEnded) "call_ended" else "cancelled")
+
+/** S125 决策 2: `media.revoked` replaces `media.failed` when Control refused with MEDIA_REVOKED. */
+internal fun mediaRevokedFields(stage: String): Map<String, Any?> = mapOf("stage" to stage, "code" to "MEDIA_REVOKED")
 
 enum class MediaSendResult { SENT, BACKPRESSURE, CLOSED }
 enum class MediaDiagnosticStage {
@@ -215,7 +230,7 @@ class GatewayDataChannelTransport private constructor(
          * relay candidate or an open data channel inside its bounded budget, the negotiation is torn
          * down and replayed once on the other transport before the failure is reported.
          */
-        suspend fun connect(
+        internal suspend fun connect(
             context: Context,
             callId: String,
             signaling: GatewayMediaSignaling,
@@ -224,9 +239,17 @@ class GatewayDataChannelTransport private constructor(
             /** S73: a rejoin runs exactly one transport with the budget its window has left. */
             fallback: Boolean = true,
             budgetMs: Long = MEDIA_NEGOTIATION_TIMEOUT_MS,
+            /** S97: only picks the relay settle window, see [mediaRelaySettleMs]. */
+            answeredByAi: Boolean = false,
+            /** False when the caller retries on the same [signaling] and closes it itself. */
+            closeSignaling: Boolean = true,
+            /** Stage timings for the `media.setup` row; null records nothing. */
+            timeline: MediaSetupTimeline? = null,
             onTransportFallback: (from: IceTransport, to: IceTransport, reason: String) -> Unit = { _, _, _ -> },
-        ): GatewayDataChannelTransport =
-            connectInternal(context, callId, signaling, listener, transport, true, onTransportFallback, fallback, budgetMs)
+        ): GatewayDataChannelTransport = connectInternal(
+            context, callId, signaling, listener, transport, true, onTransportFallback, fallback, budgetMs, answeredByAi,
+            closeSignaling, timeline,
+        )
 
         internal suspend fun connectForTest(
             context: Context,
@@ -247,21 +270,35 @@ class GatewayDataChannelTransport private constructor(
             onTransportFallback: (IceTransport, IceTransport, String) -> Unit,
             fallback: Boolean,
             budgetMs: Long,
+            answeredByAi: Boolean = false,
+            closeSignaling: Boolean = true,
+            timeline: MediaSetupTimeline? = null,
         ): GatewayDataChannelTransport = withContext(Dispatchers.IO) {
             initialize(context.applicationContext)
+            // Relay enforcement is also what tells a production call from the host-candidate
+            // loopback fixture, which has no second transport to fall back to.
+            val fallbackPlan = enforceRelay && fallback
             try {
-                // Relay enforcement is also what tells a production call from the host-candidate
-                // loopback fixture, which has no second transport to fall back to.
                 withMediaTransportFallback(
-                    mediaTransportPlan(transport, fallbackEnabled = enforceRelay && fallback, finalBudgetMs = budgetMs),
+                    mediaTransportPlan(transport, fallbackEnabled = fallbackPlan, finalBudgetMs = budgetMs),
                     onTransportFallback,
-                ) { attempt -> negotiate(context, callId, signaling, listener, attempt, enforceRelay) }
+                ) { attempt ->
+                    // Options runs ahead of a fallback-plan attempt's clock; see [runMediaAttemptClocks].
+                    negotiate(context, callId, signaling, listener, attempt, enforceRelay, answeredByAi,
+                        if (fallbackPlan) MEDIA_OPTIONS_TIMEOUT_MS else null, timeline)
+                }
             } finally {
                 // Both attempts share one signaling instance: closing it here would close the owned
                 // HTTP transport that the fallback's second `options` request still needs.
-                runCatching { signaling.close() }
+                if (closeSignaling) runCatching { signaling.close() }
             }
         }
+
+        /**
+         * Loads the WebRTC native library and its globals once, off the main thread, when the gateway
+         * turns ON - so the first call's setup does not pay for it. No socket is opened.
+         */
+        fun prewarm(context: Context) = initialize(context.applicationContext)
 
         private suspend fun negotiate(
             context: Context,
@@ -270,6 +307,9 @@ class GatewayDataChannelTransport private constructor(
             listener: GatewayDataChannelListener,
             attempt: MediaTransportAttempt,
             enforceRelay: Boolean,
+            answeredByAi: Boolean,
+            optionsTimeoutMs: Long?,
+            timeline: MediaSetupTimeline?,
         ): GatewayDataChannelTransport {
             // Read by the fallback log after the budget expires; the coroutine that set it is gone.
             val stage = AtomicReference(MediaTransportStage.OPTIONS)
@@ -281,15 +321,29 @@ class GatewayDataChannelTransport private constructor(
             var factoryOwner: DataOnlyPeerConnectionFactory? = null
             var peer: PeerConnection? = null
             var channel: DataChannel? = null
+            // The factory and its audio device module build while options is in flight; every path
+            // that does not take it over below hands it back through abandon().
+            val prewarm = PrewarmedResource(Dispatchers.Default.asExecutor()) {
+                val startedMs = SystemClock.elapsedRealtime()
+                dataOnlyPeerConnectionFactory(context.applicationContext)
+                    .also { timeline?.span("factoryMs", startedMs) }
+            }
             try {
-                return withTimeout(attempt.budgetMs) {
+                return runMediaAttemptClocks(attempt.budgetMs, optionsTimeoutMs, options = {
                     diagnostic(listener, MediaDiagnosticStage.OPTIONS_REQUESTED)
-                    val options = signaling.options(callId, attempt.transport)
-                    diagnostic(listener, MediaDiagnosticStage.OPTIONS_RECEIVED)
+                    val optionsStartedMs = SystemClock.elapsedRealtime()
+                    signaling.options(callId, attempt.transport).also {
+                        timeline?.span("optionsMs", optionsStartedMs)
+                        diagnostic(listener, MediaDiagnosticStage.OPTIONS_RECEIVED)
+                    }
+                }) { options ->
                     if (enforceRelay) require(options.iceTransportPolicy == "relay") { "relay ICE is required" }
                     stage.set(MediaTransportStage.GATHERING)
-                    val owner = dataOnlyPeerConnectionFactory(context.applicationContext)
+                    val factoryWaitStartedMs = SystemClock.elapsedRealtime()
+                    val owner = prewarm.take()
                     factoryOwner = owner
+                    val factoryReadyMs = SystemClock.elapsedRealtime()
+                    timeline?.span("factoryWaitMs", factoryWaitStartedMs, factoryReadyMs)
                     val gatheringComplete = CompletableDeferred<Unit>()
                     val relayCandidate = CompletableDeferred<Unit>()
                     // Monotonic stamps for the S25 D9 settle window; 0 means "has not happened yet".
@@ -297,14 +351,24 @@ class GatewayDataChannelTransport private constructor(
                     val gatheringCompleteAtMs = java.util.concurrent.atomic.AtomicLong()
                     // S36 C3: per attempt, so a fallback's ICE timing is measured from its own offer.
                     val offerAtMs = java.util.concurrent.atomic.AtomicLong()
+                    // `media.setup`: when the answer landed; ICE CONNECTED and the open channel count from it.
+                    val answerAtMs = java.util.concurrent.atomic.AtomicLong()
+                    val iceConnectedAtMs = java.util.concurrent.atomic.AtomicLong()
                     val channelOpen = CompletableDeferred<Unit>()
                     val channelRef = AtomicReference<DataChannel>()
                     val config = PeerConnection.RTCConfiguration(options.iceServers.map { server ->
-                        PeerConnection.IceServer.builder(server.urls)
+                        // S118: libwebrtc resolves TURN names itself; pin a DNS-named URL through
+                        // GatewayDns (IO thread here) so a router DNS outage still reaches the relay.
+                        val pinned = if (server.hostname == null && server.urls.size == 1) {
+                            pinTurnUrl(server.urls.single()) { host ->
+                                GatewayDns.lookup(host).let { all -> all.firstOrNull { it is java.net.Inet4Address } ?: all.firstOrNull() }
+                            }
+                        } else null
+                        PeerConnection.IceServer.builder(pinned?.first?.let(::listOf) ?: server.urls)
                             .setUsername(server.username)
                             .setPassword(server.credential)
                             .setTlsCertPolicy(PeerConnection.TlsCertPolicy.TLS_CERT_POLICY_SECURE)
-                            .apply { server.hostname?.let { setHostname(it) } }
+                            .apply { (server.hostname ?: pinned?.second)?.let { setHostname(it) } }
                             .createIceServer()
                     }).apply {
                         iceTransportsType = if (enforceRelay) PeerConnection.IceTransportsType.RELAY else PeerConnection.IceTransportsType.ALL
@@ -322,7 +386,13 @@ class GatewayDataChannelTransport private constructor(
                         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
                             Log.i(ICE_LOG_TAG, "ice_state call=$callTag transport=$transportTag state=$state")
                             val sinceOfferMs = offerAtMs.get().takeIf { it > 0L }?.let { SystemClock.elapsedRealtime() - it }
-                            if (state == PeerConnection.IceConnectionState.CONNECTED || state == PeerConnection.IceConnectionState.COMPLETED) GatewayDiag.log("media.ice_connected", mapOf("transport" to transportTag, "state" to state.name, "sinceOfferMs" to sinceOfferMs), callId = callId)
+                            if (state == PeerConnection.IceConnectionState.CONNECTED || state == PeerConnection.IceConnectionState.COMPLETED) {
+                                GatewayDiag.log("media.ice_connected", mapOf("transport" to transportTag, "state" to state.name, "sinceOfferMs" to sinceOfferMs), callId = callId)
+                                val answeredAt = answerAtMs.get()
+                                if (answeredAt > 0L && iceConnectedAtMs.compareAndSet(0L, SystemClock.elapsedRealtime())) {
+                                    timeline?.span("answerToIceConnectedMs", answeredAt, iceConnectedAtMs.get())
+                                }
+                            }
                             // DISCONNECTED is transient and is logged, never fatal: the same relay pair
                             // recovers without an ICE restart once packets resume (S18 decision 6 gives
                             // iOS the same grace). A truly dead pair is escalated to FAILED by libwebrtc
@@ -416,6 +486,9 @@ class GatewayDataChannelTransport private constructor(
                     diagnostic(listener, MediaDiagnosticStage.SET_LOCAL_STARTED)
                     connection.setLocalDescriptionAwait(offer)
                     diagnostic(listener, MediaDiagnosticStage.SET_LOCAL_COMPLETE)
+                    // Gathering starts with the local description; peerMs is the PC, channel and offer.
+                    val localSetAtMs = SystemClock.elapsedRealtime()
+                    timeline?.span("peerMs", factoryReadyMs, localSetAtMs)
                     if (enforceRelay) {
                         // S25 decision 9: wait for the first relay candidate, not for the end of
                         // gathering. Gathering only completes once the TURN allocation on every
@@ -442,6 +515,7 @@ class GatewayDataChannelTransport private constructor(
                         val readyAtMs = mediaOfferReadyAtMs(
                             relayCandidateAtMs.get().takeIf { it > 0L },
                             gatheringCompleteAtMs.get().takeIf { it > 0L },
+                            mediaRelaySettleMs(answeredByAi, attempt.transport),
                         )
                         val settleWaitMs = readyAtMs?.minus(SystemClock.elapsedRealtime()) ?: 0L
                         if (settleWaitMs > 0L) withTimeoutOrNull(settleWaitMs) { gatheringComplete.await() }
@@ -468,8 +542,12 @@ class GatewayDataChannelTransport private constructor(
                     )
                     diagnostic(listener, MediaDiagnosticStage.SIGNALING_OFFER_STARTED)
                     offerAtMs.set(SystemClock.elapsedRealtime())
+                    timeline?.span("firstRelayMs", localSetAtMs, relayCandidateAtMs.get().takeIf { it > 0L } ?: localSetAtMs)
+                    timeline?.span("settleMs", relayCandidateAtMs.get(), offerAtMs.get())
                     GatewayDiag.log("media.offer", mapOf("transport" to transportTag, "ms" to offerAtMs.get() - peerCreatedAtMs, "relayCandidates" to relayCandidates, "gathering" to if (gatheringCompleteAtMs.get() > 0L) "complete" else "partial"), callId = callId)
                     val answer = signaling.offer(callId, MediaSessionDescription("offer", local.description))
+                    answerAtMs.set(SystemClock.elapsedRealtime())
+                    timeline?.span("offerPostMs", offerAtMs.get(), answerAtMs.get())
                     diagnostic(listener, MediaDiagnosticStage.SIGNALING_ANSWER_RECEIVED)
                     diagnostic(listener, MediaDiagnosticStage.SET_REMOTE_STARTED)
                     connection.setRemoteDescriptionAwait(SessionDescription(SessionDescription.Type.ANSWER, answer.sdp))
@@ -477,6 +555,7 @@ class GatewayDataChannelTransport private constructor(
                     stage.set(MediaTransportStage.DATA_CHANNEL)
                     diagnostic(listener, MediaDiagnosticStage.DATA_CHANNEL_WAITING)
                     channelOpen.await()
+                    timeline?.span("dcOpenMs", answerAtMs.get())
                     created.unregisterObserver()
                     GatewayDataChannelTransport(owner, connection, created, listener, attempt.transport, attempt.ordinal,
                         options.iceServers.firstOrNull()?.urls?.firstOrNull()?.let(::turnUrlHost), loss, relayTurn = options.relay)
@@ -485,11 +564,19 @@ class GatewayDataChannelTransport private constructor(
             } catch (timeout: TimeoutCancellationException) {
                 diagnostic(listener, MediaDiagnosticStage.NEGOTIATION_FAILED)
                 GatewayDiag.log("media.failed", mapOf("transport" to transportTag, "stage" to stage.get().name, "reason" to "timeout") + iceFailureDiagFields(lastIceFailure.get()), callId = callId, level = "error")
+                prewarm.abandon()
                 releaseNegotiation(channel, peer, factoryOwner)
                 throw MediaTransportTimeoutException(attempt.transport, stage.get(), timeout)
             } catch (error: Throwable) {
                 diagnostic(listener, MediaDiagnosticStage.NEGOTIATION_FAILED)
-                GatewayDiag.log("media.failed", mapOf("transport" to transportTag, "stage" to stage.get().name, "reason" to (error.message ?: error.javaClass.simpleName).take(120)) + iceFailureDiagFields(lastIceFailure.get()), callId = callId, level = "error")
+                // S124 决策 3: a cancelled setup (the caller hung up, or OFF) is not a media failure. Shared with
+                // S56 human early legs and normal legs. Still rethrown below: control flow is unchanged.
+                if (mediaSetupCancelled(error)) GatewayDiag.log("media.setup_cancelled", mediaSetupCancelledFields(
+                    stage.get().name, mediaCallEnded(context, callId)), callId = callId)
+                // S125 决策 2: Control already ended the call; info, not a media failure. Still rethrown.
+                else if (mediaRevoked(error)) GatewayDiag.log("media.revoked", mediaRevokedFields(stage.get().name), callId = callId)
+                else GatewayDiag.log("media.failed", mapOf("transport" to transportTag, "stage" to stage.get().name, "reason" to (error.message ?: error.javaClass.simpleName).take(120)) + iceFailureDiagFields(lastIceFailure.get()), callId = callId, level = "error")
+                prewarm.abandon()
                 releaseNegotiation(channel, peer, factoryOwner)
                 throw error
             }
@@ -567,6 +654,57 @@ internal class DataOnlyPeerConnectionFactory(
         } finally {
             audioDevice.release()
         }
+    }
+}
+
+/**
+ * A [Closeable] built on [executor] while the caller does other work (the PeerConnectionFactory while
+ * media options is in flight). Exactly one side ends up owning it: [take] hands it over, and after
+ * [abandon] it is closed here - at once if it is already built, or by the builder the moment it
+ * finishes, because a blocking native construction cannot be interrupted by a cancellation.
+ */
+internal class PrewarmedResource<T : Closeable>(executor: java.util.concurrent.Executor, create: () -> T) {
+    private val lock = Any()
+    private val ready = CompletableDeferred<Unit>()
+    private var value: T? = null
+    private var failure: Throwable? = null
+    private var abandoned = false
+
+    init {
+        try {
+            executor.execute {
+                val built = runCatching(create)
+                val orphan = synchronized(lock) {
+                    built.exceptionOrNull()?.let { failure = it }
+                    val created = built.getOrNull()
+                    if (abandoned) created else { value = created; null }
+                }
+                orphan?.let { runCatching(it::close) }
+                ready.complete(Unit)
+            }
+        } catch (rejected: Throwable) {
+            synchronized(lock) { failure = rejected }
+            ready.complete(Unit)
+        }
+    }
+
+    /** Waits for the build and transfers ownership to the caller; rethrows a failed build. */
+    suspend fun take(): T {
+        ready.await()
+        return synchronized(lock) {
+            check(!abandoned) { "prewarmed resource abandoned" }
+            failure?.let { throw it }
+            checkNotNull(value) { "prewarmed resource already taken" }.also { value = null }
+        }
+    }
+
+    /** Gives up on the resource; a no-op after [take]. Never blocks on the build. */
+    fun abandon() {
+        val built = synchronized(lock) {
+            abandoned = true
+            value.also { value = null }
+        }
+        built?.let { runCatching(it::close) }
     }
 }
 

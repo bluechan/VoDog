@@ -507,6 +507,26 @@ class GatewayMediaRejoinSessionTest {
         assertTrue(root.resolve("$callId/manifest.json").readText().contains("\"terminalState\":\"failed\""))
         root.deleteRecursively()
     }
+
+    @Test fun revokedRejoinStillSignalsFatalAndATelecomEndUpgradesTheArchive() {
+        // S125 决策 1: 409 MEDIA_REVOKED ends the rejoin after one attempt and the fatal callback still runs
+        // (the coordinator's only hangup path when Control sends none); a racing Telecom end archives `ended`.
+        val root = Files.createTempDirectory("media-rejoin-revoked").toFile(); val callId = "77777777-7777-4777-8777-777777777777"
+        val codes = java.util.concurrent.CopyOnWriteArrayList<String>(); val endpoint = FakeEndpoint()
+        val rejoiner = Rejoiner { throw org.vodog.gateway.media.GatewayMediaHttpException(409, "MEDIA_REVOKED", "revoked") }
+        val ref = java.util.concurrent.atomic.AtomicReference<GatewayAudioMediaSession>()
+        val session = GatewayAudioMediaSession(endpoint, FakeCodec(), FakeTransport(), LocalCallRecorder(root, callId), FakeMute(), { true },
+            { codes += it; ref.get().requestTerminalState("ended") }, { 0 }, rejoiner = rejoiner)
+        ref.set(session)
+        val started = startAsync(session)
+        session.onRemotePacket(MediaPacket(MediaDirection.USER_UPLINK, 20, 1, 0, ByteArray(640)))
+        assertTrue(started.get(1, TimeUnit.SECONDS).isSuccess)
+        session.onTransportFailure("transport_disconnected", "dc_closed")
+        repeat(100) { if (!root.resolve("$callId/manifest.json").exists()) Thread.sleep(10) }
+        assertEquals(listOf("media_revoked"), codes.toList()); assertEquals(1, rejoiner.calls.get()); assertEquals(1, endpoint.stopCount)
+        assertTrue(root.resolve("$callId/manifest.json").readText().contains("\"terminalState\":\"ended\""))
+        root.deleteRecursively()
+    }
 }
 
 class GatewayEarlyMediaSessionTest {

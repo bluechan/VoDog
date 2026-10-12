@@ -283,6 +283,7 @@ private fun recordingStatusLabel(value: String) = when (value) {
     "recording", "processing", "pending" -> "处理中"
     "incomplete" -> "不完整"
     "failed" -> "失败"
+    "none", "" -> "无录音"
     else -> "待确认"
 }
 

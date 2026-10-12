@@ -2,6 +2,7 @@ package org.vodog.gateway.media
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -14,6 +15,13 @@ internal const val MEDIA_NEGOTIATION_TIMEOUT_MS = 20_000L
 
 /** Budget for an attempt that still has a fallback behind it; the last attempt keeps the full one. */
 internal const val MEDIA_FALLBACK_ATTEMPT_TIMEOUT_MS = 8_000L
+
+/**
+ * Options' own guard when it runs ahead of an attempt's clock. Options may legitimately spend most of
+ * [retryMediaNodePending]'s 12 s polling Control (S97: CAPTURE_NOT_* until the gateway's own snapshot
+ * lands; MEDIA_NODE_PENDING until the winner pins a node).
+ */
+internal const val MEDIA_OPTIONS_TIMEOUT_MS = 12_000L
 
 /** A relay allocation that has produced nothing by here will not produce anything useful later. */
 internal const val MEDIA_RELAY_CANDIDATE_DEADLINE_MS = 3_000L
@@ -28,6 +36,16 @@ internal const val MEDIA_RELAY_CANDIDATE_DEADLINE_MS = 3_000L
  * a second interface's relay candidate join the same offer, not a wait for the whole gathering.
  */
 internal const val MEDIA_RELAY_SETTLE_MS = 500L
+
+/**
+ * S97 §3: an AI leg on TURN TLS takes the first relay almost at once. Its one-way AI speech gains
+ * nothing from a second interface's candidate worth 400 ms of silence after ACTIVE; UDP and human
+ * legs keep [MEDIA_RELAY_SETTLE_MS].
+ */
+internal const val MEDIA_RELAY_SETTLE_AI_TLS_MS = 100L
+
+internal fun mediaRelaySettleMs(answeredByAi: Boolean, transport: IceTransport): Long =
+    if (answeredByAi && transport == IceTransport.TLS) MEDIA_RELAY_SETTLE_AI_TLS_MS else MEDIA_RELAY_SETTLE_MS
 
 /** Where one negotiation attempt was when its budget ran out. Bounded, content-free telemetry. */
 internal enum class MediaTransportStage { OPTIONS, GATHERING, RELAY_CANDIDATE, OFFER, DATA_CHANNEL }
@@ -111,12 +129,33 @@ internal fun mediaOfferReady(
 /**
  * Only a transport-shaped failure earns the second attempt. An HTTP refusal, a capture-binding
  * conflict or a revoked authorization would fail the same way on the other transport, and Control
- * re-runs `authorizeGatewayMedia`/`ensureCaptureBinding` on every options request.
+ * re-runs `authorizeGatewayMedia`/`ensureCaptureBinding` on every options request. An options timeout
+ * is HTTP-shaped too now that options runs ahead of the attempt's clock ([runMediaAttemptClocks]):
+ * switching an AI leg from TLS to the lossy UDP path would not make Control answer faster.
  */
-internal fun mediaTransportFallbackReason(error: Throwable): String? = when (error) {
-    is MediaTransportTimeoutException -> error.stage.timeoutReason()
-    is RelayIceUnavailableException -> "relay_unavailable"
+internal fun mediaTransportFallbackReason(error: Throwable): String? = when {
+    error is MediaTransportTimeoutException && error.stage != MediaTransportStage.OPTIONS -> error.stage.timeoutReason()
+    error is RelayIceUnavailableException -> "relay_unavailable"
     else -> null
+}
+
+/**
+ * One attempt's clocks. With [optionsTimeoutMs] set (an attempt of the S24 fallback plan), options
+ * runs first under that guard and [budgetMs] - gathering, offer and data channel - only starts once
+ * it returns, so a slow but successful options can no longer spend the ICE budget and trigger a
+ * spurious fallback. Without it (a single-transport rejoin or retry, whose budget is a hard window)
+ * options stays inside [budgetMs]. A timeout surfaces as [kotlinx.coroutines.TimeoutCancellationException]
+ * for the caller to turn into [MediaTransportTimeoutException] at its current stage.
+ */
+internal suspend fun <O, T> runMediaAttemptClocks(
+    budgetMs: Long,
+    optionsTimeoutMs: Long?,
+    options: suspend () -> O,
+    negotiate: suspend (O) -> T,
+): T {
+    if (optionsTimeoutMs == null) return withTimeout(budgetMs) { negotiate(options()) }
+    val granted = withTimeout(optionsTimeoutMs) { options() }
+    return withTimeout(budgetMs) { negotiate(granted) }
 }
 
 internal suspend fun <T> withMediaTransportFallback(
@@ -187,11 +226,18 @@ internal fun mediaRejoinTransport(attempt: Int, original: IceTransport, relay: B
     else -> original
 }
 
-internal enum class MediaRejoinFailure { CONFLICT, RETRY, FATAL }
+internal enum class MediaRejoinFailure { CONFLICT, RETRY, FATAL, REVOKED }
 
-/** 409 / 503 MEDIA_BRIDGE_UNAVAILABLE = old leg still up; other 4xx = call gone or revoked, stop rejoining. */
+/** S125 决策 1: Control ended the call (409 MEDIA_REVOKED); decided by the code alone. */
+internal fun mediaRevoked(error: Throwable): Boolean = error is GatewayMediaHttpException && error.code == "MEDIA_REVOKED"
+
+/**
+ * 409 / 503 MEDIA_BRIDGE_UNAVAILABLE = old leg still up; other 4xx = call gone, stop rejoining.
+ * S125 决策 1: MEDIA_REVOKED is REVOKED, which stops like FATAL (the caller's fatal path still hangs up).
+ */
 internal fun classifyMediaRejoinFailure(error: Throwable): MediaRejoinFailure = when {
     error !is GatewayMediaHttpException -> MediaRejoinFailure.RETRY
+    mediaRevoked(error) -> MediaRejoinFailure.REVOKED
     error.status == 409 || (error.status == 503 && error.code == "MEDIA_BRIDGE_UNAVAILABLE") -> MediaRejoinFailure.CONFLICT
     error.status in 400..499 -> MediaRejoinFailure.FATAL
     else -> MediaRejoinFailure.RETRY
@@ -238,7 +284,7 @@ internal suspend fun <T> rejoinMediaLeg(
             coroutineContext.ensureActive()
             runCatching { onAttempt(attempt, transport, false, error, nowMs() - attemptStartMs) }
             val kind = classifyMediaRejoinFailure(error)
-            if (kind == MediaRejoinFailure.FATAL) return null
+            if (kind == MediaRejoinFailure.FATAL || kind == MediaRejoinFailure.REVOKED) return null
             val windowLeft = MEDIA_REJOIN_WINDOW_MS - (nowMs() - startMs)
             if (offline(error)) {
                 if (windowLeft <= 0 || !awaitNetwork(windowLeft)) return null
@@ -253,4 +299,66 @@ internal suspend fun <T> rejoinMediaLeg(
         }
     }
     return null
+}
+
+/** Initial-leg retry: the waits before extra attempt 1 and 2 (S73 classification, not its 15 s spacing). */
+internal val MEDIA_INITIAL_RETRY_DELAYS_MS = longArrayOf(300L, 800L)
+/** Everything after the first failure - waits, offline waits and extra attempts - fits in this. */
+internal const val MEDIA_INITIAL_RETRY_BUDGET_MS = 8_000L
+/** An extra attempt with less budget than this left is not started. */
+internal const val MEDIA_INITIAL_RETRY_MIN_ATTEMPT_MS = 2_000L
+
+/**
+ * The initial leg's bounded retry, before a live cellular call is hung up for want of media. The first
+ * [connect] (budget null) is the planned negotiation with its own transport fallback. A failure that
+ * S73's [classifyMediaRejoinFailure] calls RETRY or CONFLICT then gets at most
+ * [MEDIA_INITIAL_RETRY_DELAYS_MS].size single-transport attempts, each given the budget left of
+ * [MEDIA_INITIAL_RETRY_BUDGET_MS]; FATAL (4xx other than 409), REVOKED (S125), our own cancellation or [shouldContinue]
+ * turning false end it. An [offline] failure waits for the network inside the same budget and spends
+ * no attempt. Every extra attempt is a whole new options + offer on a fresh PeerConnection - the bridge
+ * replaces a gateway leg that is not Connected and 409s one that is - so an offer whose response was
+ * lost is never re-sent as such. The last failure is rethrown unchanged.
+ */
+internal suspend fun <T> connectInitialMediaLeg(
+    nowMs: () -> Long,
+    sleep: suspend (Long) -> Unit,
+    onRetry: (retry: Int, error: Throwable, offline: Boolean) -> Unit = { _, _, _ -> },
+    offline: (Throwable) -> Boolean = { false },
+    awaitNetwork: suspend (Long) -> Boolean = { true },
+    shouldContinue: () -> Boolean = { true },
+    connect: suspend (budgetMs: Long?) -> T,
+): T {
+    var failure: Throwable = try {
+        return connect(null)
+    } catch (error: Throwable) {
+        // Only our own cancellation (hangup / teardown) ends it here; an inner timeout is a failure.
+        coroutineContext.ensureActive()
+        error
+    }
+    val failedAtMs = nowMs()
+    var retries = 0
+    while (true) {
+        if (classifyMediaRejoinFailure(failure).let { it == MediaRejoinFailure.FATAL || it == MediaRejoinFailure.REVOKED } ||
+            !shouldContinue()) throw failure
+        val leftMs = MEDIA_INITIAL_RETRY_BUDGET_MS - (nowMs() - failedAtMs)
+        if (offline(failure)) {
+            runCatching { onRetry(retries, failure, true) }
+            if (leftMs <= 0 || !awaitNetwork(leftMs)) throw failure
+        } else {
+            if (retries == MEDIA_INITIAL_RETRY_DELAYS_MS.size) throw failure
+            val waitMs = MEDIA_INITIAL_RETRY_DELAYS_MS[retries]
+            if (leftMs - waitMs < MEDIA_INITIAL_RETRY_MIN_ATTEMPT_MS) throw failure
+            retries++
+            runCatching { onRetry(retries, failure, false) }
+            sleep(waitMs)
+        }
+        val budgetMs = MEDIA_INITIAL_RETRY_BUDGET_MS - (nowMs() - failedAtMs)
+        if (budgetMs < MEDIA_INITIAL_RETRY_MIN_ATTEMPT_MS || !shouldContinue()) throw failure
+        failure = try {
+            return connect(budgetMs)
+        } catch (error: Throwable) {
+            coroutineContext.ensureActive()
+            error
+        }
+    }
 }

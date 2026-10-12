@@ -68,6 +68,14 @@ data class DeviceCallRecord(
      * process restart mid-call never rebuilds a media leg (and then hangs up on its prebuffer failure).
      */
     val ownerJoined: Boolean = false,
+    /**
+     * S123 决策 2: an AI ANSWER deferred while the early leg is built; `elapsedRealtime` deadline of
+     * [AI_EARLY_LEG_BUDGET_MS], valid only on [aiAnswerBootId]. Null on every call answered at once.
+     */
+    val aiAnswerDeadlineMs: Long? = null,
+    /** S123 决策 4: written before `Call.answer()`; an ACTIVE with a deadline and no issue is the owner's (决策 5). */
+    val aiAnswerIssuedMs: Long? = null,
+    val aiAnswerBootId: String? = null,
 )
 
 /** Device-protected crash/reboot journal. Caller numbers stay in this app-private store and are never logged. */
@@ -164,6 +172,29 @@ class DeviceCallJournal(context: Context) {
             if (it.answeredByAi == answeredByAi && it.remoteAnswered) it
             else it.copy(answeredByAi = answeredByAi, remoteAnswered = true)
         }
+    }
+
+    /** S123 决策 2: the ANSWER is accepted but Telecom is asked later, by [GatewayTelecomController.answerIfRinging]. */
+    fun markAiAnswerDeferred(deviceCallId: String, deadlineMs: Long, bootId: String?) = synchronized(LOCK) {
+        mutate(deviceCallId) { it.copy(aiAnswerDeadlineMs = deadlineMs, aiAnswerIssuedMs = null, aiAnswerBootId = bootId) }
+    }
+
+    /** S123 决策 4: true exactly once per deferred answer; the single fence that keeps it idempotent. */
+    fun markAiAnswerIssued(deviceCallId: String, issuedMs: Long): Boolean = synchronized(LOCK) {
+        val record = read().firstOrNull { it.deviceCallId == deviceCallId }
+        if (record?.aiAnswerDeadlineMs == null || record.aiAnswerIssuedMs != null) return@synchronized false
+        mutate(deviceCallId) { it.copy(aiAnswerIssuedMs = issuedMs) }
+        true
+    }
+
+    /** S123 决策 4: Telecom refused the answer outright (it never saw it), so a later trigger may try again. */
+    fun clearAiAnswerIssued(deviceCallId: String) = synchronized(LOCK) {
+        mutate(deviceCallId) { it.copy(aiAnswerIssuedMs = null) }
+    }
+
+    /** S123 决策 5: the owner answered on the Pixel inside the AI window; the call is local from now on. */
+    fun markOwnerAnsweredDuringAiWindow(deviceCallId: String) = synchronized(LOCK) {
+        mutate(deviceCallId) { it.copy(answeredByAi = false, remoteAnswered = false, ownerJoined = true) }
     }
 
     /** S94: written once from the owner-join IO work; never cleared for the rest of this call. */
@@ -492,6 +523,9 @@ internal fun DeviceCallRecord.toJson() = JSONObject()
     .put("outgoingPayload", outgoingPayload ?: JSONObject.NULL)
     .put("remoteAnswered", remoteAnswered)
     .put("ownerJoined", ownerJoined)
+    .put("aiAnswerDeadlineMs", aiAnswerDeadlineMs ?: JSONObject.NULL)
+    .put("aiAnswerIssuedMs", aiAnswerIssuedMs ?: JSONObject.NULL)
+    .put("aiAnswerBootId", aiAnswerBootId ?: JSONObject.NULL)
 
 internal fun JSONObject.toRecord() = DeviceCallRecord(
     deviceCallId = getString("deviceCallId"),
@@ -515,6 +549,10 @@ internal fun JSONObject.toRecord() = DeviceCallRecord(
     // Absent in rows written before S72b: keep today's behaviour (media for any ACTIVE incoming).
     remoteAnswered = optBoolean("remoteAnswered", true),
     ownerJoined = optBoolean("ownerJoined"),
+    // Absent in rows written before S123: answered at once, as before.
+    aiAnswerDeadlineMs = if (isNull("aiAnswerDeadlineMs")) null else optLong("aiAnswerDeadlineMs"),
+    aiAnswerIssuedMs = if (isNull("aiAnswerIssuedMs")) null else optLong("aiAnswerIssuedMs"),
+    aiAnswerBootId = nullableString("aiAnswerBootId"),
 )
 
 private fun JSONObject.nullableString(key: String): String? =

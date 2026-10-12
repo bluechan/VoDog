@@ -60,6 +60,99 @@ class GatewayDiagTest {
         assertEquals(0, posts.size)
     }
 
+    /** The events among [posts] named [name], oldest first. */
+    private fun rows(posts: MutableList<GatewayHttpRequest>, name: String): List<org.json.JSONObject> =
+        synchronized(posts) { posts.toList() }.flatMap { request ->
+            val array = JSONArray(String(requireNotNull(request.jsonBody)))
+            (0 until array.length()).map { array.getJSONObject(it) }
+        }.filter { it.getString("event") == name }
+
+    @Test fun mediaSetupRowsNestHttpTimingAndCarryTheOutcome() {
+        val posts = recorder()
+        attach(posts)
+        val http = GatewayHttpTiming(dnsMs = null, tcpMs = 40, tlsMs = 90, reused = false, protocol = "h2",
+            ttfbMs = 120, totalMs = 300, reqBytes = 210, respBytes = 900)
+        val stages = mapOf("optionsMs" to 350L, "optionsAttempts" to 2, "optionsHttp" to httpTimingDiagJson(http),
+            "transport" to "tls", "relay" to true, "attempt" to 1, "totalMs" to 2_100L)
+        GatewayDiag.log("media.setup", mediaSetupDiagFields(stages, mapOf("prebufferMs" to 900L, "firstTxFrameMs" to null), null),
+            callId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        GatewayDiag.log("media.setup", mediaSetupDiagFields(stages, emptyMap(), "data_channel_connect_failed"), level = "warn")
+        GatewayDiag.flushNow()
+
+        val (ok, failed) = rows(posts, "media.setup").map { it.getJSONObject("fields") }
+        assertEquals(true, ok.getBoolean("ok"))
+        assertEquals(false, ok.has("code"))
+        assertEquals(900L, ok.getLong("prebufferMs"))
+        // A stage that never happened is absent, not null.
+        assertEquals(false, ok.has("firstTxFrameMs"))
+        val nested = ok.getJSONObject("optionsHttp")
+        assertEquals(120L, nested.getLong("ttfbMs"))
+        assertEquals("h2", nested.getString("protocol"))
+        assertEquals(false, nested.getBoolean("reused"))
+        assertEquals(false, nested.has("dnsMs"))
+        assertEquals("tls", ok.getString("transport"))
+        assertEquals(false, failed.getBoolean("ok"))
+        assertEquals("data_channel_connect_failed", failed.getString("code"))
+        // Control drops a row whose fields serialize past 4 KiB.
+        assertTrue(ok.toString().length < 4_096)
+    }
+
+    @Test fun setupCancelledAndEarlyArmedRowsCarryTheirS124Fields() {
+        val posts = recorder()
+        attach(posts)
+        GatewayDiag.log("media.setup_cancelled", org.vodog.gateway.media.mediaSetupCancelledFields("OPTIONS", true))
+        GatewayDiag.log("media.setup_cancelled", org.vodog.gateway.media.mediaSetupCancelledFields("GATHERING", false))
+        GatewayDiag.log("media.early_armed", earlyArmedFields(420L, "active_callback"))
+        GatewayDiag.flushNow()
+        val (ended, cancelled) = rows(posts, "media.setup_cancelled")
+        assertEquals("info", ended.getString("level"))
+        assertEquals("OPTIONS", ended.getJSONObject("fields").getString("stage"))
+        assertEquals("call_ended", ended.getJSONObject("fields").getString("reason"))
+        assertEquals("cancelled", cancelled.getJSONObject("fields").getString("reason"))
+        val armed = rows(posts, "media.early_armed").single().getJSONObject("fields")
+        assertEquals("active_callback", armed.getString("via"))
+        assertEquals(420L, armed.getLong("earlyMs"))
+    }
+
+    @Test fun mediaRevokedRowIsInfoWithStageAndCode() {
+        val posts = recorder()
+        attach(posts)
+        GatewayDiag.log("media.revoked", org.vodog.gateway.media.mediaRevokedFields("OPTIONS"))
+        GatewayDiag.flushNow()
+        val row = rows(posts, "media.revoked").single()
+        assertEquals("info", row.getString("level"))
+        assertEquals("OPTIONS", row.getJSONObject("fields").getString("stage"))
+        assertEquals("MEDIA_REVOKED", row.getJSONObject("fields").getString("code"))
+    }
+
+    @Test fun onlySlowAckAndSnapshotPostsBecomeApiTimingRows() {
+        val posts = recorder()
+        attach(posts)
+        var totalMs = 0L
+        val api = GatewayApi("token", { true }, GatewayHttpTransport { request ->
+            val body = if (request.url.endsWith(GatewayApiRoutes.TELECOM_SNAPSHOT)) {
+                """{"accepted":true,"busyState":"idle"}"""
+            } else "{}"
+            GatewayHttpResponse(200, body, GatewayHttpTiming(1, 2, 3, false, "http/1.1", 4, totalMs, 10, 20))
+        })
+        totalMs = 801L
+        api.ackCommand(GatewayCommand("command-1", generation = 1, sequence = 1), "succeeded", org.json.JSONObject())
+        api.reportTelecomSnapshot(org.json.JSONObject())
+        api.ackCallLogPurges(listOf(CallLogPurgeAck("p-1", "deleted", 1)))
+        totalMs = API_TIMING_LOG_THRESHOLD_MS
+        api.ackCommand(GatewayCommand("command-2", generation = 1, sequence = 2), "succeeded", org.json.JSONObject())
+        GatewayDiag.flushNow()
+
+        val timings = rows(posts, "api.timing").map { it.getJSONObject("fields") }
+        assertEquals(listOf("command_ack", "telecom_snapshot"), timings.map { it.getString("route") })
+        timings.forEach {
+            assertEquals(801L, it.getLong("totalMs"))
+            assertEquals(200, it.getInt("status"))
+            assertEquals(4L, it.getLong("ttfbMs"))
+            assertEquals(false, it.toString().contains("command-1"))
+        }
+    }
+
     @Test fun aBurstIsCappedByTheRingAndSplitIntoServerSizedBatches() {
         val drained = recorder()
         attach(drained)

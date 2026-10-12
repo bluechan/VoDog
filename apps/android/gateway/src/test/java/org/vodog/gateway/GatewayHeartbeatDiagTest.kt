@@ -28,5 +28,22 @@ class GatewayHeartbeatDiagTest {
         assertEquals(0L, next["slowCount"])
         assertEquals(0L, next["maxGapMs"])
         assertTrue(next["maxMs"] == 50L)
+        assertEquals(50L, next["p50Ms"])
+        assertEquals(50L, next["p95Ms"])
+    }
+
+    @Test fun `heartbeat summary carries nearest-rank p50 and p95 per window`() {
+        val window = HeartbeatRttWindow(windowMs = 1_000L)
+        assertNull(window.due(0L))
+        (1..100).shuffled(java.util.Random(7)).forEach { window.sample(it * 10L) }
+        val fields = window.due(1_000L)!!
+        assertEquals(500L, fields["p50Ms"])
+        assertEquals(950L, fields["p95Ms"])
+        assertEquals(1_000L, fields["maxMs"])
+        // A new window starts empty: one slow outlier is its own p50 and p95.
+        window.sample(4_000L)
+        val next = window.due(2_000L)!!
+        assertEquals(4_000L, next["p50Ms"])
+        assertEquals(4_000L, next["p95Ms"])
     }
 }

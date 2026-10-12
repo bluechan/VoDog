@@ -192,4 +192,24 @@ class GatewayForegroundMediaPolicyTest {
             scope.cancel()
         }
     }
+
+    @Test fun `S97 early ACTIVE snapshot covers only remote-answered incoming calls Control has not seen active`() {
+        fun record(id: String, state: DeviceCallState, serverCallId: String? = "call-$id",
+            direction: DeviceCallDirection = DeviceCallDirection.INCOMING, remoteAnswered: Boolean = true) = DeviceCallRecord(
+            deviceCallId = id, phoneAccountHandle = "account-a", creationTimeMillis = 100L, direction = direction,
+            state = state, observedAt = "2026-10-03T00:00:00Z", remoteNumber = null, incomingEventId = null,
+            incomingPayload = null, incomingReported = true, serverCallId = serverCallId, remoteAnswered = remoteAnswered,
+        )
+        val records = listOf(
+            record("a", DeviceCallState.ACTIVE),
+            record("ringing", DeviceCallState.RINGING),
+            record("local", DeviceCallState.ACTIVE, remoteAnswered = false),
+            record("unbound", DeviceCallState.ACTIVE, serverCallId = null),
+            record("out", DeviceCallState.ACTIVE, direction = DeviceCallDirection.OUTGOING),
+            record("ended", DeviceCallState.ENDED),
+        )
+        assertEquals(setOf("call-a"), earlyActiveSnapshotCallIds(records, emptySet()))
+        // Once tried or confirmed by any accepted snapshot, it never triggers a second early POST.
+        assertEquals(emptySet<String>(), earlyActiveSnapshotCallIds(records, setOf("call-a")))
+    }
 }

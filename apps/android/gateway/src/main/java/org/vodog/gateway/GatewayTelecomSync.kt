@@ -2,10 +2,13 @@ package org.vodog.gateway
 
 import android.content.Context
 import android.telecom.TelecomManager
+import org.vodog.gateway.media.GatewayMediaSignalingTransport
+import org.vodog.gateway.media.warmMediaSignaling
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.util.UUID
+import kotlin.concurrent.thread
 
 data class GatewayTelecomSyncResult(
     val simsSynced: Int,
@@ -93,6 +96,13 @@ class GatewayTelecomSync(
             journal.markIncomingReported(record.deviceCallId, response.callId)
             logTelephonyBound(record.deviceCallId, response.callId)
             if (shouldSilenceNativeRinger(response.disposition, record.state)) silenceNativeRinger(context, record.deviceCallId, response.callId)
+            // S123 决策 9: Control will hand this call to a client or AI; open the media signaling TLS now.
+            if (response.disposition != "local_only") {
+                val baseUrl = GatewayEndpoint.baseUrl()
+                thread(isDaemon = true, name = "media-warmup") {
+                    warmMediaSignaling(GatewayMediaSignalingTransport.shared, baseUrl, response.callId)
+                }
+            }
             incomingReported++
         }
 
