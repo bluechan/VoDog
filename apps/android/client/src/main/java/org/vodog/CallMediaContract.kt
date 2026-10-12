@@ -125,6 +125,42 @@ internal fun mediaRxTx(stats: Collection<Pair<String, Map<String, Any?>>>): Map<
 }
 
 /**
+ * Path quality beside [mediaRxTx], for `media.stats` / `media.summary`: the selected candidate pair's RTT
+ * (`rttMs`) and candidate types (`pair {local, remote}`), and what the bridge reports about our audio
+ * (`txRemote {fractionLost, roundTripTimeMs, jitterMs}` from `remote-inbound-rtp`). Input is id → (type,
+ * members) as `RTCStatsReport.statsMap`; the pair is the transport's `selectedCandidatePairId`, else the
+ * nominated succeeded one. Types and numbers only, never an address.
+ */
+internal fun mediaPath(stats: Map<String, Pair<String, Map<String, Any?>>>): Map<String, Any> {
+    fun Map<String, Any?>.num(key: String): Double? = (this[key] as? Number)?.toDouble()?.takeIf { it.isFinite() }
+    fun Double.tenths(): Double = Math.round(this * 10) / 10.0
+    fun member(id: Any?, type: String, key: String): Any? =
+        (id as? String)?.let(stats::get)?.takeIf { it.first == type }?.second?.get(key)
+    val out = linkedMapOf<String, Any>()
+    val selectedId = stats.values.firstOrNull { it.first == "transport" }?.second?.get("selectedCandidatePairId")
+    val pair = (selectedId as? String)?.let(stats::get)?.takeIf { it.first == "candidate-pair" }?.second
+        ?: stats.values.firstOrNull { (type, m) -> type == "candidate-pair" && m["nominated"] == true && m["state"] == "succeeded" }?.second
+    if (pair != null) {
+        pair.num("currentRoundTripTime")?.let { out["rttMs"] = (it * 1000).tenths() }
+        val types = linkedMapOf<String, String>()
+        (member(pair["localCandidateId"], "local-candidate", "candidateType") as? String)?.let { types["local"] = it }
+        (member(pair["remoteCandidateId"], "remote-candidate", "candidateType") as? String)?.let { types["remote"] = it }
+        if (types.isNotEmpty()) out["pair"] = types
+    }
+    stats.values.firstOrNull { (type, m) -> type == "remote-inbound-rtp" && m["kind"] == "audio" }?.second?.let { m ->
+        val remote = linkedMapOf<String, Number>()
+        m.num("fractionLost")?.let { remote["fractionLost"] = Math.round(it * 1000) / 1000.0 }
+        m.num("roundTripTime")?.let { remote["roundTripTimeMs"] = (it * 1000).tenths() }
+        m.num("jitter")?.let { remote["jitterMs"] = (it * 1000).tenths() }
+        if (remote.isNotEmpty()) out["txRemote"] = remote
+    }
+    return out
+}
+
+/** `typ` of an ICE candidate line (`host`/`srflx`/`prflx`/`relay`), without its address. */
+internal fun iceCandidateType(sdp: String): String? = Regex(" typ ([a-z]+)").find(sdp)?.groupValues?.get(1)
+
+/**
  * S70 (iOS `MediaRtpWindow`): the NetEq counters `media.stats` averages over the interval since the
  * previous row of the same PeerConnection. [rtpWindowSample] reads the raw counters; [rtpWindow]
  * diffs two of them. A new PC starts with `before == null` (no window on its first row).

@@ -82,31 +82,48 @@ class AndroidCallMediaSession(
     private val rejoins = AtomicInteger(0)
     /** S73b: `relay` of the last media-options response; a rejoin stays TLS-only iff it was true. */
     @Volatile private var lastOptionsRelay = false
+    private val transportMemory = CallMediaTransportMemory(SharedPreferencesTransportStore(applicationContext))
 
     private class Attempt(val token: Long, val error: Throwable?)
 
     /**
-     * Runs the handshake, publishing exactly one terminal FAILED state. An automatic UDP attempt
-     * that fails for a relay-path reason gets one TLS attempt before the UI ever sees FAILED, so
-     * the controls do not flash between the two tries; an explicit TLS request stays TLS-only.
+     * Runs the handshake, publishing exactly one terminal FAILED state. An automatic (UDP) request
+     * that fails for a relay-path reason gets one attempt on the other transport before the UI ever
+     * sees FAILED, so the controls do not flash between the two tries; an explicit TLS request stays
+     * TLS-only. P2: the UDP start of an automatic request gathers for at most 5 s, and a network where
+     * the TLS fallback was needed within 24 h starts on TLS ([CallMediaTransportMemory]).
      */
     suspend fun connect(callId: String, requested: CallMediaTransport = CallMediaTransport.UDP): Unit =
         withContext(Dispatchers.IO) {
             // S73b：蜂窝也先走 UDP（国内 4G 到 relay-node 的 TLS 不稳）；中转 TURN 只在 TLS 请求且房间在中转节点时由
             // Control 返回（响应 relay:true），UDP 失败后的 TLS 回退自然拿到它。
-            val transport = requested
+            val automatic = requested == CallMediaTransport.UDP
+            val network = if (automatic) currentMediaNetworkSignature(applicationContext) else null
+            val transport = transportMemory.startTransport(network, requested)
+            val learned = transport != requested
             rejoins.set(0)
             lastOptionsRelay = false
-            val first = runAttempt(callId, transport)
-            val firstError = first.error ?: return@withContext
+            val first = runAttempt(
+                callId, transport, CallMediaRelayGatheringPolicy.capMs(transport, fallbackFollows = automatic), learned,
+            )
+            val firstError = first.error
+            if (firstError == null) {
+                if (!learned) transportMemory.forget(network)
+                return@withContext
+            }
             // Only the attempt that is still current may escalate; a superseded one must not steal
             // the session back from whatever replaced it.
-            if (transport == CallMediaTransport.UDP && stateMachine.isCurrent(first.token) &&
-                CallMediaRetryPolicy.shouldRetryTls(firstError)
-            ) {
-                val second = runAttempt(callId, CallMediaTransport.TLS)
-                val secondError = second.error ?: return@withContext
-                finishSetup(second.token, callId, transport, CallMediaTransport.TLS, secondError)
+            if (automatic && stateMachine.isCurrent(first.token) && CallMediaRetryPolicy.shouldRetryTls(firstError)) {
+                // A relay-path failure: the other transport may fix it (normally UDP→TLS; a learned TLS start falls back to UDP).
+                if (learned) transportMemory.forget(network)
+                val fallback = if (transport == CallMediaTransport.UDP) CallMediaTransport.TLS else CallMediaTransport.UDP
+                val second = runAttempt(callId, fallback)
+                val secondError = second.error
+                if (secondError == null) {
+                    if (fallback == CallMediaTransport.TLS) transportMemory.rememberTls(network)
+                    return@withContext
+                }
+                finishSetup(second.token, callId, transport, fallback, secondError)
                 return@withContext
             }
             finishSetup(first.token, callId, transport, transport, firstError)
@@ -135,10 +152,15 @@ class AndroidCallMediaSession(
         else reportTerminal(token, callId, failed, error)
     }
 
-    private suspend fun runAttempt(callId: String, transport: CallMediaTransport): Attempt {
+    private suspend fun runAttempt(
+        callId: String,
+        transport: CallMediaTransport,
+        gatherCapMs: Long = CallMediaRelayGatheringPolicy.CAP_MS,
+        learned: Boolean = false,
+    ): Attempt {
         val token = stateMachine.begin(callId, transport)
         return try {
-            runHandshake(token, callId, transport)
+            runHandshake(token, callId, transport, gatherCapMs = gatherCapMs, learned = learned)
             Attempt(token, null)
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
@@ -151,7 +173,14 @@ class AndroidCallMediaSession(
      * (Control `authorizeUserMedia` → `selectMediaNode(call.media_node_id)`), and a probe right after the
      * network returns fails on the generation change, wasting the attempt (iOS: ~43 s recovery).
      */
-    private suspend fun runHandshake(token: Long, callId: String, transport: CallMediaTransport, rejoin: Boolean = false) {
+    private suspend fun runHandshake(
+        token: Long,
+        callId: String,
+        transport: CallMediaTransport,
+        rejoin: Boolean = false,
+        gatherCapMs: Long = CallMediaRelayGatheringPolicy.CAP_MS,
+        learned: Boolean = false,
+    ) {
         probeSessionIdentity = currentServiceIdentity(applicationContext)
             ?: throw CallMediaStaleAttempt("登录状态已变化")
         val networkGeneration = if (rejoin) probeGeneration.current() else try {
@@ -171,7 +200,8 @@ class AndroidCallMediaSession(
         // S36 C3: 每一步的毫秒都记下来，问题通话的时间线才对得上服务端那一半。
         ClientDiag.log(
             "media.options",
-            mapOf("ms" to diagElapsedMs(optionsStartedAt), "transport" to transport.name, "relay" to options.relay),
+            mapOf("ms" to diagElapsedMs(optionsStartedAt), "transport" to transport.name, "relay" to options.relay) +
+                (if (learned) mapOf("learned" to true) else emptyMap()),
             callId = callId,
         )
         ensureCurrent(token)
@@ -315,7 +345,18 @@ class AndroidCallMediaSession(
                     lastIceFailure.set(summarizeCallIceFailure(event))
                 }
                 override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
-                override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent) = Unit
+                /** Which pair carries the audio (e.g. a Wi-Fi → cellular relay switch); types only, no addresses. */
+                override fun onSelectedCandidatePairChanged(event: CandidatePairChangeEvent) {
+                    ClientDiag.log(
+                        "media.pair",
+                        mapOf(
+                            "local" to iceCandidateType(event.local.sdp), "remote" to iceCandidateType(event.remote.sdp),
+                            "localAdapter" to event.local.adapterType?.name, "reason" to event.reason?.take(60),
+                            "transport" to transport.name,
+                        ),
+                        callId = callId,
+                    )
+                }
                 override fun onAddStream(stream: MediaStream) = Unit
                 override fun onRemoveStream(stream: MediaStream) = Unit
                 override fun onDataChannel(channel: org.webrtc.DataChannel) = Unit
@@ -360,6 +401,7 @@ class AndroidCallMediaSession(
             awaitRelayCandidates(
                 token = token,
                 transport = transport,
+                capMs = gatherCapMs,
                 gatheringComplete = gatheringComplete,
                 relayCandidates = relayCandidates,
                 firstRelayCandidateAt = firstRelayCandidateAt,
@@ -446,6 +488,7 @@ class AndroidCallMediaSession(
     private suspend fun awaitRelayCandidates(
         token: Long,
         transport: CallMediaTransport,
+        capMs: Long,
         gatheringComplete: AtomicBoolean,
         relayCandidates: AtomicInteger,
         firstRelayCandidateAt: AtomicLong,
@@ -463,6 +506,7 @@ class AndroidCallMediaSession(
                 relayCandidateCount = relayCandidates.get(),
                 elapsedMs = nowMs - startMs,
                 sinceFirstRelayCandidateMs = if (firstAt == UNSET_TIME) null else nowMs - firstAt,
+                capMs = capMs,
             )
             when (decision) {
                 CallMediaRelayGatheringPolicy.Decision.PROCEED -> return
@@ -739,10 +783,16 @@ private class MediaResources(
         if (sample != null) window = sample
         ClientDiag.log(
             "media.stats",
-            fields.mapValues { org.json.JSONObject(it.value) } + ("transport" to transport.name) + ("muted" to muted),
+            fields.mapValues { org.json.JSONObject(it.value) } + pathFields(report) +
+                ("transport" to transport.name) + ("muted" to muted),
             callId = callId,
         )
     }
+
+    /** [mediaPath] with nested maps as JSONObject (org.json would otherwise stringify them). */
+    private fun pathFields(report: org.webrtc.RTCStatsReport): Map<String, Any> =
+        mediaPath(report.statsMap.mapValues { it.value.type to it.value.members })
+            .mapValues { (_, value) -> if (value is Map<*, *>) org.json.JSONObject(value) else value }
 
     override fun close() {
         synchronized(lock) {
@@ -756,7 +806,7 @@ private class MediaResources(
         runCatching {
             peer.getStats { report ->
                 val stats = report.statsMap.values.map { it.type to it.members }
-                val fields = mediaRxTx(stats).mapValues { org.json.JSONObject(it.value) }
+                val fields = mediaRxTx(stats).mapValues { org.json.JSONObject(it.value) } + pathFields(report)
                 ClientDiag.log("media.summary", fields + ("transport" to transport.name) + ("rejoins" to rejoins.get()), callId = callId)
             }
         }

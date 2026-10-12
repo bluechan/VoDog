@@ -86,6 +86,13 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LifecycleStartEffect
 import kotlinx.coroutines.launch
+import android.content.ClipData
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONObject
@@ -424,6 +431,10 @@ private fun AllCallsRow(
  * S95b §5 unified call row, shared by 记录 and the 电话 tab's 最近通话: direction icon | name +
  * `number · direction · duration` | line chip (+AiBadge) | HH:mm. The caller supplies click handling.
  */
+/** S96b: short location goes first so end-ellipsis can't drop it; the number follows only under a contact name. */
+internal fun callRowSubline(location: String?, number: String?, kind: String?, failed: String?, duration: String?): String =
+    listOfNotNull(location, number, kind, failed, duration).joinToString(" · ")
+
 @Composable
 internal fun CallRecordRow(
     call: JSONObject,
@@ -476,13 +487,14 @@ internal fun CallRecordRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        listOfNotNull(
+                        callRowSubline(
+                            locationShort(call.remoteLocation()),
                             rowNumber.takeIf { rowName != null },
                             missedLabel ?: s38CallBadgeLabel(call) ?: directionLabel(call.optString("direction")),
                             // A failed call must still say so on the one-line row.
                             callStateLabel("failed").takeIf { call.optString("state") == "failed" && missedLabel == null && !blocked },
                             talkDurationShortLabel(item.answeredAt, item.endedAt),
-                        ).joinToString(" · "),
+                        ),
                         style = MaterialTheme.typography.bodyMedium,
                         color = signal.ink3,
                         maxLines = 1,
@@ -722,7 +734,8 @@ private fun ReportCard(
                 )
             }
             Text(
-                listOf(
+                listOfNotNull(
+                    locationShort(item.remoteLocation), // S96: 标题号码的归属地
                     item.sim.label,
                     directionLabel(item.direction),
                     talkDurationShortLabel(item.answeredAt, item.endedAt) ?: "未接通",
@@ -877,6 +890,9 @@ private fun AiTranscriptSheet(
 @Composable
 private fun DetailHeader(detail: CallDetailUiState) {
     Text(detail.item.remoteNumber.ifBlank { "号码未知" }, style = MaterialTheme.typography.titleMedium, fontFamily = FontFamily.Monospace)
+    detail.item.remoteLocation?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
     Text(
         listOf(
             detail.item.sim.label,
@@ -934,6 +950,7 @@ internal fun RecordingSheet(detail: CallDetailUiState, model: ClientViewModel, o
             RecordingSection(
                 callId = detail.item.callId,
                 recordingStatus = detail.item.recordingStatus,
+                endedAt = detail.item.endedAt,
                 gatewayKind = detail.item.gatewayKind,
                 ownerJoinedLocal = detail.item.ownerJoinedLocal,
                 recordings = detail.recordings,
@@ -963,7 +980,7 @@ private fun TranscriptSection(state: RemoteResource<CallTranscript?>, onRetry: (
             if (transcript == null) Text("这通电话尚无转写任务") else {
                 val text = transcriptStatusText(transcript)
                 when (transcript.status) {
-                    "succeeded" -> TranscriptResultContent(transcript.result)
+                    "succeeded" -> TranscriptResultContent(transcript.result, transcript.dialog)
                     "retry" -> Text(text.orEmpty(), color = warningColor())
                     "failed" -> MessageCard(text.orEmpty())
                     else -> Text(text.orEmpty())
@@ -974,7 +991,7 @@ private fun TranscriptSection(state: RemoteResource<CallTranscript?>, onRetry: (
 }
 
 @Composable
-private fun TranscriptResultContent(result: TranscriptResult?) {
+private fun TranscriptResultContent(result: TranscriptResult?, dialog: TranscriptDialog?) {
     if (result == null) { Text("转写内容尚未生成"); return }
     // S22 决策 10: reports have no admission rules any more, so this is a label on the transcript,
     // not a statement about whether the call "counted". The 报告 card carries the actionable
@@ -997,7 +1014,9 @@ private fun TranscriptResultContent(result: TranscriptResult?) {
         Text("行动项", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         result.actionItems.forEach { Text("• $it") }
     }
-    if (result.segments.isEmpty()) {
+    if (dialog != null && TranscriptDialogPolicy.useDialog(dialog)) {
+        TranscriptDialogView(dialog)
+    } else if (result.segments.isEmpty()) {
         Text(result.text.ifBlank { "转写结果为空" })
     } else {
         val blocks = mergeTranscriptSegments(result.segments)
@@ -1017,11 +1036,90 @@ private fun TranscriptResultContent(result: TranscriptResult?) {
     }
 }
 
+/** S101: Control's merged turns as chat bubbles — 对方 left, 我 / AI right, `mm:ss` from call start. */
+@Composable
+private fun TranscriptDialogView(dialog: TranscriptDialog) {
+    if (TranscriptDialogPolicy.showEstimateNote(dialog)) {
+        Text(TranscriptDialogPolicy.ESTIMATE_NOTE, style = MaterialTheme.typography.bodySmall, color = LocalSignal.current.ink3)
+    }
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp).testTag("transcript.dialog")) {
+        dialog.turns.forEachIndexed { index, turn ->
+            val gap = TranscriptDialogPolicy.spacingDp(dialog.turns.getOrNull(index - 1)?.role, turn.role)
+            TranscriptBubble(turn, Modifier.padding(top = gap.dp))
+        }
+    }
+}
+
+/**
+ * Same interaction as the SMS bubble (S83): long-press opens a menu, here with 「复制」 only. The bubble
+ * cannot sit inside a SelectionContainer — it swallows the long-press. Shape is the Signal SMS bubble
+ * (18, tail corner 6 on the speaker's side).
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun TranscriptBubble(turn: TranscriptTurn, modifier: Modifier = Modifier) {
+    val signal = LocalSignal.current
+    val end = TranscriptDialogPolicy.alignEnd(turn.role)
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var menuOpen by remember(turn) { mutableStateOf(false) }
+    val (fill, ink) = when (TranscriptDialogPolicy.tone(turn.role)) {
+        TranscriptBubbleTone.SURFACE3 -> signal.surface3 to signal.ink
+        TranscriptBubbleTone.BUBBLE_OUT -> signal.bubbleOut to Color.White
+        TranscriptBubbleTone.AI_SOFT -> signal.aiSoft to signal.ink
+    }
+    val shape = if (end) RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp) else RoundedCornerShape(18.dp, 18.dp, 18.dp, 6.dp)
+    Row(modifier.fillMaxWidth(), horizontalArrangement = if (end) Arrangement.End else Arrangement.Start) {
+        Column(Modifier.fillMaxWidth(0.72f), horizontalAlignment = if (end) Alignment.End else Alignment.Start) {
+            TranscriptDialogPolicy.badge(turn.role)?.let {
+                Text(
+                    it,
+                    modifier = Modifier.padding(bottom = 2.dp),
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold, letterSpacing = 0.22.sp),
+                    color = signal.ai,
+                )
+            }
+            Box {
+                Surface(
+                    modifier = Modifier.clip(shape).combinedClickable(
+                        onClick = { menuOpen = true },
+                        onLongClickLabel = "转录操作",
+                        onLongClick = { menuOpen = true },
+                    ).semantics { contentDescription = TranscriptDialogPolicy.speakerLabel(turn.role) }.testTag("transcript.bubble"),
+                    color = fill,
+                    contentColor = ink,
+                    shape = shape,
+                ) {
+                    Text(turn.text, Modifier.padding(horizontal = 12.dp, vertical = 9.dp), style = MaterialTheme.typography.bodyLarge)
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("复制") },
+                        onClick = {
+                            menuOpen = false
+                            scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("转录", turn.text))) }
+                        },
+                        modifier = Modifier.heightIn(min = TouchTarget).testTag("transcript.bubble.menu.copy"),
+                    )
+                }
+            }
+            Text(
+                TranscriptDialogPolicy.clock(turn.atMs),
+                modifier = Modifier.padding(top = 2.dp),
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp, fontFeatureSettings = "tnum"),
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RecordingSection(
     callId: String,
     recordingStatus: String,
+    endedAt: String?,
     gatewayKind: GatewayKind,
     ownerJoinedLocal: Boolean,
     recordings: Map<RecordingSource, RemoteResource<RecordingManifest?>>,
@@ -1043,6 +1141,7 @@ private fun RecordingSection(
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    if (hasNoRecording(recordingStatus, endedAt)) return
     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().heightIn(min = TouchTarget)) {
         RecordingSource.entries.forEachIndexed { index, source ->
             SegmentedButton(

@@ -139,6 +139,12 @@ class S38ClientPolicyTest {
         assertEquals("Mac 端", occupancyPlatformLabel("macos"))
     }
 
+    @Test fun aWatchOccupantIsNamed() {
+        assertEquals("手表端通话", callOccupancyLabel(JSONObject().put("answeredByPlatform", "watchos")))
+        assertEquals("手表端", occupancyPlatformLabel("watchos"))
+        assertEquals("手表端", callOwnerLabel(JSONObject().put("answeredByPlatform", "watchos")))
+    }
+
     @Test fun theOccupancyBannerSaysTheSameThingAsIosAndWeb() {
         val call = call(originatingPlatform = "pixel").put("startedAt", "2026-09-18T01:00:00Z")
         assertEquals("手机通话中", callOccupantLabel(call))

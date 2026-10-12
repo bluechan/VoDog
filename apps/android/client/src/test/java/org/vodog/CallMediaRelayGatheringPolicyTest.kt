@@ -10,7 +10,8 @@ class CallMediaRelayGatheringPolicyTest {
         candidates: Int = 0,
         elapsed: Long,
         sinceFirst: Long? = null,
-    ) = CallMediaRelayGatheringPolicy.decide(complete, candidates, elapsed, sinceFirst)
+        cap: Long = CallMediaRelayGatheringPolicy.CAP_MS,
+    ) = CallMediaRelayGatheringPolicy.decide(complete, candidates, elapsed, sinceFirst, cap)
 
     @Test fun windowsAreOneAndTwelveSeconds() {
         assertEquals(1_000L, CallMediaRelayGatheringPolicy.SETTLE_WINDOW_MS)
@@ -46,5 +47,24 @@ class CallMediaRelayGatheringPolicyTest {
 
     @Test fun capWithALateCandidateProceeds() {
         assertEquals(Decision.PROCEED, decide(candidates = 1, elapsed = 12_000, sinceFirst = 400))
+    }
+
+    @Test fun udpStartWithATlsFallbackGathersForFiveSecondsTheRestTwelve() {
+        val udp = CallMediaTransport.UDP
+        val tls = CallMediaTransport.TLS
+        assertEquals(5_000L, CallMediaRelayGatheringPolicy.capMs(udp, fallbackFollows = true))
+        // The TLS attempt (fallback or learned start), and a UDP attempt nothing follows, keep 12 s.
+        assertEquals(12_000L, CallMediaRelayGatheringPolicy.capMs(tls, fallbackFollows = true))
+        assertEquals(12_000L, CallMediaRelayGatheringPolicy.capMs(tls, fallbackFollows = false))
+        assertEquals(12_000L, CallMediaRelayGatheringPolicy.capMs(udp, fallbackFollows = false))
+    }
+
+    @Test fun shortCapFailsFastWithoutCandidatesAndStillOffersALateOne() {
+        val cap = CallMediaRelayGatheringPolicy.UDP_WITH_FALLBACK_CAP_MS
+        assertEquals(Decision.WAIT, decide(elapsed = 4_950, cap = cap))
+        assertEquals(Decision.NO_RELAY_CANDIDATE, decide(elapsed = 5_000, cap = cap))
+        assertEquals(Decision.PROCEED, decide(candidates = 1, elapsed = 5_000, sinceFirst = 300, cap = cap))
+        // The settle window is unchanged inside the shorter cap.
+        assertEquals(Decision.PROCEED, decide(candidates = 1, elapsed = 1_500, sinceFirst = 1_000, cap = cap))
     }
 }

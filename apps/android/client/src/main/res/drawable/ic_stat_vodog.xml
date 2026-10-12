@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- VoDog status-bar icon: flat white dog-head silhouette (system tints it). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- ears -->
+    <path android:fillColor="#FFFFFFFF" android:pathData="M3,3 L9,6 L6,12 Z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M21,3 L15,6 L18,12 Z" />
+    <!-- head with a cut-out snout -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,5 C16.4,5 19,8.2 19,12.5 C19,17.2 15.8,21 12,21 C8.2,21 5,17.2 5,12.5 C5,8.2 7.6,5 12,5 Z M10.6,15 L13.4,15 L12,16.8 Z M9,10.2 A1.2,1.2 0 1,0 9,12.6 A1.2,1.2 0 1,0 9,10.2 Z M15,10.2 A1.2,1.2 0 1,0 15,12.6 A1.2,1.2 0 1,0 15,10.2 Z" />
+</vector>

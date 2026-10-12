@@ -146,7 +146,8 @@ internal object BadgeNotifier {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(context, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_stat_vodog)
+            .setColor(androidx.core.content.ContextCompat.getColor(context, R.color.vodog_icon_background))
             .setContentTitle("VoDog")
             .setContentText(badgeNotificationText(calls, sms))
             .setNumber(value)

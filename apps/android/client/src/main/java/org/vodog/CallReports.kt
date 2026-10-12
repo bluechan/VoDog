@@ -152,6 +152,8 @@ data class CallReportItem(
     val internal: Boolean = false,
     val peerSimId: String? = null,
     val peerSimLabel: String? = null,
+    /** S96: 号码归属地完整形态；旧 Control = null。 */
+    val remoteLocation: String? = null,
 ) {
     /** S72 E: 「内部通话 A → B」，非内部为 null。 */
     val internalTitle: String?
@@ -211,6 +213,59 @@ data class TranscriptSegment(
     val startMs: Double?,
     val endMs: Double?,
 )
+/** S101: one speaker turn of `transcript.dialog`, already merged and ordered by Control. */
+enum class TranscriptRole(val wire: String) {
+    REMOTE("remote"), ME("me"), AI("ai");
+
+    companion object {
+        fun parse(value: String): TranscriptRole? = entries.firstOrNull { it.wire == value }
+    }
+}
+data class TranscriptTurn(
+    val role: TranscriptRole,
+    val text: String,
+    val atMs: Long,
+    val endAtMs: Long?,
+    val source: String,
+    val track: String?,
+)
+/** S101: `timebase` is `end_aligned` (ASR tracks aligned at hang-up) or `ai_realtime` (Voice's own log). */
+data class TranscriptDialog(val timebase: String, val maxSkewMs: Long, val turns: List<TranscriptTurn>)
+
+enum class TranscriptBubbleTone { SURFACE3, BUBBLE_OUT, AI_SOFT }
+
+/** S101 conversation-view rules (pure, so the bubble layout is unit-testable). */
+internal object TranscriptDialogPolicy {
+    const val ESTIMATE_THRESHOLD_MS = 1_500L
+    const val ESTIMATE_NOTE = "时间为估算"
+
+    /** Old Control (no `dialog`) or an empty one keeps the per-track rendering. */
+    fun useDialog(dialog: TranscriptDialog?): Boolean = dialog != null && dialog.turns.isNotEmpty()
+    fun alignEnd(role: TranscriptRole): Boolean = role != TranscriptRole.REMOTE
+    fun tone(role: TranscriptRole): TranscriptBubbleTone = when (role) {
+        TranscriptRole.REMOTE -> TranscriptBubbleTone.SURFACE3
+        TranscriptRole.ME -> TranscriptBubbleTone.BUBBLE_OUT
+        TranscriptRole.AI -> TranscriptBubbleTone.AI_SOFT
+    }
+    /** Visible label above the bubble: only AI gets 「✦ AI」; side already says 对方 / 我. */
+    fun badge(role: TranscriptRole): String? = if (role == TranscriptRole.AI) "✦ AI" else null
+    fun speakerLabel(role: TranscriptRole): String = when (role) {
+        TranscriptRole.REMOTE -> "对方"
+        TranscriptRole.ME -> "我"
+        TranscriptRole.AI -> "AI"
+    }
+    fun clock(atMs: Long): String {
+        val seconds = atMs.coerceAtLeast(0) / 1_000
+        return "${(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}"
+    }
+    fun spacingDp(previous: TranscriptRole?, role: TranscriptRole): Int = when (previous) {
+        null -> 0
+        role -> 4
+        else -> 12
+    }
+    fun showEstimateNote(dialog: TranscriptDialog): Boolean = dialog.maxSkewMs > ESTIMATE_THRESHOLD_MS
+}
+
 data class TranscriptProvider(
     val track: TranscriptTrack,
     val provider: String,
@@ -284,6 +339,7 @@ data class CallTranscript(
     val createdAt: String,
     val updatedAt: String,
     val completedAt: String?,
+    val dialog: TranscriptDialog? = null,
 )
 
 enum class RecordingSource(val wireValue: String, val label: String) {
@@ -603,6 +659,7 @@ internal fun parseCallHistoryItem(call: JSONObject, sim: JSONObject?): CallRepor
         internal = call.optBoolean("internal"),
         peerSimId = call.nullableString("peerSimId"),
         peerSimLabel = call.nullableString("peerSimLabel"),
+        remoteLocation = call.remoteLocation(),
     )
 }
 
@@ -681,6 +738,7 @@ internal fun parseCallReport(
                 internal = item.optBoolean("internal"),
                 peerSimId = item.nullableString("peerSimId"),
                 peerSimLabel = item.nullableString("peerSimLabel"),
+                remoteLocation = item.remoteLocation(),
             )
         }, requestedPageSize),
     )
@@ -725,6 +783,27 @@ internal fun parseCallTranscript(json: JSONObject): CallTranscript? {
         errorCode = error?.nullableString("code"), errorMessage = error?.nullableString("message"),
         result = result, createdAt = value.getString("createdAt"), updatedAt = value.getString("updatedAt"),
         completedAt = value.nullableString("completedAt"),
+        // S101: optional; older Control omits it, and a malformed one falls back to the per-track view.
+        dialog = value.optJSONObject("dialog")?.let { runCatching { parseTranscriptDialog(it) }.getOrNull() },
+    )
+}
+
+private fun parseTranscriptDialog(json: JSONObject): TranscriptDialog {
+    val turns = json.getJSONArray("turns")
+    return TranscriptDialog(
+        timebase = json.getString("timebase"),
+        maxSkewMs = json.optDouble("maxSkewMs", 0.0).toLong(),
+        turns = List(turns.length()) { turns.getJSONObject(it) }.mapNotNull { turn ->
+            val role = TranscriptRole.parse(turn.getString("role")) ?: return@mapNotNull null
+            TranscriptTurn(
+                role = role,
+                text = turn.getString("text").trim().ifEmpty { return@mapNotNull null },
+                atMs = turn.getDouble("atMs").toLong(),
+                endAtMs = turn.nullableDouble("endAtMs")?.toLong(),
+                source = turn.getString("source"),
+                track = turn.nullableString("track"),
+            )
+        },
     )
 }
 

@@ -642,15 +642,15 @@ class S33BusinessJourneyTest {
         captureEvidence("04-record-delete-confirm")
         clickText("取消")
         compose.onAllNodesWithTag("records.row", useUnmergedTree = true).onFirst().performClick()
-        // S95b detail page: the 转录 card's button reads 查看录音转录; the recording card is an icon button.
-        waitForText("查看录音转录")
+        // S95b detail page: the 转录 card's button reads 查看对话; the recording card is an icon button.
+        waitForText("查看对话")
         fixture.injectFailure(
             "GET",
             "/api/v1/calls/${S33Ids.CALL_RECORDED}/transcript",
             "S33_TRANSCRIPT_TRANSIENT",
             "S33 转录瞬时失败",
         )
-        clickText("查看录音转录")
+        clickText("查看对话")
         waitForText("S33 转录瞬时失败", substring = true)
         fixture.clearFailures()
         clickText("重试")

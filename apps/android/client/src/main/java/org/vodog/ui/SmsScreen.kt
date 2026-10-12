@@ -219,6 +219,10 @@ internal fun SmsPage(
                         onRevealed = { revealedThread = conversation.key.storageKey },
                         onClick = { openConversation = conversation.key.storageKey },
                         onInfo = { model.openContactCard(smsContactCardTarget(conversation)) },
+                        // S97: copying the code from the row marks that message read, like opening the thread.
+                        onCopyCode = {
+                            if (conversation.latest.direction == "incoming") model.markSmsRead(listOf(conversation.latest.id))
+                        },
                         onDelete = { block ->
                             model.deleteSmsThread(
                                 simId = conversation.key.simId,
@@ -286,6 +290,7 @@ private fun ConversationRow(
     onRevealed: () -> Unit,
     onClick: () -> Unit,
     onInfo: () -> Unit,
+    onCopyCode: () -> Unit,
     onDelete: (Boolean) -> Unit,
 ) {
     val latest = conversation.latest
@@ -445,6 +450,10 @@ private fun ConversationRow(
                         )
                         if (!stacked) time()
                     }
+                    // S96: 简短归属地，标题下小字。
+                    locationShort(conversation.remoteLocation)?.let {
+                        Text(it, style = MaterialTheme.typography.labelSmall, color = signal.ink3, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                     if (stacked) time()
                     Text(
                         latest.body.ifBlank { "（空短信）" },
@@ -465,7 +474,10 @@ private fun ConversationRow(
                     }
                     if (code != null) {
                         OutlinedButton(
-                            onClick = { scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("验证码", code))) } },
+                            onClick = {
+                                scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("验证码", code))) }
+                                onCopyCode()
+                            },
                             modifier = Modifier.heightIn(min = TouchTarget).testTag("threads.copyCode"),
                             shape = MaterialTheme.shapes.small,
                             border = BorderStroke(1.dp, signal.line),
@@ -797,20 +809,34 @@ internal fun SmsConversationPage(
                 }
             }
         } else {
-        Box(Modifier.fillMaxWidth().height(56.dp), contentAlignment = Alignment.Center) {
+        // S96: heightIn, not height — the optional 归属地 line (and large font) must grow the bar, not clip.
+        Box(Modifier.fillMaxWidth().heightIn(min = 56.dp), contentAlignment = Alignment.Center) {
             IconButton(
                 onClick = onBack,
                 modifier = Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(TouchTarget),
             ) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回短信", tint = MaterialTheme.colorScheme.primary)
             }
-            Text(
-                phoneNumberTitle(conversation.title),
-                modifier = Modifier.padding(horizontal = 64.dp),
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Column(
+                Modifier.padding(horizontal = 64.dp, vertical = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    phoneNumberTitle(conversation.title),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                locationFull(conversation.remoteLocation)?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             IconButton(
                 onClick = { model.openContactCard(smsContactCardTarget(conversation)) },
                 modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp).size(TouchTarget),

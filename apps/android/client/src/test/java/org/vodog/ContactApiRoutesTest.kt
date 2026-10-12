@@ -53,11 +53,11 @@ class ContactApiRoutesTest {
     }
 
     @Test fun `the contacts list encodes its query and clamps the page size`() {
-        assertEquals("/contacts?limit=200&offset=0", ClientApiRoutes.contacts())
+        assertEquals("/contacts?limit=500&offset=0", ClientApiRoutes.contacts())
         assertEquals("/contacts?limit=50&offset=100", ClientApiRoutes.contacts(limit = 50, offset = 100))
-        assertEquals("/contacts?limit=200&offset=0&query=%E5%BC%A0%20%E4%B8%89", ClientApiRoutes.contacts("  张 三  "))
+        assertEquals("/contacts?limit=500&offset=0&query=%E5%BC%A0%20%E4%B8%89", ClientApiRoutes.contacts("  张 三  "))
         // A caller cannot page past the server's own cap, and a negative offset is not sent.
-        assertEquals("/contacts?limit=200&offset=0", ClientApiRoutes.contacts(limit = 9_999, offset = -5))
+        assertEquals("/contacts?limit=500&offset=0", ClientApiRoutes.contacts(limit = 9_999, offset = -5))
     }
 
     @Test fun `lookup encodes the plus sign so a national number is not smuggled in`() {

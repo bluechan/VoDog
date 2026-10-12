@@ -127,6 +127,10 @@ internal fun HistoryDetailPage(
                         if (item.contactName != null && number.isNotBlank()) {
                             Text(number, style = MaterialTheme.typography.bodyLarge, fontFamily = FontFamily.Monospace, color = signal.ink3)
                         }
+                        // S96: 完整归属地，号码之下，正文字体。
+                        item.remoteLocation?.let {
+                            Text(it, style = MaterialTheme.typography.bodyMedium, color = signal.ink3)
+                        }
                     }
                 }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -174,17 +178,18 @@ internal fun HistoryDetailPage(
             // Signal recording card. Playback, source switch and download stay in the existing sheet
             // (it owns manifest loading); no waveform — there is no decoded amplitude data here.
             val signal = LocalSignal.current
+            val noRecording = hasNoRecording(item.recordingStatus, item.endedAt)
             SignalCard("通话录音") {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                     Surface(
                         onClick = { model.openCallDetail(call, HistoryViewerKind.RECORDING) },
-                        enabled = state.networkAvailable,
+                        enabled = state.networkAvailable && !noRecording,
                         shape = RoundedCornerShape(16.dp),
                         color = signal.brand,
                         contentColor = signal.onBrand,
                         modifier = Modifier.size(56.dp).testTag("history.detail.recording"),
                     ) {
-                        Box(contentAlignment = Alignment.Center) { Icon(Icons.Filled.PlayArrow, contentDescription = "查看录音", Modifier.size(30.dp)) }
+                        Box(contentAlignment = Alignment.Center) { Icon(Icons.Filled.PlayArrow, contentDescription = if (noRecording) "无录音" else "查看录音", Modifier.size(30.dp)) }
                     }
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         LinearProgressIndicator(
@@ -215,7 +220,7 @@ internal fun HistoryDetailPage(
                     onClick = { model.openCallDetail(call, HistoryViewerKind.TRANSCRIPT) },
                     enabled = state.networkAvailable,
                     modifier = Modifier.heightIn(min = TouchTarget),
-                ) { Text("查看录音转录") }
+                ) { Text("查看对话") }
             }
         }
         item {
@@ -225,6 +230,7 @@ internal fun HistoryDetailPage(
             ) {
                 Column(Modifier.padding(ScreenPadding), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     DetailFact("号码", callTitle(call))
+                    item.remoteLocation?.let { DetailFact("归属地", it) }
                     DetailFact("号码线路", item.sim.label)
                     DetailFact("方向", directionLabel(item.direction))
                     DetailFact("状态", callStateLabel(call.optString("state")))
@@ -456,6 +462,7 @@ private fun InterceptionRow(item: ClientInterception, sim: ClientSim?, onClick: 
                     PhoneNumberText(numberWithContactName(item.remoteNumber, item.contactName))
                     Text(
                         listOfNotNull(
+                            locationShort(item.remoteLocation), // S96
                             interceptionKindLabel(item.kind),
                             interceptionSimDisplayLabel(item, sim),
                             formatGatewayDateTime(item.occurredAt, interceptionGatewayTimeZone(item, sim)),

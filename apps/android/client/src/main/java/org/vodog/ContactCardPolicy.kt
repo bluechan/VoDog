@@ -21,6 +21,8 @@ data class ContactCardUiState(
     val busy: Boolean = false,
     val message: String = "",
     val status: String = "",
+    /** S96: `contacts/lookup` 顶层 `location`（目标号码的完整归属地）。 */
+    val location: String? = null,
 ) {
     val resolvedContact: ClientContact? get() = (contact as? RemoteResource.Loaded)?.value
     val displayName: String?
@@ -109,9 +111,15 @@ data class DialerLookupState(
     val number: String = "",
     val contactId: String? = null,
     val contactName: String? = null,
+    /** S96: lookup 响应顶层 `location`（完整形态）；旧 Control / 查不到 = null。 */
+    val location: String? = null,
 ) {
     fun hintFor(current: String): String? =
         contactName?.takeIf { it.isNotBlank() && current.trim() == number && number.isNotBlank() }
+
+    /** S96: 提示框里联系人名之后（或单独）显示的归属地完整形态。 */
+    fun locationFor(current: String): String? =
+        locationFull(location)?.takeIf { current.trim() == number && number.isNotBlank() }
 }
 
 /** Debounce before the dialer asks the server who a half-typed number belongs to. */

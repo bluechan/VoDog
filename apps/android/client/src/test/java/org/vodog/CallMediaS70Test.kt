@@ -89,4 +89,53 @@ class CallMediaS70Test {
         )
         assertEquals(null, rtpWindowSample(listOf("inbound-rtp" to mapOf("kind" to "video"))))
     }
+
+    @Test fun pathStatsReadTheSelectedPairAndTheRemoteReportWithoutAddresses() {
+        val stats = mapOf(
+            "T01" to ("transport" to mapOf<String, Any?>("selectedCandidatePairId" to "CPa")),
+            "CPa" to ("candidate-pair" to mapOf<String, Any?>(
+                "localCandidateId" to "La", "remoteCandidateId" to "Ra", "currentRoundTripTime" to 0.0874,
+                "nominated" to true, "state" to "succeeded",
+            )),
+            // A stale nominated pair from the other interface must not win over the transport's selection.
+            "CPb" to ("candidate-pair" to mapOf<String, Any?>(
+                "localCandidateId" to "Lb", "remoteCandidateId" to "Ra", "currentRoundTripTime" to 0.5,
+                "nominated" to true, "state" to "succeeded",
+            )),
+            "La" to ("local-candidate" to mapOf<String, Any?>("candidateType" to "relay", "address" to "203.0.113.9", "relayProtocol" to "udp")),
+            "Lb" to ("local-candidate" to mapOf<String, Any?>("candidateType" to "relay")),
+            "Ra" to ("remote-candidate" to mapOf<String, Any?>("candidateType" to "host", "address" to "198.51.100.7")),
+            "RI" to ("remote-inbound-rtp" to mapOf<String, Any?>(
+                "kind" to "audio", "fractionLost" to 0.0234375, "roundTripTime" to 0.0912, "jitter" to 0.0031,
+            )),
+            "RV" to ("remote-inbound-rtp" to mapOf<String, Any?>("kind" to "video", "fractionLost" to 0.9)),
+        )
+        val path = mediaPath(stats)
+        assertEquals(87.4, path["rttMs"])
+        assertEquals(mapOf("local" to "relay", "remote" to "host"), path["pair"])
+        assertEquals(mapOf("fractionLost" to 0.023, "roundTripTimeMs" to 91.2, "jitterMs" to 3.1), path["txRemote"])
+        assertEquals(setOf("rttMs", "pair", "txRemote"), path.keys)
+        assertEquals(false, path.toString().contains("203.0.113") || path.toString().contains("198.51.100"))
+    }
+
+    @Test fun pathStatsFallBackToTheNominatedPairAndOmitWhatIsMissing() {
+        val nominated = mediaPath(mapOf(
+            "CP" to ("candidate-pair" to mapOf<String, Any?>("localCandidateId" to "L", "nominated" to true, "state" to "succeeded", "currentRoundTripTime" to 0.1)),
+            "CPw" to ("candidate-pair" to mapOf<String, Any?>("nominated" to false, "state" to "waiting", "currentRoundTripTime" to 0.9)),
+            "L" to ("local-candidate" to mapOf<String, Any?>("candidateType" to "relay")),
+        ))
+        assertEquals(mapOf("rttMs" to 100.0, "pair" to mapOf("local" to "relay")), nominated)
+        assertEquals(emptyMap<String, Any>(), mediaPath(emptyMap()))
+        // Before ICE connects there is no selected pair and no remote report yet.
+        assertEquals(emptyMap<String, Any>(), mediaPath(mapOf(
+            "T" to ("transport" to mapOf<String, Any?>()),
+            "CPw" to ("candidate-pair" to mapOf<String, Any?>("state" to "in-progress", "currentRoundTripTime" to 0.2)),
+        )))
+    }
+
+    @Test fun iceCandidateTypeKeepsOnlyTheType() {
+        assertEquals("relay", iceCandidateType("candidate:1 1 udp 41885439 203.0.113.9 16801 typ relay raddr 0.0.0.0 rport 0"))
+        assertEquals("host", iceCandidateType("candidate:2 1 udp 2130706431 198.51.100.7 3478 typ host generation 0"))
+        assertEquals(null, iceCandidateType("not a candidate"))
+    }
 }

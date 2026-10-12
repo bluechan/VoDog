@@ -135,6 +135,19 @@ class S22ClientPolicyTest {
         assertNull(talkDurationShortLabel(null, "2026-09-12T02:02:05Z"))
     }
 
+    @Test fun endedCallWithoutMediaShowsNoRecording() {
+        assertEquals("无录音", recordingStatusLabel("none"))
+        assertEquals("无录音", recordingStatusLabel(""))
+        assertEquals("录音处理中", recordingStatusLabel("pending"))
+        assertEquals("录音已生成", recordingStatusLabel("ready"))
+        val ended = "2026-10-09T02:00:48Z"
+        assertTrue(hasNoRecording("none", ended))
+        assertTrue(hasNoRecording("", ended))
+        assertFalse(hasNoRecording("pending", ended))
+        assertFalse(hasNoRecording("ready", ended))
+        assertFalse(hasNoRecording("none", null))
+    }
+
     @Test fun classifierSilenceRendersAsUnclassifiedNotAsSafe() {
         val item = reportItem()
         assertTrue(reportClassificationUnknown(item))

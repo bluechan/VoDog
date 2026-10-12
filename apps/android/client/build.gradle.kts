@@ -34,9 +34,8 @@ if (s33UiTest) {
     }
 }
 
-val vodogRelayApiBaseUrl = providers.gradleProperty("vodogRelayApiBaseUrl")
-    .orElse(providers.gradleProperty("vodogApiBaseUrl"))
-    .orElse("https://relay.example.com:16800/api/v1").get()
+// Optional China-cellular API relay; empty (default) disables it.
+val vodogRelayApiBaseUrl = providers.gradleProperty("vodogRelayApiBaseUrl").orElse("").get().trim()
 fun endpointLiteral(value: String): String {
     val uri = URI(value)
     require(uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.rawUserInfo == null &&
@@ -59,8 +58,9 @@ android {
         versionName = "0.72.0-s95b-signal-ui"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "API_BASE_URL", endpointLiteral(productionApiBaseUrl))
-        // S72b（同 S71 网关）：默认网络是蜂窝时走 relay-node 国内中转。
-        buildConfigField("String", "RELAY_API_BASE_URL", endpointLiteral(vodogRelayApiBaseUrl))
+        // S72b/S98：可选国内中转，仅中国蜂窝（MCC 460）或学到的失败时使用；为空则禁用。
+        buildConfigField("String", "RELAY_API_BASE_URL",
+            if (vodogRelayApiBaseUrl.isEmpty()) "\"\"" else endpointLiteral(vodogRelayApiBaseUrl))
         buildConfigField("boolean", "S33_UI_TEST", "false")
     }
 

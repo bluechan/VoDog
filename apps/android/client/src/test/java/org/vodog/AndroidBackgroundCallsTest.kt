@@ -1,11 +1,14 @@
 package org.vodog
 
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
+import java.io.IOException
 
 class AndroidBackgroundCallsTest {
     private val callId = "11111111-1111-4111-8111-111111111111"
@@ -215,5 +218,82 @@ class AndroidBackgroundCallsTest {
             api.endCall(callId, onlyIfCurrentSessionOwner = true, requiredSession = expected)
         }
         assertEquals(1, requests.size)
+    }
+
+    private fun claimApi(
+        requests: MutableList<ClientRequest>,
+        claim: () -> JSONObject,
+        detail: () -> JSONObject = { error("unexpected GET") },
+    ): Pair<ClientApi, SessionSnapshot> {
+        val sessions = SessionCoordinator(Session("access", "refresh", "caller_test"))
+        val api = ClientApi(sessions, ClientTransport { request ->
+            requests += request
+            when (request.method) {
+                "POST" -> claim()
+                "GET" -> JSONObject().put("call", detail())
+                else -> error("unexpected ${request.method}")
+            }
+        })
+        return api to sessions.snapshot()
+    }
+
+    @Test
+    fun answerClaimsWithOnePostAndNoPriorRead() {
+        val requests = mutableListOf<ClientRequest>()
+        val (api, expected) = claimApi(requests, {
+            JSONObject().put("call", JSONObject().put("id", callId).put("state", "connecting").put("claimedByCurrentSession", true))
+        })
+        claimIncomingCall(api, callId, expected)
+        assertEquals(listOf("POST /calls/$callId/claim"), requests.map { "${it.method} ${it.path}" })
+    }
+
+    @Test
+    fun aClaimConflictIsDefinitiveWithoutARead() {
+        val requests = mutableListOf<ClientRequest>()
+        val (api, expected) = claimApi(requests, { throw ApiError(409, "ALREADY_CLAIMED", "Call is no longer available") })
+        val error = assertThrows(ApiError::class.java) { claimIncomingCall(api, callId, expected) }
+        assertEquals(409, error.status)
+        assertEquals(1, requests.size)
+    }
+
+    @Test
+    fun aNetworkFailedClaimIsSettledByOneRead() {
+        val requests = mutableListOf<ClientRequest>()
+        val landed = claimApi(requests, { throw IOException("read timed out") }, {
+            JSONObject().put("id", callId).put("state", "connecting").put("claimedByCurrentSession", true)
+        })
+        claimIncomingCall(landed.first, callId, landed.second)
+        assertEquals(listOf("POST", "GET"), requests.map { it.method })
+
+        requests.clear()
+        val lost = claimApi(requests, { throw IOException("read timed out") }, {
+            JSONObject().put("id", callId).put("state", "connecting").put("claimedByCurrentSession", false)
+        })
+        assertThrows(IOException::class.java) { claimIncomingCall(lost.first, callId, lost.second) }
+        assertEquals(listOf("POST", "GET"), requests.map { it.method })
+    }
+
+    @Test
+    fun claimedAnswerSkipsTheConnectReadButKeepsTheSessionFence() = runBlocking {
+        val sessions = SessionCoordinator(Session("access", "refresh", "caller_test"))
+        val epoch = sessions.snapshot().epoch
+        var reads = 0
+        val read: suspend () -> JSONObject? = {
+            reads += 1
+            JSONObject().put("state", "connecting").put("claimedByCurrentSession", true)
+        }
+        assertTrue(mediaConnectPermitted(sessions, epoch, claimed = true, readCall = read))
+        assertEquals(0, reads)
+        // ACTION_CONNECT / retry still read the call.
+        assertTrue(mediaConnectPermitted(sessions, epoch, claimed = false, readCall = read))
+        assertEquals(1, reads)
+        assertFalse(mediaConnectPermitted(sessions, epoch, claimed = false) {
+            JSONObject().put("state", "ending").put("claimedByCurrentSession", true)
+        })
+        assertFalse(mediaConnectPermitted(sessions, epoch, claimed = false) { null })
+        // A replaced login fences the claimed path too.
+        sessions.clear()
+        assertFalse(mediaConnectPermitted(sessions, epoch, claimed = true, readCall = read))
+        assertEquals(1, reads)
     }
 }

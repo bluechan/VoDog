@@ -23,6 +23,16 @@ internal fun numberWithContactName(number: String, contactName: String?): String
     return "$shown · $name"
 }
 
+/** S96: 归属地完整形态 = 服务端字符串原样；空 / 空白 / "null" → 无（不占位）。 */
+internal fun locationFull(value: String?): String? = value?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+
+/** S96: 简短形态 = 第一个 ` · ` 之前（`广东 深圳 · 移动` → `广东 深圳`，`加纳` → `加纳`）。 */
+internal fun locationShort(value: String?): String? =
+    locationFull(value)?.substringBefore(" · ")?.trim()?.takeIf(String::isNotEmpty)
+
+/** S96: 通话 / 短信 / 拦截 / 报告 DTO 上可选的 `remoteLocation`，旧 Control 不发 = null。 */
+internal fun JSONObject.remoteLocation(): String? = if (isNull("remoteLocation")) null else locationFull(optString("remoteLocation"))
+
 /**
  * `姓名 · 号码` — the report card's title (S22 客户端合同 puts the name first there, unlike the 通话
  * rows frozen by S21 §F). Falls back to the plain number when there is no contact.
@@ -166,8 +176,13 @@ internal fun recordingStatusLabel(value: String): String = when (value) {
     "recording", "processing", "pending" -> "录音处理中"
     "incomplete" -> "录音不完整"
     "failed" -> "录音失败"
+    "none", "" -> "无录音"
     else -> "录音状态待确认"
 }
+
+/** S118: Control marks an ended call whose gateway never joined media `none`; there is nothing to play. */
+internal fun hasNoRecording(recordingStatus: String, endedAt: String?): Boolean =
+    !endedAt.isNullOrBlank() && recordingStatus in setOf("none", "")
 
 internal fun recordingSourceStatusLabel(value: RemoteResource<RecordingManifest?>?): String = when (value) {
     null, RemoteResource.NotLoaded -> "待加载"

@@ -102,6 +102,8 @@ internal data class ClientSmsMessage(
     val state: String,
     val timestamp: String,
     val raw: JSONObject,
+    /** S96 */
+    val remoteLocation: String? = null,
 ) {
     val conversationKey = SmsConversationKey(simId, conversationAddress)
 }
@@ -129,6 +131,7 @@ internal fun JSONObject.toClientSmsMessage(): ClientSmsMessage {
         timestamp = listOf("deliveredAt", "sentAt", "receivedAt", "createdAt")
             .firstNotNullOfOrNull { nullableText(it) }.orEmpty(),
         raw = this,
+        remoteLocation = remoteLocation(),
     )
 }
 
@@ -145,6 +148,9 @@ internal data class SmsConversation(val key: SmsConversationKey, val messages: L
         get() = messages.asReversed().firstNotNullOfOrNull { message ->
             message.raw.toContactAnnotation().takeIf { it != ContactAnnotation.Empty }
         } ?: ContactAnnotation.Empty
+
+    /** S96: 会话归属地 = 最新一条消息的 `remoteLocation`。 */
+    val remoteLocation: String? get() = latest.remoteLocation
 
     /** `号码 · 姓名` for the row and the thread header. */
     val title: String get() = numberWithContactName(key.address, contact.contactName)
@@ -187,7 +193,7 @@ internal fun JSONObject.toCallOccupancy(): CallOccupancy? {
         holdsLock = raw.optBoolean("holdsLock"),
         lockedSince = raw.nullableText("lockedSince"),
         occupantPlatform = raw.nullableText("occupantPlatform")
-            ?.takeIf { it in setOf("ios", "android", "macos", "web", "ai", "pixel") },
+            ?.takeIf { it in setOf("ios", "android", "macos", "watchos", "web", "ai", "pixel") },
         occupantDevice = raw.nullableText("occupantDevice"),
         isCurrentSession = raw.optBoolean("isCurrentSession"),
         canRelease = raw.optBoolean("canRelease"),
@@ -401,6 +407,8 @@ data class ClientContactPhone(
     val e164: String?,
     val label: String?,
     val isPrimary: Boolean,
+    /** S96: 号码归属地完整形态；旧 Control / 未回补 = null。 */
+    val location: String? = null,
 ) {
     val dialNumber: String get() = e164?.takeIf(String::isNotBlank) ?: rawNumber
 }
@@ -475,6 +483,7 @@ internal fun JSONObject.toClientContact(): ClientContact = ClientContact(
             label = phone.nullableText("label"),
             // An older row without an explicit primary still needs one; the first phone wins.
             isPrimary = if (phone.has("isPrimary")) phone.optBoolean("isPrimary") else index == 0,
+            location = locationFull(phone.nullableText("location")),
         )
     },
     emails = jsonObjects("emails").mapNotNull { email ->
@@ -616,6 +625,8 @@ data class ClientInterception(
     val source: String?,
     val simLabel: String? = null,
     val gatewayTimeZone: String? = null,
+    /** S96 */
+    val remoteLocation: String? = null,
 )
 
 internal fun JSONObject.toClientInterception(): ClientInterception = ClientInterception(
@@ -631,6 +642,7 @@ internal fun JSONObject.toClientInterception(): ClientInterception = ClientInter
     source = nullableText("source"),
     simLabel = nullableText("simLabel"),
     gatewayTimeZone = nullableText("gatewayTimeZone"),
+    remoteLocation = remoteLocation(),
 )
 
 /** `lastPowerResult` — what the Pixel reported back about the last remote ON/OFF attempt (§D). */

@@ -28,6 +28,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -208,14 +211,23 @@ internal fun CallPage(state: ClientUiState, model: ClientViewModel, onShowCall: 
                                 }
                             }
                             val matchingName = state.dialerLookup.hintFor(number)
+                            val matchingLocation = state.dialerLookup.locationFor(number)
                             val hintStyle = MaterialTheme.typography.titleSmall
                             val hintHeight = with(LocalDensity.current) { hintStyle.lineHeight.toDp() }
                             Box(
                                 Modifier.fillMaxWidth().height(hintHeight),
                                 contentAlignment = Alignment.Center,
                             ) {
-                                if (matchingName != null) Text(
-                                    matchingName,
+                                val locationColor = LocalSignal.current.ink3
+                                if (matchingName != null || matchingLocation != null) Text(
+                                    // S96: `{联系人} · {完整}` 或 `{完整}`；归属地次要色，仍是固定一行。
+                                    buildAnnotatedString {
+                                        matchingName?.let(::append)
+                                        if (matchingLocation != null) withStyle(SpanStyle(color = locationColor)) {
+                                            if (matchingName != null) append(" · ")
+                                            append(matchingLocation)
+                                        }
+                                    },
                                     style = hintStyle,
                                     color = MaterialTheme.colorScheme.primary,
                                     maxLines = 1,
@@ -520,6 +532,9 @@ internal fun PrimaryOwnedCallControls(
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
     )
+    call.remoteLocation()?.let {
+        Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
     Text(
         "${sim?.displayLabel ?: "SIM"} · 当前登录会话",
         style = MaterialTheme.typography.labelMedium,
@@ -739,6 +754,9 @@ internal fun ActiveCallCard(call: JSONObject, state: ClientUiState, model: Clien
                 Text("当前通话", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.tertiary)
             }
             Text(phoneNumberTitle(callTitle(call)), style = MaterialTheme.typography.headlineSmall)
+            call.remoteLocation()?.let {
+                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Row(Modifier.fillMaxWidth()) {
                 Text(callStateLabel(callState), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.weight(1f))

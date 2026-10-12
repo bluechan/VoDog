@@ -222,8 +222,8 @@ internal fun ClientUiState.autoDismissInfo(): String? = message.takeIf {
 internal fun ClientUiState.withTransientError(text: String): ClientUiState = copy(message = text, transientMessage = text)
 
 /**
- * The outbound call this session placed whose media should start now, or null. Mirrors iOS, which starts
- * media right after dialing: `connecting` already carries early media (S56 ringback). [attempted] makes it
+ * The outbound call this session placed whose media should start now, or null. The list-driven fallback
+ * to [dialResponseMediaStartId] (a dial whose response this process did not act on). [attempted] makes it
  * once per call — a FAILED handshake is retried by the user, never re-fired by the next refresh — and any
  * existing local media session (this call's or another's) blocks without consuming the attempt.
  */
@@ -239,6 +239,25 @@ internal fun outboundMediaAutoStartId(
         call.optString("state") in setOf("connecting", "active") &&
         media.callId == null
 }?.optString("id")
+
+/**
+ * The call a successful dial response hands back, whose media starts right away like iOS and Web: Control
+ * authorizes the dialing session's media from `outgoing_pending` on, and the room is ready before the
+ * gateway's early media (S56) arrives. Same once-only [attempted] set and local-media block as
+ * [outboundMediaAutoStartId]; a replayed dial of a call that already has media starts nothing.
+ */
+internal fun dialResponseMediaStartId(
+    response: JSONObject,
+    media: CallMediaUiState,
+    attempted: Set<String>,
+): String? {
+    val call = response.optJSONObject("call") ?: return null
+    return call.optString("id").takeIf { id ->
+        id.isNotBlank() && id !in attempted && media.callId == null &&
+            call.optString("direction") == "outgoing" &&
+            call.optString("state") in setOf("outgoing_pending", "connecting", "active")
+    }
+}
 
 internal fun clientStateWithInterceptionsPage(
     current: ClientUiState,
@@ -1329,6 +1348,13 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                             OutboundCallReleaseService.track(getApplication(), it)
                         }
                         _state.update { it.copy(busy = false).withInfo(DIALING_ACKNOWLEDGEMENT) }
+                        // As iOS / Web: media starts at the dial response, not at the first `connecting` refresh.
+                        dialResponseMediaStartId(response, ClientCallRuntime.state.value, attemptedOutboundMedia)?.let {
+                            // A refresh in flight may have read `/calls` before this dial committed; its reconcile
+                            // would stop the new media (call not listed). Drop it: `refreshAll()` below reads again.
+                            refreshJob?.cancel()
+                            startOutboundMedia(it, trigger = "dial")
+                        }
                         dialBurst = ClientRefreshCadence.DialBurst(
                             response.optJSONObject("call")?.optString("id")?.takeIf { it.isNotBlank() },
                             SystemClock.elapsedRealtime() + ClientRefreshCadence.DIAL_BURST_WINDOW_MS,
@@ -1524,8 +1550,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private fun autoStartOutboundMedia(items: List<JSONObject>) {
         // The runtime flow, not `_state.media`: the view model copy lags one collector hop behind.
         val callId = outboundMediaAutoStartId(items, ClientCallRuntime.state.value, attemptedOutboundMedia) ?: return
+        startOutboundMedia(callId, trigger = "list")
+    }
+
+    private fun startOutboundMedia(callId: String, trigger: String) {
         attemptedOutboundMedia += callId
-        ClientDiag.log("media.auto_start", mapOf("direction" to "outgoing"), callId = callId)
+        ClientDiag.log("media.auto_start", mapOf("direction" to "outgoing", "trigger" to trigger), callId = callId)
         // Same rule as `connectAfterClaim`: a denied microphone is a FAILED media with a retry, not a silent call.
         if (ContextCompat.checkSelfPermission(getApplication(), Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             mediaPermissionDenied(callId, CallMediaTransport.UDP)
@@ -2489,6 +2519,19 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         refreshContacts(query, debounceMs = CONTACT_SEARCH_DEBOUNCE_MS, preserveSnapshot = false)
     }
 
+    /** S114: pages `GET /contacts` until a short page; the server sorts Latin names first, so one page drops CJK names. */
+    private fun loadAllContacts(query: String = ""): List<JSONObject> {
+        val all = mutableListOf<JSONObject>()
+        var page: List<JSONObject>
+        var pages = 0
+        do {
+            page = clientApi.contacts(search = query, limit = ClientApiRoutes.CONTACTS_PAGE_LIMIT, offset = all.size)
+            all.addAll(page)
+            // ponytail: hard cap 40 pages = 20,000 contacts; beyond that the list is truncated.
+        } while (page.size == ClientApiRoutes.CONTACTS_PAGE_LIMIT && ++pages < 40)
+        return all.distinctBy { it.optString("id") }
+    }
+
     /** Independent from the address book search; epoch guards prevent cross-account results. */
     fun refreshSmsPickerContacts() {
         if (!_state.value.networkAvailable || smsPickerJob?.isActive == true) return
@@ -2496,15 +2539,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         if (expected.session == null) return
         _state.update { it.copy(smsPickerError = "") }
         smsPickerJob = viewModelScope.launch {
-            val result = load {
-                val all = mutableListOf<JSONObject>()
-                var page: List<JSONObject>
-                do {
-                    page = clientApi.contacts(limit = ClientApiRoutes.CONTACTS_PAGE_LIMIT, offset = all.size)
-                    all.addAll(page)
-                } while (page.size == ClientApiRoutes.CONTACTS_PAGE_LIMIT)
-                all.distinctBy { it.optString("id") }
-            }
+            val result = load { loadAllContacts() }
             if (sessions.isCurrent(expected.epoch)) {
                 _state.update { it.copy(
                     smsPickerContacts = remoteListAfterRefresh(it.smsPickerContacts, result),
@@ -2527,7 +2562,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         }
         contactsJob = viewModelScope.launch {
             if (debounceMs > 0) delay(debounceMs)
-            val result = load { clientApi.contacts(query) }
+            val result = load { if (query.isBlank()) loadAllContacts() else clientApi.contacts(query) }
             // A query that changed while the request was in flight has its own job; drop this one.
             if (sessions.isCurrent(expected.epoch) && _state.value.contactQuery == query) {
                 _state.update {
@@ -2787,11 +2822,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         lookupJob = viewModelScope.launch {
             delay(CONTACT_LOOKUP_DEBOUNCE_MS)
             if (!_state.value.networkAvailable) return@launch
-            val item = runCatching { withContext(Dispatchers.IO) { clientApi.lookupContact(trimmed) } }.getOrNull()
+            val (item, location) = runCatching { withContext(Dispatchers.IO) { clientApi.lookupNumber(trimmed) } }
+                .getOrDefault(null to null)
             if (!sessions.isCurrent(expected.epoch)) return@launch
             val contact = item?.let { json -> runCatching { json.toClientContact() }.getOrNull() }
             _state.update {
-                it.copy(dialerLookup = DialerLookupState(trimmed, contact?.id, contact?.displayName))
+                it.copy(dialerLookup = DialerLookupState(trimmed, contact?.id, contact?.displayName, location))
             }
         }
     }
@@ -2810,7 +2846,8 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         val expected = sessions.snapshot().also { if (it.session == null) return }
         val token = contactCardRequests.next(expected.epoch, target.number)
         viewModelScope.launch {
-            val result = runCatching { withContext(Dispatchers.IO) { clientApi.lookupContact(target.number) } }
+            val lookup = runCatching { withContext(Dispatchers.IO) { clientApi.lookupNumber(target.number) } }
+            val result = lookup.map { it.first }
             val latestNumber = _state.value.contactCard?.target?.number.orEmpty()
             if (!contactCardRequests.accepts(token, sessions.snapshot().epoch, latestNumber)) return@launch
             _state.update { state ->
@@ -2830,6 +2867,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                 state.copy(
                     contactCard = card.copy(
                         contact = loaded,
+                        location = lookup.fold({ it.second }, { card.location }),
                         blocked = resolved?.blocked ?: card.blocked,
                         message = result.exceptionOrNull()?.let { "联系人刷新失败：${it.userMessage()}" }.orEmpty(),
                     ),
@@ -3286,6 +3324,7 @@ internal fun callOccupancyLabel(call: JSONObject): String {
     // 所以手机直拨（answeredByPlatform 为 null）必须显式过滤，否则永远读不到 originatingPlatform。
     val platform = when (callPlatformField(call)) {
         "ios" -> "iPhone 端通话"
+        "watchos" -> "手表端通话" // S105: Apple Watch acts through its iPhone session
         "android" -> "Android 端通话"
         "macos" -> "Mac 端通话"
         "web" -> "网页端通话"
@@ -3310,6 +3349,7 @@ private fun callPlatformField(call: JSONObject): String =
 /** The single platform→中文 map behind [callOwnerLabel] and the S20 D6 occupancy notice. */
 internal fun occupancyPlatformLabel(platform: String?, kind: GatewayKind = GatewayKind.PIXEL): String? = when (platform) {
     "ios" -> "iPhone 端"
+    "watchos" -> "手表端"
     "android" -> "Android 端"
     "macos" -> "Mac 端"
     "web" -> "网页端"

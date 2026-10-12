@@ -212,11 +212,10 @@ internal fun ContactsPage(state: ClientUiState, model: ClientViewModel, onDetail
                         selectedId = contact.id
                     }
                 }
-                // The server caps one page at 200 (§A) and this screen does not page; say so rather
-                // than letting a large address book look truncated for no reason.
-                if (contacts.size >= ClientApiRoutes.CONTACTS_PAGE_LIMIT) item {
+                // S114: an empty search loads every page; only a search result is still capped at one page.
+                if (state.contactQuery.isNotBlank() && contacts.size >= ClientApiRoutes.CONTACTS_PAGE_LIMIT) item {
                     Text(
-                        "只显示前 ${ClientApiRoutes.CONTACTS_PAGE_LIMIT} 位联系人，请用搜索缩小范围。",
+                        "只显示前 ${ClientApiRoutes.CONTACTS_PAGE_LIMIT} 个匹配结果，请用搜索缩小范围。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -417,7 +416,7 @@ private fun ContactDetailPage(
                             ContactDetailRow(Icons.Filled.Business, "公司", it)
                         }
                         contact.phones.forEach { phone ->
-                            ContactDetailRow(Icons.Filled.Call, contactLabelText(phone.label), phone.rawNumber, monospace = true)
+                            ContactDetailRow(Icons.Filled.Call, contactLabelText(phone.label), phone.rawNumber, monospace = true, caption = phone.location)
                         }
                         contact.emails.forEach { email ->
                             ContactDetailRow(Icons.Filled.Email, contactLabelText(email.label), email.address)

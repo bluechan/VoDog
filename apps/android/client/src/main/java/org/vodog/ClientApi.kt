@@ -205,8 +205,8 @@ object ClientApiRoutes {
         "/blocklist/interceptions?limit=${limit.coerceIn(1, INTERCEPTIONS_LIMIT)}"
     fun gatewayPower(gatewayId: String) = "/gateways/${encodePathSegment(gatewayId)}/power"
 
-    /** The server caps `GET /contacts` at 200 per page (§A); paging is the client's job. */
-    const val CONTACTS_PAGE_LIMIT = 200
+    /** The server caps `GET /contacts` at 500 per page (S114); paging is the client's job. */
+    const val CONTACTS_PAGE_LIMIT = 500
     const val INTERCEPTIONS_LIMIT = 100
 
     /** `POST /sms/delete` 的服务端上限（S30 §1.2 的 1–500）；更长的选择由客户端切批。 */
@@ -323,13 +323,15 @@ internal class UrlConnectionClientTransport(
         } catch (failure: java.io.IOException) {
             val alternate = ClientEndpoint.alternateUrl(base)
             if (alternate == null || !request.retriesOnAlternate() || !stillWanted()) throw failure
+            val alternateRelay = alternate == ClientEndpoint.relayBaseUrl
             runCatching {
                 ClientDiag.log("api.alternate_retry", mapOf(
-                    "relay" to (alternate == BuildConfig.RELAY_API_BASE_URL), "method" to request.method,
+                    "relay" to alternateRelay, "method" to request.method,
                     "errorType" to failure.javaClass.simpleName,
                 ))
             }
-            return attempt(alternate)
+            // Only a base chosen by [ClientEndpoint] learns (not a transport built with a fixed base).
+            return attempt(alternate).also { if (baseUrl == null) ClientEndpoint.learn(workingRelay = alternateRelay) }
         }
     }
 
@@ -645,9 +647,14 @@ class ClientApi internal constructor(
         List<JSONObject> = collection(ClientApiRoutes.contacts(search, limit, offset))
 
     /** `{item: ContactDto|null}`; a blank/unknown number is a `null` item, not an error. */
-    fun lookupContact(number: String): JSONObject? {
+    fun lookupContact(number: String): JSONObject? = lookupNumber(number).first
+
+    /** S96: `{item, location?}` — the dialer needs the contact and the number's home location together. */
+    fun lookupNumber(number: String): Pair<JSONObject?, String?> {
         val response = request("GET", ClientApiRoutes.contactLookup(number))
-        return if (!response.has("item") || response.isNull("item")) null else response.optJSONObject("item")
+        val item = if (!response.has("item") || response.isNull("item")) null else response.optJSONObject("item")
+        val location = if (response.isNull("location")) null else locationFull(response.optString("location"))
+        return item to location
     }
 
     fun contact(contactId: String): JSONObject =
@@ -898,6 +905,7 @@ class ClientApi internal constructor(
             "POST",
             ClientApiRoutes.mediaOptions(callId),
             // S72b: 中转模式告诉 Control 返回 relay-node TURN（IP + hostname）；旧 Control 的 z.object 会丢弃未知键。
+            // 与 API 基址同一判定（[ClientRelayPolicy]：国内蜂窝，或本网络上测得直连失败）。
             JSONObject().put("transport", transport.wireValue).put("networkGeneration", networkGeneration)
                 .put("relay", ClientEndpoint.relay),
         )

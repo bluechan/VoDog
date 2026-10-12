@@ -36,8 +36,40 @@ class OutboundMediaAutoStartTest {
         val none = CallMediaUiState()
         assertNull(outboundMediaAutoStartId(listOf(call(direction = "incoming")), none, emptySet()))
         assertNull(outboundMediaAutoStartId(listOf(call(claimed = false)), none, emptySet()))
+        // The list path is only the fallback; `outgoing_pending` media starts from the dial response.
         assertNull(outboundMediaAutoStartId(listOf(call(state = "outgoing_pending")), none, emptySet()))
         assertNull(outboundMediaAutoStartId(listOf(call(state = "ending")), none, emptySet()))
+    }
+
+    private fun dialResponse(state: String = "outgoing_pending", direction: String = "outgoing", callId: String = id) =
+        JSONObject().put("call", JSONObject().put("id", callId).put("state", state).put("direction", direction))
+            .put("command", JSONObject())
+
+    @Test fun dialResponseStartsMediaOnceRightAway() {
+        val attempted = mutableSetOf<String>()
+        val none = CallMediaUiState()
+        // 202 for a new dial: the call is still `outgoing_pending`, and media starts now (as iOS / Web).
+        val first = dialResponseMediaStartId(dialResponse(), none, attempted)
+        assertEquals(id, first)
+        attempted += first!!
+        // Never twice: not from a replayed dial response, not from the next `connecting` / `active` refresh.
+        assertNull(dialResponseMediaStartId(dialResponse(), none, attempted))
+        assertNull(outboundMediaAutoStartId(listOf(call()), none, attempted))
+        assertNull(outboundMediaAutoStartId(listOf(call(state = "active")), none, attempted))
+        // A replay (200) of a dial that already moved on still starts once if nothing started it yet.
+        assertEquals(id, dialResponseMediaStartId(dialResponse(state = "connecting"), none, emptySet()))
+    }
+
+    @Test fun dialResponseNeverStartsForIncomingEndedOrBusyMedia() {
+        val none = CallMediaUiState()
+        assertNull(dialResponseMediaStartId(dialResponse(direction = "incoming"), none, emptySet()))
+        assertNull(dialResponseMediaStartId(dialResponse(state = "failed"), none, emptySet()))
+        assertNull(dialResponseMediaStartId(dialResponse(state = "ended"), none, emptySet()))
+        assertNull(dialResponseMediaStartId(dialResponse(callId = ""), none, emptySet()))
+        assertNull(dialResponseMediaStartId(JSONObject(), none, emptySet()))
+        // A replayed dial whose media already runs here (or any other local media) starts nothing.
+        assertNull(dialResponseMediaStartId(dialResponse(), CallMediaUiState(callId = id, phase = CallMediaPhase.CONNECTED), emptySet()))
+        assertNull(dialResponseMediaStartId(dialResponse(), CallMediaUiState(callId = "other", phase = CallMediaPhase.CONNECTING), emptySet()))
     }
 
     @Test fun anExistingLocalMediaSessionBlocksWithoutConsumingTheAttempt() {

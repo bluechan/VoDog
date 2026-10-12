@@ -486,13 +486,16 @@ internal object ClientDiag {
         runCatching {
             val connectivity = app.getSystemService(ConnectivityManager::class.java)
             // S72b: 冷启动（FCM 拉起）的第一条请求早于回调，先同步定一次端点。
-            ClientEndpoint.onDefaultNetwork(transportName(connectivity.getNetworkCapabilities(connectivity.activeNetwork)))
+            val active = connectivity.activeNetwork
+            ClientEndpoint.onDefaultNetwork(
+                transportName(connectivity.getNetworkCapabilities(active)), active?.toString(),
+            ) { chinaCellular(app) }
             connectivity
                 .registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                     override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                        logTransport(caps)
+                        logTransport(app, network, caps)
 
-                    override fun onLost(network: Network) = logTransport(null)
+                    override fun onLost(network: Network) = logTransport(app, null, null)
                 })
         }
         runCatching {
@@ -554,14 +557,32 @@ internal object ClientDiag {
     }
 
     /** `onCapabilitiesChanged` 一秒能来好几次，只有真的换了网才记一条。 */
-    private fun logTransport(caps: NetworkCapabilities?) {
+    private fun logTransport(app: Context, network: Network?, caps: NetworkCapabilities?) {
         val transport = transportName(caps)
-        ClientEndpoint.onDefaultNetwork(transport)
+        ClientEndpoint.onDefaultNetwork(transport, network?.toString()) { chinaCellular(app) }
         val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         val signature = "$transport:$validated"
         if (signature == lastTransport) return
         lastTransport = signature
         log("network.transport", mapOf("transport" to transport, "validated" to validated))
+    }
+
+    /**
+     * [ClientRelayPolicy.chinaCellular] from the default data subscription (no permission needed for the
+     * operator numerics). Only MCC/MNC are read, never logged.
+     */
+    private fun chinaCellular(app: Context): Boolean {
+        val telephony = reading {
+            app.getSystemService(TelephonyManager::class.java)?.let { base ->
+                val data = android.telephony.SubscriptionManager.getDefaultDataSubscriptionId()
+                if (data == android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID) base else base.createForSubscriptionId(data)
+            }
+        }
+        return ClientRelayPolicy.chinaCellular(
+            reading { telephony?.simOperator },
+            reading { telephony?.networkOperator },
+            reading { TimeZone.getDefault().id },
+        )
     }
 
     private fun transportName(caps: NetworkCapabilities?) = when {

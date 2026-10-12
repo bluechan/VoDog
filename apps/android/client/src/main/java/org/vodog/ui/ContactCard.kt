@@ -79,6 +79,10 @@ internal fun ContactCardSheet(state: ClientUiState, model: ClientViewModel) {
             if (card.displayName != null) {
                 PhoneNumberText(card.target.number.ifBlank { "号码未知" })
             }
+            // S96: 目标号码的完整归属地，号码下。
+            locationFull(card.location)?.let {
+                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             contact?.organization?.takeIf(String::isNotBlank)?.let {
                 ContactDetailRow(Icons.Filled.Business, "公司", it)
             }
@@ -235,7 +239,7 @@ internal fun ContactCardSheet(state: ClientUiState, model: ClientViewModel) {
 @Composable
 private fun ContactBody(contact: ClientContact) {
     contact.phones.forEach { phone ->
-        ContactDetailRow(Icons.Filled.Call, contactLabelText(phone.label), phone.rawNumber, monospace = true)
+        ContactDetailRow(Icons.Filled.Call, contactLabelText(phone.label), phone.rawNumber, monospace = true, caption = phone.location)
     }
     contact.emails.forEach { email ->
         ContactDetailRow(Icons.Filled.Email, contactLabelText(email.label), email.address)
@@ -252,7 +256,14 @@ private fun ContactBody(contact: ClientContact) {
 }
 
 @Composable
-internal fun ContactDetailRow(icon: ImageVector, label: String, value: String, monospace: Boolean = false) {
+internal fun ContactDetailRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    monospace: Boolean = false,
+    /** S96: 号码下的归属地等次要说明，空则不占位。 */
+    caption: String? = null,
+) {
     Row(
         Modifier.fillMaxWidth().heightIn(min = TouchTarget),
         verticalAlignment = Alignment.CenterVertically,
@@ -266,6 +277,9 @@ internal fun ContactDetailRow(icon: ImageVector, label: String, value: String, m
                 style = MaterialTheme.typography.bodyLarge,
                 fontFamily = if (monospace) FontFamily.Monospace else null,
             )
+            locationFull(caption)?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }

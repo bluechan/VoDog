@@ -286,10 +286,16 @@ internal object ClientCallRuntime {
         }
     }
 
+    /**
+     * [claimedBy]: the session snapshot whose claim of [callId] just succeeded (answer path), so the
+     * call is known to be ours and the `GET /calls/:id` ownership check is skipped; the session must
+     * still be that one. Null (ACTION_CONNECT, retry) re-reads the call.
+     */
     suspend fun connect(
         context: Context,
         callId: String,
         transport: CallMediaTransport,
+        claimedBy: SessionSnapshot? = null,
     ): CallMediaConnectOutcome {
         val current = _state.value
         if (current.callId != null && current.callId != callId &&
@@ -297,13 +303,12 @@ internal object ClientCallRuntime {
         ) return CallMediaConnectOutcome.REJECTED
         RecordingPlaybackController.get(context).stop()
         val sessions = ClientSessionProcess.coordinator(context)
-        val expected = sessions.snapshot()
+        val expected = claimedBy ?: sessions.snapshot()
         expected.session ?: return CallMediaConnectOutcome.REJECTED
-        val detail = withContext(Dispatchers.IO) { runCatching { ClientApi(sessions).call(callId) }.getOrNull() }
-            ?: return CallMediaConnectOutcome.REJECTED
-        if (!sessions.isCurrent(expected.epoch) || !detail.optBoolean("claimedByCurrentSession") ||
-            detail.optString("state") !in MEDIA_STATES
-        ) return CallMediaConnectOutcome.REJECTED
+        val permitted = mediaConnectPermitted(sessions, expected.epoch, claimed = claimedBy != null) {
+            withContext(Dispatchers.IO) { runCatching { ClientApi(sessions).call(callId) }.getOrNull() }
+        }
+        if (!permitted) return CallMediaConnectOutcome.REJECTED
         attach(context, expected.epoch).connect(callId, transport)
         val completed = _state.value
         if (!sessions.isCurrent(expected.epoch) || completed.callId != callId) {
@@ -341,7 +346,40 @@ internal object ClientCallRuntime {
         handleTerminalFailure(callId, transport, error)
     }
 
-    private val MEDIA_STATES = setOf("outgoing_pending", "connecting", "active")
+    internal val MEDIA_STATES = setOf("outgoing_pending", "connecting", "active")
+}
+
+/**
+ * Whether [ClientCallRuntime.connect] may build media for a call. A call this session just claimed
+ * needs only the staleness check; otherwise [readCall] (`GET /calls/:id`) must show it ours and live.
+ */
+internal suspend fun mediaConnectPermitted(
+    sessions: SessionCoordinator,
+    expectedEpoch: Long,
+    claimed: Boolean,
+    readCall: suspend () -> JSONObject?,
+): Boolean {
+    if (claimed) return sessions.isCurrent(expectedEpoch)
+    val detail = readCall() ?: return false
+    return sessions.isCurrent(expectedEpoch) && detail.optBoolean("claimedByCurrentSession") &&
+        detail.optString("state") in ClientCallRuntime.MEDIA_STATES
+}
+
+/**
+ * Answer-path claim (one request in the common case). Control's claim POST is idempotent for the
+ * session that already holds the call (`connecting`/`active` replay) and answers 409 when the call
+ * is gone or someone else won, so an HTTP answer is definitive. Only a network-level failure leaves
+ * open whether the POST landed; then one `GET /calls/:id` settles it via `claimedByCurrentSession`.
+ * Returns when the call is this session's; otherwise rethrows the claim failure.
+ */
+internal fun claimIncomingCall(api: ClientApi, callId: String, expected: SessionSnapshot) {
+    try {
+        api.claimCall(callId, expected)
+    } catch (failure: Exception) {
+        if (failure is ApiError || failure is SessionChangedException) throw failure
+        val detail = runCatching { api.call(callId, expected) }.getOrNull() ?: throw failure
+        if (!detail.optBoolean("claimedByCurrentSession")) throw failure
+    }
 }
 
 internal enum class CancelledCallDisposition { KEEP_ONGOING, END_LOCAL }
@@ -416,6 +454,51 @@ internal fun incomingVerifyFailureReason(error: Throwable): String = when {
     else -> "not_ringing"
 }
 
+/**
+ * Telecom call scopes by call id, plus a readiness that exists from `ACTION_RING` on. The ring shows
+ * its Answer button before the verify GET (up to 10 s connect + 15 s read) and before Telecom
+ * registration, so an answer in that gap waits up to [readyTimeoutMs] for the scope instead of
+ * finding nothing and ending the call. Pure (no Telecom types) so it unit-tests.
+ */
+internal class TelecomScopeRegistry<T : Any>(private val readyTimeoutMs: Long = ANSWER_READY_TIMEOUT_MS) {
+    private val scopes = ConcurrentHashMap<String, T>()
+    private val ready = ConcurrentHashMap<String, CompletableDeferred<T>>()
+
+    /** Idempotent: a second ring or the registration itself reuses the pending readiness. */
+    fun prepare(callId: String): CompletableDeferred<T> = ready.computeIfAbsent(callId) { CompletableDeferred() }
+
+    fun register(callId: String, scope: T) {
+        scopes[callId] = scope
+        prepare(callId).complete(scope)
+    }
+
+    /** The registered scope, else waits for [prepare]d readiness; null when none, cancelled or timed out. */
+    suspend fun await(callId: String): T? {
+        scopes[callId]?.let { return it }
+        val pending = ready[callId] ?: return null
+        return withTimeoutOrNull(readyTimeoutMs) {
+            try {
+                pending.await()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                if (pending.isCancelled) null else throw cancelled
+            }
+        }
+    }
+
+    /** Telecom disconnected the call: drop its scope (readiness stays until [release]). */
+    fun detach(callId: String): T? = scopes.remove(callId)
+
+    /** The ring ended (verify said no, registration failed or finished): wake any waiting answer with null. */
+    fun release(callId: String) {
+        scopes.remove(callId)
+        ready.remove(callId)?.cancel()
+    }
+
+    companion object {
+        const val ANSWER_READY_TIMEOUT_MS = 5_000L
+    }
+}
+
 internal class AndroidTelecomCalls(
     context: Context,
     private val onAnswer: suspend (String) -> Boolean,
@@ -425,13 +508,17 @@ internal class AndroidTelecomCalls(
     private val calls = CallsManager(context.applicationContext).also {
         it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
     }
-    private val scopes = ConcurrentHashMap<String, CallControlScope>()
-    private val readyScopes = ConcurrentHashMap<String, CompletableDeferred<CallControlScope>>()
+    private val registry = TelecomScopeRegistry<CallControlScope>()
+
+    /** At `ACTION_RING` entry, before the verify GET: an Answer tap from then on waits for registration. */
+    fun prepare(callId: String) { registry.prepare(callId) }
+
+    /** The ring job ended; any answer still waiting returns false. */
+    fun release(callId: String) = registry.release(callId)
 
     suspend fun addIncoming(callId: String, displayName: String) {
         lateinit var control: CallControlScope
-        val ready = CompletableDeferred<CallControlScope>()
-        readyScopes[callId] = ready
+        registry.prepare(callId)
         val attributes = CallAttributesCompat(
             displayName,
             Uri.parse("vodog:$callId"),
@@ -448,7 +535,7 @@ internal class AndroidTelecomCalls(
                 }
             },
             onDisconnect = { cause ->
-                scopes.remove(callId)
+                registry.detach(callId)
                 onDisconnect(callId)
             },
             onSetActive = { control.setActive() },
@@ -456,17 +543,13 @@ internal class AndroidTelecomCalls(
         ) {
             // Core-Telecom 1.0.1 awaits its internal blockingSessionExecution after this DSL returns.
             control = this
-            scopes[callId] = this
-            ready.complete(this)
+            registry.register(callId, this)
         }
-        scopes.remove(callId)
-        readyScopes.remove(callId)?.cancel()
+        registry.release(callId)
     }
 
     suspend fun answer(callId: String): Boolean {
-        val control = scopes[callId] ?: withTimeoutOrNull(5_000) {
-            readyScopes[callId]?.await()
-        } ?: return false
+        val control = registry.await(callId) ?: return false
         if (!onAnswer(callId)) return false
         control.answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL)
         onAnswered(callId)
@@ -475,7 +558,7 @@ internal class AndroidTelecomCalls(
 
     suspend fun disconnect(callId: String, notifyServer: Boolean, cause: Int = DisconnectCause.LOCAL) {
         val (code, label) = transactionalDisconnectCode(cause)
-        scopes.remove(callId)?.disconnect(DisconnectCause(code, label, null, label))
+        registry.detach(callId)?.disconnect(DisconnectCause(code, label, null, label))
         if (notifyServer) onDisconnect(callId)
     }
 }
@@ -502,6 +585,10 @@ internal object ReconcilingCalls {
 }
 
 private data class IncomingCallDisplay(val title: String, val subtitle: String)
+
+/** S96: 响铃通知副标题 `{归属地完整} · {被叫卡} · {网关}`，无归属地时同 S95 之前。 */
+internal fun ringingSubtitle(location: String?, simLabel: String, gateway: String?): String =
+    listOfNotNull(locationFull(location), simLabel, gateway).joinToString(" · ")
 
 /**
  * S79: calls [OngoingCallService] still holds a token for but nothing owns any more — no ringing /
@@ -608,23 +695,30 @@ class OngoingCallService : Service() {
             ACTION_RING -> if (telecomJobs[callId]?.isActive != true) {
                 if (callId in quietCalls) reportOwnerBusy(callId)
                 telecomJobs[callId] = scope.launch {
-                    // null = Control unreachable: ring on the push display, reconcileRingingLoop verifies.
-                    if (verifyIncoming(callId) == false) return@launch stopCall(callId)
-                    authorityJobs[callId] = scope.launch { reconcileRingingUntilSettled(callId) }
-                    runCatching {
-                        telecom.addIncoming(callId, callDisplays[callId]?.title ?: "VoDog 来电")
-                    }.onSuccess {
-                        // S36 C3: 推送到达 → 系统来电界面出现，这一段是「响铃慢/不响」的唯一量尺。
-                        ClientDiag.log(
-                            "telecom.added",
-                            mapOf("ms" to (System.currentTimeMillis() - pushAtMillis).takeIf { pushAtMillis > 0 }),
-                            callId = callId,
-                        )
-                    }.onFailure {
-                        // S36b D1: 系统来电界面没拉起来是「不响铃」的根因，异常本身必须留痕。
-                        // S72b: stopCall 取消本作业是正常收尾，不是故障。
-                        if (it !is kotlinx.coroutines.CancellationException) ClientDiag.appError("telecom.addIncoming", it, callId = callId)
-                        stopCall(callId)
+                    // The notification above already offers Answer; a tap during the verify GET waits
+                    // (≤ 5 s) for the Telecom registration below instead of ending the call.
+                    telecom.prepare(callId)
+                    try {
+                        // null = Control unreachable: ring on the push display, reconcileRingingLoop verifies.
+                        if (verifyIncoming(callId) == false) return@launch stopCall(callId)
+                        authorityJobs[callId] = scope.launch { reconcileRingingUntilSettled(callId) }
+                        runCatching {
+                            telecom.addIncoming(callId, callDisplays[callId]?.title ?: "VoDog 来电")
+                        }.onSuccess {
+                            // S36 C3: 推送到达 → 系统来电界面出现，这一段是「响铃慢/不响」的唯一量尺。
+                            ClientDiag.log(
+                                "telecom.added",
+                                mapOf("ms" to (System.currentTimeMillis() - pushAtMillis).takeIf { pushAtMillis > 0 }),
+                                callId = callId,
+                            )
+                        }.onFailure {
+                            // S36b D1: 系统来电界面没拉起来是「不响铃」的根因，异常本身必须留痕。
+                            // S72b: stopCall 取消本作业是正常收尾，不是故障。
+                            if (it !is kotlinx.coroutines.CancellationException) ClientDiag.appError("telecom.addIncoming", it, callId = callId)
+                            stopCall(callId)
+                        }
+                    } finally {
+                        telecom.release(callId)
                     }
                 }
             }
@@ -686,7 +780,8 @@ class OngoingCallService : Service() {
         startForeground(
             notificationId(callId),
             NotificationCompat.Builder(this, CHANNEL)
-                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setSmallIcon(R.drawable.ic_stat_vodog)
+                .setColor(ContextCompat.getColor(this, R.color.vodog_icon_background))
                 .setContentTitle("VoDog")
                 .setSilent(true)
                 .build(),
@@ -750,15 +845,8 @@ class OngoingCallService : Service() {
             val expected = callSnapshots[callId] ?: return false
             expected.session ?: return false
             withContext(Dispatchers.IO) {
-                val api = ClientApi(sessions)
                 // Failures here throw into the `call.claim` diag below instead of hanging up silently.
-                val detail = api.call(callId, expected)
-                sessions.requireCurrent(expected)
-                if (detail.optBoolean("claimedByCurrentSession")) return@withContext true.also {
-                    ClientCallLiveness.publish(callId, ClientCallLivenessPhase.CLAIMED)
-                }
-                if (detail.optString("state") != "incoming_ringing") return@withContext false
-                api.claimCall(callId, expected)
+                claimIncomingCall(ClientApi(sessions), callId, expected)
                 runCatching { sessions.requireCurrent(expected) }.isSuccess.also { claimed ->
                     if (claimed) ClientCallLiveness.publish(callId, ClientCallLivenessPhase.CLAIMED)
                 }
@@ -823,7 +911,7 @@ class OngoingCallService : Service() {
         val display = IncomingCallDisplay(
             incomingCallTitle(remote, contactName, detail.optBoolean("internal") || callId in internalCalls, detail.optString("peerSimLabel").takeIf { it.isNotBlank() && it != "null" } ?: callPeerLabels[callId])
                 ?: "${numberWithContactName(remote, contactName)} 来电",
-            listOfNotNull(simLabel, gateway).joinToString(" · "),
+            ringingSubtitle(detail.remoteLocation(), simLabel, gateway),
         )
         // 没变就不重发：响铃通知没有 onlyAlertOnce，每 5 s 重发会重复提醒。
         if (callDisplays.put(callId, display) != display) updateNotification(callId, actionTokens[callId], true)
@@ -894,7 +982,8 @@ class OngoingCallService : Service() {
         applyMediaOutcome(
             callId,
             actionTokens[callId],
-            ClientCallRuntime.connect(this, callId, CallMediaTransport.UDP),
+            // Only reached after [claim] succeeded for this snapshot: connect skips its own GET.
+            ClientCallRuntime.connect(this, callId, CallMediaTransport.UDP, claimedBy = callSnapshots[callId]),
         )
     }
 
@@ -1001,7 +1090,8 @@ class OngoingCallService : Service() {
             .build()
         val quiet = ringing && callId in quietCalls
         val builder = NotificationCompat.Builder(this, if (quiet) QUIET_CHANNEL else CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_stat_vodog)
+            .setColor(ContextCompat.getColor(this, R.color.vodog_icon_background))
             .setContentTitle(if (ringing) display?.title ?: "VoDog 来电" else display?.title ?: "VoDog 通话")
             .setContentText(if (ringing) display?.subtitle ?: "正在核验来电" else "${display?.subtitle.orEmpty()} · 通话正在进行".trimStart(' ', '·'))
             .setContentIntent(content)
@@ -1010,7 +1100,8 @@ class OngoingCallService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(
                 NotificationCompat.Builder(this, CHANNEL)
-                    .setSmallIcon(R.drawable.ic_launcher_foreground)
+                    .setSmallIcon(R.drawable.ic_stat_vodog)
+                    .setColor(ContextCompat.getColor(this, R.color.vodog_icon_background))
                     .setContentTitle("VoDog 来电")
                     .setContentText("解锁后查看来电号码")
                     .setCategory(NotificationCompat.CATEGORY_CALL)

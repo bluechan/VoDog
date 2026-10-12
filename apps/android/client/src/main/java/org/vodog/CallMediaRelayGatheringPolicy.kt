@@ -18,15 +18,25 @@ object CallMediaRelayGatheringPolicy {
     /** Hard cap on the whole gathering wait. */
     const val CAP_MS = 12_000L
 
+    /**
+     * Cap for a UDP-first attempt that an automatic TLS attempt follows (as Web P2): a UDP-blocked network
+     * reaches TLS 7 s sooner, and the TLS attempt itself keeps [CAP_MS].
+     */
+    const val UDP_WITH_FALLBACK_CAP_MS = 5_000L
+
     const val POLL_INTERVAL_MS = 50L
 
     enum class Decision { WAIT, PROCEED, NO_RELAY_CANDIDATE }
+
+    fun capMs(transport: CallMediaTransport, fallbackFollows: Boolean): Long =
+        if (transport == CallMediaTransport.UDP && fallbackFollows) UDP_WITH_FALLBACK_CAP_MS else CAP_MS
 
     fun decide(
         gatheringComplete: Boolean,
         relayCandidateCount: Int,
         elapsedMs: Long,
         sinceFirstRelayCandidateMs: Long? = null,
+        capMs: Long = CAP_MS,
     ): Decision {
         if (gatheringComplete) {
             return if (relayCandidateCount > 0) Decision.PROCEED else Decision.NO_RELAY_CANDIDATE
@@ -36,7 +46,7 @@ object CallMediaRelayGatheringPolicy {
         ) {
             return Decision.PROCEED
         }
-        if (elapsedMs >= CAP_MS) {
+        if (elapsedMs >= capMs) {
             return if (relayCandidateCount > 0) Decision.PROCEED else Decision.NO_RELAY_CANDIDATE
         }
         return Decision.WAIT
