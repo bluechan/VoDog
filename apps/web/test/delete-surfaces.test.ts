@@ -489,3 +489,24 @@ test('换一段对话会清掉上一段的选择', async () => {
     renderer?.unmount();
   }
 });
+
+test('S96：短信列表行标题后简短归属地，会话顶部 small 为 {号码（有联系人时）} · {完整}', async () => {
+  const located = thread.map((message, index) => ({...message, remoteLocation: index ? '广东 深圳 · 移动' : '北京 · 移动'}));
+  const small = (renderer: ReactTestRenderer) =>
+    collectText(renderer.root.findAll(node => node.type === 'header' && String(node.props.className).includes('conversation-heading'))[0]!.findByType('small'));
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    renderer = await openConversation({messages: located.map(message => ({...message, contactName: '张三'}))});
+    const row = renderer.root.findAll(node => node.type === 'button' && String(node.props.className || '').includes('thread-row'))[0]!;
+    assert.equal(collectText(row.findAll(node => node.props.className === 'number-location')[0]), ' 广东 深圳');
+    assert.equal(small(renderer), '+12025550110 · 广东 深圳 · 移动');
+    renderer.unmount();
+    renderer = await openConversation({messages: located});
+    assert.equal(small(renderer), '广东 深圳 · 移动 · 使用 家庭卡', '无联系人：归属地 + 原有 SIM 文字');
+    renderer.unmount();
+    renderer = await openConversation({});
+    assert.equal(small(renderer), '使用 家庭卡', '旧 Control：不变');
+  } finally {
+    renderer?.unmount();
+  }
+});

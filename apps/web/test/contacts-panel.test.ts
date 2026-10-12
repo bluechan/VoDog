@@ -81,18 +81,18 @@ test('the 通讯录 list shows names, primary numbers and the blocked badge, and
     assert.match(text, /已屏蔽/);
     assert.match(text, /李四/);
     assert.match(text, /无号码/, 'a contact without phones or emails still says so');
-    assert.deepEqual(paths, ['/contacts?limit=200']);
+    assert.deepEqual(paths, ['/contacts?limit=500']);
 
     const search = renderer!.root.findAll(node => node.type === 'input' && node.props.type === 'search')[0]!;
     await act(async () => {
       search.props.onChange({target: {value: '张'}});
     });
-    assert.deepEqual(paths, ['/contacts?limit=200'], 'typing does not fire a request per keystroke');
+    assert.deepEqual(paths, ['/contacts?limit=500'], 'typing does not fire a request per keystroke');
     await act(async () => {
       await sleep(320);
       await flush();
     });
-    assert.deepEqual(paths, ['/contacts?limit=200', '/contacts?limit=200&query=%E5%BC%A0']);
+    assert.deepEqual(paths, ['/contacts?limit=500', '/contacts?limit=500&query=%E5%BC%A0']);
   } finally {
     renderer?.unmount();
   }

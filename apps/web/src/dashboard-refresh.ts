@@ -20,6 +20,9 @@ export function dashboardRefreshIntervalMs(calls: readonly {state: string}[]): n
     : IDLE_DASHBOARD_REFRESH_MS;
 }
 
+/** S32：短信与角标的独立刷新节奏（前台每 5 s 内发起一次）；通话与 SIM 仍走 1 s / 2 s。 */
+export const MESSAGES_REFRESH_MS = 5000;
+
 export type DashboardRefreshSources<S, C, M> = {
   epoch: () => number;
   loadSims: () => Promise<S>;
@@ -30,65 +33,116 @@ export type DashboardRefreshSources<S, C, M> = {
   applyMessages: (value: M) => void;
 };
 
-/** Applies successful dashboard resources independently and coalesces refresh bursts. */
+type Resource = 'sims' | 'calls' | 'messages';
+/**
+ * Resources whose apply is skipped while the JSON body is unchanged. Sims always apply: every read advances the
+ * S80 settings-freshness observation and restores the SIM load status.
+ */
+const SKIP_UNCHANGED: ReadonlySet<Resource> = new Set(['calls', 'messages']);
+
+/** One coalescing refresh queue over a fixed set of resources. */
+class Lane {
+  sequence = 0;
+  queued = false;
+  inFlight: Promise<boolean> | null = null;
+  readonly resources: readonly Resource[];
+  constructor(resources: readonly Resource[]) { this.resources = resources; }
+}
+
+/**
+ * Applies successful dashboard resources independently and coalesces refresh bursts.
+ *
+ * `request()` reads all three resources (actions, focus, reconnect). The poll uses `requestLive()` (sims + calls)
+ * and `requestMessages()` on separate timers, so a slow SMS paging read never delays the next `/calls` poll.
+ * An older response never overwrites a newer one of the same resource, whichever queue loaded it.
+ */
 export class DashboardRefreshCoordinator<S, C, M> {
   private readonly sources: DashboardRefreshSources<S, C, M>;
-  private sequence = 0;
-  private queued = false;
-  private inFlight: Promise<boolean> | null = null;
+  private readonly all = new Lane(['sims', 'calls', 'messages']);
+  private readonly live = new Lane(['sims', 'calls']);
+  private readonly messages = new Lane(['messages']);
+  private readonly started: Record<Resource, number> = {sims: 0, calls: 0, messages: 0};
+  private readonly applied: Record<Resource, number> = {sims: 0, calls: 0, messages: 0};
+  private readonly signatures = new Map<Resource, string>();
 
   constructor(sources: DashboardRefreshSources<S, C, M>) { this.sources = sources; }
 
   invalidate() {
-    this.sequence++;
-    this.queued = false;
+    for (const lane of [this.all, this.live, this.messages]) {
+      lane.sequence++;
+      lane.queued = false;
+    }
+    this.signatures.clear();
   }
 
-  request(): Promise<boolean> {
-    if (this.inFlight) {
-      this.queued = true;
-      return this.inFlight;
+  request(): Promise<boolean> { return this.enqueue(this.all); }
+  requestLive(): Promise<boolean> { return this.enqueue(this.live); }
+  requestMessages(): Promise<boolean> { return this.enqueue(this.messages); }
+
+  private enqueue(lane: Lane): Promise<boolean> {
+    if (lane.inFlight) {
+      lane.queued = true;
+      return lane.inFlight;
     }
-    const operation = this.drain();
+    const operation = this.drain(lane);
     const tracked = operation.finally(() => {
-      if (this.inFlight === tracked) this.inFlight = null;
+      if (lane.inFlight === tracked) lane.inFlight = null;
     });
-    this.inFlight = tracked;
+    lane.inFlight = tracked;
     return tracked;
   }
 
-  private async drain(): Promise<boolean> {
+  private async drain(lane: Lane): Promise<boolean> {
     let applied = false;
     let lastError: unknown;
     do {
-      this.queued = false;
+      lane.queued = false;
       try {
-        applied = (await this.once()) || applied;
+        applied = (await this.once(lane)) || applied;
         lastError = undefined;
       } catch (error) {
         lastError = error;
       }
-    } while (this.queued);
+    } while (lane.queued);
     if (lastError !== undefined) throw lastError;
     return applied;
   }
 
-  private async once(): Promise<boolean> {
+  private load(resource: Resource): Promise<unknown> {
+    return resource === 'sims' ? this.sources.loadSims() : resource === 'calls' ? this.sources.loadCalls() : this.sources.loadMessages();
+  }
+
+  private commit(resource: Resource, value: unknown) {
+    if (resource === 'sims') this.sources.applySims(value as S);
+    else if (resource === 'calls') this.sources.applyCalls(value as C);
+    else this.sources.applyMessages(value as M);
+  }
+
+  private async once(lane: Lane): Promise<boolean> {
     const epoch = this.sources.epoch();
-    const sequence = ++this.sequence;
-    const current = () => epoch === this.sources.epoch() && sequence === this.sequence;
-    const apply = async <T>(load: () => Promise<T>, commit: (value: T) => void) => {
-      const value = await load();
-      if (!current()) return false;
-      commit(value);
+    const sequence = ++lane.sequence;
+    const current = () => epoch === this.sources.epoch() && sequence === lane.sequence;
+    const apply = async (resource: Resource) => {
+      const ticket = ++this.started[resource];
+      let value: unknown;
+      try {
+        value = await this.load(resource);
+      } catch (error) {
+        if (current()) this.signatures.delete(resource);
+        throw error;
+      }
+      if (!current() || ticket < this.applied[resource]) return false;
+      this.applied[resource] = ticket;
+      if (SKIP_UNCHANGED.has(resource)) {
+        const signature = JSON.stringify(value);
+        if (signature === this.signatures.get(resource)) return true;
+        this.signatures.set(resource, signature);
+      }
+      this.commit(resource, value);
       return true;
     };
-    const results = await Promise.allSettled([
-      apply(this.sources.loadSims, this.sources.applySims),
-      apply(this.sources.loadCalls, this.sources.applyCalls),
-      apply(this.sources.loadMessages, this.sources.applyMessages),
-    ]);
-    if (epoch !== this.sources.epoch() || sequence !== this.sequence) return false;
+    const results = await Promise.allSettled(lane.resources.map(apply));
+    if (epoch !== this.sources.epoch() || sequence !== lane.sequence) return false;
     const failure = results.find(result => result.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
     return results.some(result => result.status === 'fulfilled' && result.value);

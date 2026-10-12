@@ -377,6 +377,7 @@ test('S58: row owner shows platform labels, never raw ids',async()=>{
  const base={id:'c',direction:'outgoing',state:'ended',startedAt:'2026-09-24T00:00:00Z',simId:'s'} as any;
  assert.equal(callRowOwner({...base,originatingPlatform:'macos'}),'Mac 端');
  assert.equal(callRowOwner({...base,direction:'incoming',answeredByPlatform:'ios'}),'iPhone 端');
+ assert.equal(callRowOwner({...base,direction:'incoming',answeredByPlatform:'watchos'}),'手表端');
  assert.equal(callRowOwner({...base,originatingPlatform:'pixel',gatewayKind:'dji4g'}),'通过 DJI 4G 模组拨打');
  assert.equal(callRowOwner({...base,originatingPlatform:'some_new_platform'}),undefined,'S95b §C: an unknown platform id is not shown raw');
 });
@@ -524,7 +525,10 @@ test('S95 宽屏：列表行不挂录音/转录，选中后详情面板打开，
     await act(async()=>{const row=rows(renderer!)[0]!;row.props.onKeyDown({key:'Enter',target:row,currentTarget:row,preventDefault(){}});await flush();});
     assert.equal(rows(renderer!)[0]!.props['aria-current'],'true');
     assert.deepEqual(opened,[id]);
-    assert.equal(renderer!.root.findAll(node=>node.type==='button'&&collectText(node)==='收起 AI 对话').length,1);
+    assert.equal(renderer!.root.findAll(node=>node.type==='button'&&collectText(node)==='收起 AI 实时对话').length,1);
+    const recordingCard=renderer!.root.find(node=>node.type==='section'&&String(node.props.className).includes('call-detail-recording'));
+    assert.equal(recordingCard.findAll(node=>node.type==='button'&&node.props['aria-expanded']!==undefined).length,0,'S101: the recording card has no open/close toggle');
+    assert.equal(recordingCard.findAll(node=>node.props?.className==='recording-sources').length,1,'S101: source switch shown without a click');
     assert.ok(paths.includes(`/calls/${id}/ai-transcript`),'the detail pane opens the AI transcript on select');
   }finally{
     renderer?.unmount();
@@ -542,4 +546,37 @@ test('S95b §C：未知状态不显示原始枚举',async()=>{
     assert.doesNotMatch(text,/weird_internal_state/);
     assert.match(text,/呼出 · 状态待核实/);
   }finally{renderer?.unmount();}
+});
+
+test('S96：记录行在号码后显示简短归属地（无联系人时也有），未接行归属地不变红；详情头显示完整形态',async()=>{
+  const {CallList,CallHistoryPanel}=await load<typeof import('../src/call-history-panel.tsx')>('/src/call-history-panel.tsx');
+  const located:Call[]=[
+    {...calls[0]!,id:'33000000-0000-4000-8000-000000000096',remoteLocation:'广东 深圳 · 移动'},
+    {...calls[1]!,remoteLocation:'北京 · 联通'},
+    {...calls[0]!,id:'call-missed',contactName:undefined,answeredAt:undefined,remoteLocation:'加纳'},
+  ];
+  const locations=(node:ReactTestRenderer['root'])=>node.findAll(n=>n.props?.className==='number-location');
+  let renderer:ReactTestRenderer|undefined;
+  try{
+    await act(async()=>{renderer=create(React.createElement(CallList,{calls:[...located,calls[1]!],sims,busy:false}));});
+    const [named,bare,missed,legacy]=rows(renderer!);
+    assert.match(collectText(named),/2025550117广东 深圳呼入/);
+    assert.equal(collectText(locations(bare!)[0]),'北京','无联系人时号码是标题，归属地仍在第二行');
+    assert.equal(locations(missed!)[0]!.type,'small');
+    assert.doesNotMatch(String(locations(missed!)[0]!.props.className),/missed/);
+    assert.equal(locations(legacy!).length,0,'旧 Control 无字段：不占位');
+  }finally{renderer?.unmount();}
+  const priorFetch=globalThis.fetch;globalThis.fetch=async()=>new Response('{}',{status:404});
+  Object.defineProperty(globalThis,'matchMedia',{configurable:true,value:()=>({matches:true,addEventListener(){},removeEventListener(){}})});
+  try{
+    await act(async()=>{renderer=create(React.createElement(CallHistoryPanel,{request:stub([],()=>({items:located,total:3,totalPages:1})),simId:'sim-1',sims,busy:false}));});
+    await act(async()=>{await flush();});
+    await act(async()=>{const row=rows(renderer!)[0]!;row.props.onKeyDown({key:'Enter',target:row,currentTarget:row,preventDefault(){}});await flush();});
+    const meta=renderer!.root.findAll(n=>n.props?.className==='call-detail-meta')[0]!;
+    assert.match(collectText(meta),/2025550117广东 深圳 · 移动/);
+  }finally{
+    renderer?.unmount();
+    Reflect.deleteProperty(globalThis,'matchMedia');
+    globalThis.fetch=priorFetch;
+  }
 });

@@ -9,14 +9,14 @@ import {AiTranscript,clockOffset} from './ai-transcript';
 import {HistoryCallActions} from './history-call-actions';
 import {browserSessionGeneration,expireBrowserSession} from './session-boundary';
 import {formatCompactCallDate,gatewayCalendarDate,gatewayDisplayTimeZone,shiftCalendarDate} from './gateway-time';
-import {mergeTranscriptSegments,transcriptTrackLabel,type TranscriptSegment} from './transcript-text';
-import type {ApiRequest} from './contacts';
+import {mergeTranscriptSegments,transcriptTrackLabel,type TranscriptDialog,type TranscriptSegment} from './transcript-text';
+import {locationShort,type ApiRequest} from './contacts';
 import {callShowsDot} from './badges';
 import {internalCallRoute} from './call-occupancy';
 
 const NO_IDS:ReadonlySet<string>=new Set();
 
-type Transcript={status:string;nextAttemptAt?:string;error?:{code:string};result?:{text:string;summary?:string;actionItems?:string[];segments?:TranscriptSegment[]}};
+type Transcript={status:string;nextAttemptAt?:string;error?:{code:string};result?:{text:string;summary?:string;actionItems?:string[];segments?:TranscriptSegment[]};/** S101; missing on an older Control. */dialog?:TranscriptDialog|null};
 
 /** `GET /api/v1/reports/calls` item (S22 接口合同). Every S22 addition is optional: an older Control omits it. */
 export type ReportTranscriptState='none'|'queued'|'running'|'retry'|'succeeded'|'failed';
@@ -27,6 +27,8 @@ export type ReportItem={
  endedAt?:string|null;
  direction:string;
  remoteNumber?:string|null;
+ /** S96 归属地（完整形态）。 */
+ remoteLocation?:string|null;
  contactName?:string|null;
  contactId?:string|null;
  blocked?:boolean;
@@ -97,8 +99,26 @@ function TranscriptDetail({callId}:{callId:string}){
  if(value.status==='failed')return <p role="status">转录失败，原始录音仍可查看。</p>;
  if(value.status!=='succeeded')return <p role="status">{value.status==='retry'?'转录暂时失败，正在等待重试。':'转录处理中…'}</p>;
  if(!value.result)return <p>转录结果暂不可用。</p>;
+ const actions=(value.result.actionItems??[]).filter(item=>item.trim());
+ const head=<>{value.result.summary&&<p className="transcript-summary"><strong>摘要</strong>{value.result.summary}</p>}{actions.length>0&&<ul className="transcript-actions">{actions.map((item,index)=><li key={index}>{item}</li>)}</ul>}</>;
+ if(value.dialog?.turns?.length)return <div className="transcript-detail">{head}<TranscriptDialogView dialog={value.dialog}/><p className="note">机器转录供参考，可对照原始录音核实。</p></div>;
  const blocks=mergeTranscriptSegments(value.result.segments);
- return <div className="transcript-detail">{value.result.summary&&<p className="transcript-summary"><strong>摘要</strong>{value.result.summary}</p>}{blocks.length?blocks.map((block,index)=><p key={index} className="transcript-line"><span className="transcript-time num">{typeof block.startMs==='number'?clockOffset(block.startMs):''}</span><strong className={block.speaker==='ai'?'speaker-ai':undefined}>{speakerLabel(block.track,block.speaker)}</strong><span className="transcript-text">{block.text}</span></p>):<p>{value.result.text}</p>}<p className="note">机器转录供参考，可对照原始录音核实。</p></div>;
+ return <div className="transcript-detail">{head}{blocks.length?blocks.map((block,index)=><p key={index} className="transcript-line"><span className="transcript-time num">{typeof block.startMs==='number'?clockOffset(block.startMs):''}</span><strong className={block.speaker==='ai'?'speaker-ai':undefined}>{speakerLabel(block.track,block.speaker)}</strong><span className="transcript-text">{block.text}</span></p>):<p>{value.result.text}</p>}<p className="note">机器转录供参考，可对照原始录音核实。</p></div>;
+}
+const DIALOG_ROLE_LABEL={remote:'对方',me:'我',ai:'AI'} as const;
+/** S101 conversation: SMS bubble shapes (对方 left on surface3, 我 right on bubbleOut, AI right on aiSoft + ✦ AI) and `mm:ss` from call start. */
+export function TranscriptDialogView({dialog}:{dialog:TranscriptDialog}){
+ return <div className="transcript-dialog">
+  {dialog.maxSkewMs>1500&&<p className="note transcript-estimate">时间为估算</p>}
+  {dialog.turns.map((turn,index)=>{
+   const time=clockOffset(turn.atMs);
+   return <article key={index} aria-label={`${DIALOG_ROLE_LABEL[turn.role]} ${time}`} className={'message-bubble '+(turn.role==='remote'?'incoming':turn.role==='ai'?'outgoing ai':'outgoing')+(dialog.turns[index-1]?.role===turn.role?' turn-follow':'')}>
+    {turn.role==='ai'&&<span className="ai-badge"><span aria-hidden="true">✦</span><span>AI</span></span>}
+    <p>{turn.text}</p>
+    <small className="num">{time}</small>
+   </article>;
+  })}
+ </div>;
 }
 /** Transcript lines read 对方 / 我 (S95); other tracks keep their full track name. */
 function speakerLabel(track:string,speaker?:string):string{
@@ -382,7 +402,7 @@ export function CallReports({
         <time dateTime={item.startedAt}>{formatCompactCallDate(item.startedAt,itemZone)}</time>
        </div>
        <p className="report-meta">
-        {simLabel(item.sim)} · {item.direction==='outgoing'?'呼出':'呼入'} · {callDurationLabel(item)} · {answerModeLabel(item)}
+        {simLabel(item.sim)} · {locationShort(item.remoteLocation)&&<><span className="number-location">{locationShort(item.remoteLocation)}</span> · </>}{item.direction==='outgoing'?'呼出':'呼入'} · {callDurationLabel(item)} · {answerModeLabel(item)}
         {reportTags(item).map(tag=><span key={tag} className={'record-tag'+(tag==='AI 对话'?' tag-ai':'')}>{tag}</span>)}
        </p>
        {/* `false` is a classified, harmless call and wears no pill at all. */}
@@ -398,7 +418,7 @@ export function CallReports({
        {/* Same order as a 全部通话 row: 回拨 → 发短信 → 更多(屏蔽) → 查看录音 → 查看转录. */}
        <HistoryCallActions remoteNumber={remote||undefined} simId={item.sim?.id} mediaLive={mediaLive} busy={busy} blocked={Boolean(item.blocked)} onRedial={()=>onRedial?.(item)} onSms={()=>onSms?.(item)} onBlock={()=>blockNumber(item)}/>
        <div className="record-media-actions" role="group" aria-label="录音与转录" onClickCapture={()=>onOpen?.(item)}>
-        <CallRecording callId={item.callId} timeZone={itemZone} request={request} preferPixelSource={preferPixelSource(item)} ownerJoinedLocal={item.ownerJoinedLocal} gatewayKind={item.gatewayKind}/>
+        <CallRecording callId={item.callId} timeZone={itemZone} request={request} preferPixelSource={preferPixelSource(item)} ownerJoinedLocal={item.ownerJoinedLocal} gatewayKind={item.gatewayKind} recordingStatus={item.recordingStatus}/>
         {aiFirst?<AiTranscriptToggle callId={item.callId} request={request}/>:<CallTranscript callId={item.callId} request={request}/>}
        </div>
       </article>

@@ -17,19 +17,20 @@ const recordingPlayers=new Set<()=>void>();
 function registerRecordingPlayer(pause:()=>void,dispose:()=>void){recordingPlayers.add(pause);const unregister=audioOwnership.registerPlayer(dispose);return()=>{recordingPlayers.delete(pause);unregister();};}
 function claimRecordingPlayer(owner:()=>void){for(const stop of [...recordingPlayers])if(stop!==owner)stop();}
 /** `preferPixelSource`：S38 手机直拨的通话没有 media_node 那一路，录音只在 Pixel 归档里，默认就打开它。 */
-export function CallRecording({callId,timeZone,request,preferPixelSource=false,ownerJoinedLocal=false,gatewayKind,initialOpen=false}:{callId:string;timeZone?:string;request?:ApiRequest;preferPixelSource?:boolean;ownerJoinedLocal?:boolean;gatewayKind?:string|null;/** 记录 detail pane: open on mount (still closes when a call starts). */initialOpen?:boolean}){
- const callActiveNow=audioOwnership.isCallActive();
- const [opened,setOpened]=useState(()=>initialOpen&&!callActiveNow),[source,setSource]=useState<RecordingSource>(preferPixelSource?'pixel':'media_node');
+export function CallRecording({callId,timeZone,request,preferPixelSource=false,ownerJoinedLocal=false,gatewayKind,alwaysOpen=false,recordingStatus}:{callId:string;timeZone?:string;request?:ApiRequest;preferPixelSource?:boolean;ownerJoinedLocal?:boolean;gatewayKind?:string|null;/** S101 记录 detail card: no toggle; hidden only while a call is live or the call is gone. */alwaysOpen?:boolean;/** S118: pass only for a terminal call — live calls are 'none' until media pins. 'none' = the call never had a recording (Control settles pending calls the gateway never bound). */recordingStatus?:string|null}){
+ const [opened,setOpened]=useState(false),[source,setSource]=useState<RecordingSource>(preferPixelSource?'pixel':'media_node');
  const [missingNotice,setMissingNotice]=useState('');
  const callActive=useSyncExternalStore(audioOwnership.subscribe,audioOwnership.isCallActive);
  const zone=gatewayDisplayTimeZone(timeZone);
  useEffect(()=>audioOwnership.registerPlayer(()=>setOpened(false)),[]);
+ const shown=alwaysOpen?!callActive&&!missingNotice:opened;
+ if(recordingStatus==='none')return <div className="call-recording">{alwaysOpen?<p className="note">本次通话没有录音</p>:<button className="passkey" disabled>无录音</button>}</div>;
  return <div className="call-recording">
-  <button className="passkey" disabled={callActive} aria-expanded={opened} onClick={()=>{setMissingNotice('');setOpened(value=>!value);}}>{opened?'收起录音':'查看录音'}</button>
+  {!alwaysOpen&&<button className="passkey" disabled={callActive} aria-expanded={opened} onClick={()=>{setMissingNotice('');setOpened(value=>!value);}}>{opened?'收起录音':'查看录音'}</button>}
   {callActive&&<p className="note">通话结束后可播放录音。</p>}
   {missingNotice&&<p className="note" role="status">{missingNotice}</p>}
-  {opened&&request&&<CallDetailGuard callId={callId} request={request} onMissing={message=>{audioOwnership.stopRecordings();setOpened(false);setMissingNotice(message);}}/>}
-  {opened&&<><div className="recording-sources" role="group" aria-label="录音副本">
+  {shown&&request&&<CallDetailGuard callId={callId} request={request} onMissing={message=>{audioOwnership.stopRecordings();setOpened(false);setMissingNotice(message);}}/>}
+  {shown&&<><div className="recording-sources" role="group" aria-label="录音副本">
    {(['media_node','pixel'] as const).map(value=><button key={value} className={source===value?'primary':'passkey'} aria-pressed={source===value} onClick={()=>setSource(value)}>{value==='pixel'?gatewayArchiveLabel(gatewayKind):serverRecordingLabel(ownerJoinedLocal)}</button>)}
   </div><RecordingDetail key={`${callId}:${source}`} callId={callId} source={source} timeZone={zone} gatewayKind={gatewayKind}/></>}
  </div>;

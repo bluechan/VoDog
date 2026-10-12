@@ -82,3 +82,32 @@ test('a recording by-ID 404 closes the panel and disposes its audio ownership', 
     globalThis.fetch = previousFetch;
   }
 });
+
+test('S101 always-open recording card: no toggle, sources shown on mount, a by-ID 404 hides the card', async () => {
+  const {CallRecording} = await load<typeof import('../src/recording.tsx')>('/src/recording.tsx');
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{}', {status: 404, headers: {'content-type': 'application/json'}});
+  let renderer: ReactTestRenderer | undefined;
+  const sources = () => renderer!.root.findAll(node => node.props?.className === 'recording-sources');
+  try {
+    await act(async () => {
+      renderer = create(React.createElement(CallRecording, {
+        callId: '7814d6a7-3a8f-426f-9eb2-cdf91cbfdd72',
+        alwaysOpen: true,
+        request: async <T,>(): Promise<T> => ({} as T),
+      }));
+    });
+    assert.equal(renderer!.root.findAll(node => node.type === 'button' && node.props['aria-expanded'] !== undefined).length, 0);
+    assert.equal(sources().length, 1);
+    await act(async () => renderer!.unmount());
+    await act(async () => { renderer = create(React.createElement(CallRecording, {
+      callId: '7814d6a7-3a8f-426f-9eb2-cdf91cbfdd73', alwaysOpen: true,
+      request: async <T,>(): Promise<T> => { throw missing; },
+    })); await flush(); });
+    assert.equal(sources().length, 0);
+    assert.match(textOf(renderer!.toJSON()), /此通话已在其他设备删除，详情已关闭/);
+  } finally {
+    if (renderer) await act(async () => renderer!.unmount());
+    globalThis.fetch = previousFetch;
+  }
+});

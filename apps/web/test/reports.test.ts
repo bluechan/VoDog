@@ -443,3 +443,21 @@ test('报告 pages through the server, resets to page 1 on every filter change, 
     renderer?.unmount();
   }
 });
+
+test('S96：报告卡 meta 首项后显示简短归属地', async () => {
+  const {CallReports} = await load<typeof import('../src/reports.tsx')>('/src/reports.tsx');
+  const located = [{...items[0]!, remoteLocation: '广东 深圳 · 移动'}];
+  const request = async <T,>(): Promise<T> => ({items: located}) as T;
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(React.createElement(CallReports, {simId: 'sim-1', timeZone: ZONE, request, busy: false}));
+    });
+    await act(async () => {
+      await flush();
+    });
+    assert.match(collectText(renderer!.toJSON()), /家庭卡 · 广东 深圳 · 呼入 · 通话 48 秒/);
+  } finally {
+    renderer?.unmount();
+  }
+});

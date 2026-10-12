@@ -1,7 +1,8 @@
 import {audioOwnership} from './audio-ownership.ts';
 import {AudioQualityMonitor,diagAudioStats} from './media-quality.ts';
 import {diag} from './diag.ts';
-import {errorCode,shouldRetryTls} from './media-policy.ts';
+import {authorizeMedia,errorCode,learnedTransport,networkSnapshot,networkSwitched,rememberTransport,shouldRetryTls,transportStorage,watchNetworkEpoch} from './media-policy.ts';
+import {browserSessionGeneration} from './session-boundary.ts';
 type MediaRequestOptions={signal?:AbortSignal;timeoutMs?:number};
 type MediaAPI=<T>(path:string,body?:unknown,method?:string,options?:MediaRequestOptions)=>Promise<T>;
 type Transport='udp'|'tls';
@@ -16,6 +17,8 @@ type MediaDependencies={
  window?:Pick<Window,'addEventListener'|'removeEventListener'>;
  connection?:EventTarget;
  iceTimeoutMs?:number;
+ /** S98：UDP 起步且失败后还能自动换 TLS 时的中继收集上限（默认 UDP_FALLBACK_GATHER_CAP_MS）。 */
+ udpGatherCapMs?:number;
  connectedTimeoutMs?:number;
  disconnectGraceMs?:number;
  /** S70d：媒体断开时立即让仪表盘拉一次 `/calls`，对端挂断不必等下一次 2 s 轮询；只刷新，不结束通话。 */
@@ -25,6 +28,8 @@ type MediaDependencies={
  rejoinBackoffMs?:number;
  rejoinSpacingMs?:number;
  rejoinNetworkRetryMs?:number;
+ /** S98：记住自动回退学到的传输；默认浏览器 localStorage（Node 测试中为 null）。 */
+ storage?:Pick<Storage,'getItem'|'setItem'|'removeItem'>|null;
 };
 
 /** S73 D3：最多 3 次、自首次断线起 60 s；冲突（旧腿仍 Connected）退避 2 s；其他失败距上次开始至少 15 s 再试。都计入次数（S73c：断网时的失败除外）。 */
@@ -51,11 +56,24 @@ export function rejoinTransport(attempt:number,elapsedMs:number,base:Transport,f
 /** S73c：只认浏览器明确报告的离线（Node/旧浏览器没有 onLine 时按在线处理）。 */
 const isOffline=()=>(globalThis.navigator as Navigator|undefined)?.onLine===false;
 
-/** S73d：重连不测节点——房间节点已由 Control 固定（call.media_node_id），networkGeneration 只为满足接口，服务端此时不看它。 */
+/**
+ * S73d：重连不测节点——房间节点已由 Control 固定（call.media_node_id），networkGeneration 只为满足接口，服务端此时不看它。
+ * S98：首次建立复用本会话、本网络代 100 s 内已被接受的测量（mediaProbeCache），否则现测。
+ */
 async function defaultAuthorize(callId:string,api:MediaAPI,transport:Transport,signal:AbortSignal,rejoin=false):Promise<RTCConfiguration>{
- const [{authorizeMedia},{measureMediaNodes}]=await Promise.all([import('./media-policy'),import('./media-probe')]);
- return authorizeMedia(callId,api,transport,signal,rejoin?async()=>crypto.randomUUID():measureMediaNodes);
+ if(rejoin)return authorizeMedia(callId,api,transport,signal,async()=>crypto.randomUUID());
+ const {mediaProbeCache}=await import('./media-probe.ts');
+ return authorizeMedia(callId,api,transport,signal,mediaProbeCache().forAuthorization(browserSessionGeneration()));
 }
+
+/** S98：有可能马上要通话时（来电振铃、拨号盘）提前测节点；不等待、不抛错，振铃与拨号从不依赖它。 */
+export function prewarmMediaProbe(api:MediaAPI):void{
+ const session=browserSessionGeneration();
+ void import('./media-probe.ts').then(({mediaProbeCache})=>mediaProbeCache().prewarm(session,api)).catch(()=>{/* Only an optimisation. */});
+}
+
+/** S98：UDP 起步、失败后还会自动换 TLS 时，中继收集最多等 5 s（TLS 那次仍是 12 s）。 */
+export const UDP_FALLBACK_GATHER_CAP_MS=5000;
 
 async function bounded<T>(operation:Promise<T>,signal:AbortSignal,timeoutMs:number,message:string,onLateValue?:(value:T)=>void):Promise<T>{
  return await new Promise<T>((resolve,reject)=>{
@@ -69,7 +87,7 @@ async function bounded<T>(operation:Promise<T>,signal:AbortSignal,timeoutMs:numb
  });
 }
 
-/** Relay-stage failures (before any offer reaches the bridge) carry a code so the UDP→TLS retry can tell them apart. */
+/** Relay and ICE-connect failures carry a code so the UDP→TLS retry can tell them apart from bridge, API and microphone errors. */
 const relayError=(message:string,code:string)=>Object.assign(new Error(message),{code});
 
 function cancelled(signal:AbortSignal){if(signal.aborted)throw new DOMException('媒体连接已取消','AbortError');}
@@ -143,12 +161,14 @@ export async function waitForRelayCandidates(peer:RTCPeerConnection,signal:Abort
 
 async function waitForConnected(peer:RTCPeerConnection,signal:AbortSignal,timeoutMs:number):Promise<void>{
  if(peer.connectionState==='connected')return;
+ const connectFailed=()=>relayError('通话音频连接失败','ICE_CONNECT_FAILED');
+ if(peer.connectionState==='failed'||peer.connectionState==='closed')throw connectFailed();
  await new Promise<void>((resolve,reject)=>{
   let settled=false;
   const finish=(error?:Error)=>{if(settled)return;settled=true;clearTimeout(timer);signal.removeEventListener('abort',aborted);peer.removeEventListener('connectionstatechange',changed);error?reject(error):resolve();};
-  const changed=()=>{if(peer.connectionState==='connected')finish();else if(peer.connectionState==='failed'||peer.connectionState==='closed')finish(new Error('通话音频连接失败'));};
+  const changed=()=>{if(peer.connectionState==='connected')finish();else if(peer.connectionState==='failed'||peer.connectionState==='closed')finish(connectFailed());};
   const aborted=()=>finish(new DOMException('媒体连接已取消','AbortError'));
-  const timer=setTimeout(()=>finish(new Error('通话音频连接超时')),timeoutMs);
+  const timer=setTimeout(()=>finish(relayError('通话音频连接超时','ICE_CONNECT_TIMEOUT')),timeoutMs);
   signal.addEventListener('abort',aborted,{once:true});peer.addEventListener('connectionstatechange',changed);
   if(signal.aborted)aborted();
  });
@@ -172,15 +192,24 @@ export class CallMedia {
  private rejoining?:symbol;
  private readonly onFailure:(message:string)=>void;
  private readonly dependencies:MediaDependencies;
- constructor(onFailure:(message:string)=>void,dependencies:MediaDependencies={}){this.onFailure=onFailure;this.dependencies=dependencies;}
+ constructor(onFailure:(message:string)=>void,dependencies:MediaDependencies={}){this.onFailure=onFailure;this.dependencies=dependencies;watchNetworkEpoch();}
  private fail(message:string){const callId=this.callId;this.stop();diag.log('media.failed',{message},callId);this.onFailure(message);}
- /** One automatic UDP→TLS retry, only for relay-stage failures: the first offer never reached the bridge, so no 409. */
+ /**
+  * One automatic UDP→TLS retry for relay and ICE-connect failures: the UDP leg never reached Connected, so the bridge replaces it (S52) instead of 409.
+  * S98：标准连接（UDP）时，本网络 24 h 内学到的 TLS 直接起步；UDP 起步时收集只等 5 s，失败后的 TLS 仍等 12 s。
+  */
  async start(callId:string,api:MediaAPI,transport:Transport='udp'):Promise<void>{
-  try{await this.attempt(callId,api,transport);}
-  catch(error){
-   if(isOffline()||!shouldRetryTls(error,transport))return this.setupOffline(error,callId,transport);
+  const storage=this.dependencies.storage===undefined?transportStorage():this.dependencies.storage;
+  const learned=transport==='udp'?learnedTransport(storage):undefined,first=learned??transport;
+  try{
+   await this.attempt(callId,api,first,false,true,first==='udp'?{gatherCapMs:Math.min(this.dependencies.iceTimeoutMs??12000,this.dependencies.udpGatherCapMs??UDP_FALLBACK_GATHER_CAP_MS)}:{learned:Boolean(learned)});
+   if(first==='udp')rememberTransport(null,storage);
+  }catch(error){
+   if(learned&&shouldRetryTls(error,'udp'))rememberTransport(null,storage);// 学到的 TLS 在这里也连不上：下一通重新先试 UDP
+   if(isOffline()||!shouldRetryTls(error,first))return this.setupOffline(error,callId,first);
    diag.log('media.retry_tls',{code:errorCode(error)},callId);
    try{await this.attempt(callId,api,'tls');}catch(tlsError){return this.setupOffline(tlsError,callId,'tls');}
+   rememberTransport('tls',storage);
   }
  }
  /** S73e：首次建立时断网失败（attempt 已只拆腿、保留 callId/麦克风）→ 走 S73 重连循环：等 online、断网不计次、60 s 窗口；在线失败照旧抛出。 */
@@ -235,7 +264,7 @@ export class CallMedia {
    }
   }finally{clearTimeout(deadline);}
  }
- private async attempt(callId:string,api:MediaAPI,transport:Transport,rejoin=false,probe=!rejoin):Promise<void>{
+ private async attempt(callId:string,api:MediaAPI,transport:Transport,rejoin=false,probe=!rejoin,setup:{gatherCapMs?:number;learned?:boolean}={}):Promise<void>{
   if(rejoin)this.closeLeg();else{this.stop();this.audioOwner=audioOwnership.beginCall();}
   const generation=this.generation,operation=new AbortController();this.operation=operation;this.callId=callId;this.api=api;
   const began=performance.now();let offerAt=0,stage='options';
@@ -244,9 +273,14 @@ export class CallMedia {
   type AuthorizationAttempt={controller:AbortController;networkChanged:boolean;allocationStarted:boolean};
   let authorization:AuthorizationAttempt|undefined;
   const offline=()=>operation.abort();
-  let networkFlap=false;
-  const networkChanged=()=>{const current=authorization;if(current&&!current.allocationStarted){current.networkChanged=true;current.controller.abort();}else{networkFlap=true;operation.abort();}};
+  let networkFlap=false,network=networkSnapshot(connection);
+  // S98：只有 connection.type 真的变了或 onLine 翻转才算换网；Chrome 的 effectiveType/rtt/downlink 估算变化不打断建立。
+  const networkChanged=()=>{const next=networkSnapshot(connection);if(!networkSwitched(network,next))return;network=next;const current=authorization;if(current&&!current.allocationStarted){current.networkChanged=true;current.controller.abort();}else{networkFlap=true;operation.abort();}};
   browserWindow.addEventListener('offline',offline);connection?.addEventListener('change',networkChanged);
+  // S98：麦克风与授权并行开始，授权之后再等它；本次尝试没用上的流在 finally 里释放（含晚到的）。
+  const getUserMedia=this.dependencies.getUserMedia??(constraints=>navigator.mediaDevices.getUserMedia(constraints));
+  let microphone=rejoin&&this.stream?undefined:new Promise<MediaStream>(resolve=>resolve(getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false})));
+  microphone?.catch(()=>{/* Reported when awaited; an unused failure needs no report. */});
   try{
    const authorize=this.dependencies.authorize??defaultAuthorize,allocationPath=`/calls/${callId}/media/options`;
    let rtcConfiguration:RTCConfiguration|undefined;
@@ -263,10 +297,10 @@ export class CallMedia {
     finally{operation.signal.removeEventListener('abort',rootAbort);if(authorization===current)authorization=undefined;}
    }
    if(!rtcConfiguration)throw new Error('通话网络测量未完成');
-   diag.log('media.options',{ms:Math.round(performance.now()-began),transport},callId);
+   diag.log('media.options',{ms:Math.round(performance.now()-began),transport,...(setup.learned?{learned:true}:{})},callId);
    cancelled(operation.signal);if(generation!==this.generation)return;stage='microphone';
-   const getUserMedia=this.dependencies.getUserMedia??(constraints=>navigator.mediaDevices.getUserMedia(constraints));
-   const stream=rejoin&&this.stream?this.stream:await bounded(getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}),operation.signal,15000,'等待麦克风权限超时',late=>late.getTracks().forEach(track=>track.stop()));
+   const pending=microphone;microphone=undefined;
+   const stream=pending?await bounded(pending,operation.signal,15000,'等待麦克风权限超时',late=>late.getTracks().forEach(track=>track.stop())):this.stream!;
    if(generation!==this.generation||operation.signal.aborted){if(stream!==this.stream)stream.getTracks().forEach(t=>t.stop());return;}
    this.stream=stream;stage='relay';
    const peer=(this.dependencies.createPeer??(configuration=>new RTCPeerConnection(configuration)))(rtcConfiguration);this.peer=peer;
@@ -277,7 +311,8 @@ export class CallMedia {
    let established=false,downAt:number|undefined;
    peer.onconnectionstatechange=()=>{
     if(generation!==this.generation)return;
-    if(peer.connectionState==='failed'){if(established)void this.rejoin('failed',downAt);else if(!rejoin&&!isOffline())this.fail('通话音频连接失败');return;}
+    // 建立中的失败由 waitForRelayCandidates / waitForConnected 带码报告（UDP 可自动换 TLS）；这里只管已建立的腿。
+    if(peer.connectionState==='failed'){if(established)void this.rejoin('failed',downAt);return;}
     if(peer.connectionState==='disconnected'){
      this.dependencies.onMediaDrop?.();downAt??=performance.now();
      clearTimeout(this.disconnectTimer);this.disconnectTimer=setTimeout(()=>{if(generation===this.generation&&peer.connectionState==='disconnected'){if(established)void this.rejoin('disconnected',downAt);else if(!rejoin&&!isOffline())this.fail('通话音频连接已中断');}},this.dependencies.disconnectGraceMs??5000);
@@ -292,7 +327,7 @@ export class CallMedia {
    const offer=await bounded(peer.createOffer(),operation.signal,6000,'创建音频连接超时');
    if(offer.sdp)offer.sdp=rewriteOpusOffer(offer.sdp);
    await bounded(peer.setLocalDescription(offer),operation.signal,6000,'设置本地音频超时');
-   const relayCandidates=await waitForRelayCandidates(peer,operation.signal,{settleMs:RELAY_SETTLE_MS,capMs:this.dependencies.iceTimeoutMs??12000});
+   const relayCandidates=await waitForRelayCandidates(peer,operation.signal,{settleMs:RELAY_SETTLE_MS,capMs:setup.gatherCapMs??this.dependencies.iceTimeoutMs??12000});
    diag.log('media.relay_candidates',{count:relayCandidates,ms:Math.round(performance.now()-began)},callId);
    cancelled(operation.signal);if(generation!==this.generation)return;
    offerAt=performance.now();stage='offer';diag.log('media.offer',{ms:Math.round(offerAt-began)},callId);
@@ -307,7 +342,8 @@ export class CallMedia {
     this.statsTimer=setInterval(()=>{void peer.getStats().then(report=>diag.log('media.stats',diagAudioStats(report),callId)).catch(()=>{/* 诊断读数失败不影响通话。 */});},30000);}
   }catch(error){if(generation===this.generation){if(rejoin)this.closeLeg();else{if(isOffline())this.closeLeg();else this.stop();diag.log('media.failed',{stage,transport,message:String(error).slice(0,300),...(isOffline()?{offline:true}:{})},callId);}}
    throw rejoin&&networkFlap?Object.assign(new Error('重连期间网络切换'),{code:'NETWORK_CHANGED'}):error;}
-  finally{authorization?.controller.abort();authorization=undefined;browserWindow.removeEventListener('offline',offline);connection?.removeEventListener('change',networkChanged);if(this.operation===operation)this.operation=undefined;}
+  finally{authorization?.controller.abort();authorization=undefined;browserWindow.removeEventListener('offline',offline);connection?.removeEventListener('change',networkChanged);if(this.operation===operation)this.operation=undefined;
+   if(microphone)void microphone.then(unused=>unused.getTracks().forEach(track=>{try{track.stop();}catch{/* Already ended. */}}),()=>{});}
  }
  get hasMicrophone():boolean{return Boolean(this.stream?.getAudioTracks().some(track=>track.readyState!=='ended'));}
  setMuted(muted:boolean):boolean{

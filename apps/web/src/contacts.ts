@@ -17,6 +17,8 @@ export type ContactPhoneDto = {
   /** Per-number blocklist state; absent on an older Control. */
   blocked?: boolean;
   blockedEntryId?: string | null;
+  /** S96 号码归属地（完整形态）；旧 Control 或查不到时缺省。 */
+  location?: string | null;
 };
 export type ContactEmailDto = {id?: string; address: string; label?: string | null};
 export type ContactAddressDto = {
@@ -56,6 +58,16 @@ export type ContactAnnotated = {
   blocked?: boolean;
   blockedEntryId?: string | null;
 };
+
+/** S96 完整形态：服务端字符串去空白；空即无。 */
+export function locationFull(location?: string | null): string | undefined {
+  return location?.trim() || undefined;
+}
+
+/** S96 简短形态：第一个 ` · ` 之前（`广东 深圳 · 移动` → `广东 深圳`，`加纳` → `加纳`）。 */
+export function locationShort(location?: string | null): string | undefined {
+  return locationFull(location?.split(' · ')[0]);
+}
 
 /** The `api()` wrapper from `main.tsx`, injected so every panel keeps its cookie and 401 handling. */
 export type ApiRequest = <T>(path: string, body?: unknown, method?: string, options?: {idempotencyKey?: string}) => Promise<T>;
@@ -290,9 +302,27 @@ export const CONTACT_DELETE_PROMPT = '删除此联系人？通话与短信记录
 export const CONTACT_CALL_PROMPT = '拨打此号码？将使用当前所选 SIM 拨出。';
 
 /** `GET /contacts` path with the server-side search applied (§A). */
-export function contactsPath(query: string, limit = 200): string {
+export function contactsPath(query: string, limit = CONTACTS_PAGE_SIZE, offset = 0): string {
   const trimmed = query.trim();
-  return `/contacts?limit=${limit}${trimmed ? `&query=${encodeURIComponent(trimmed)}` : ''}`;
+  return `/contacts?limit=${limit}${offset > 0 ? `&offset=${offset}` : ''}${trimmed ? `&query=${encodeURIComponent(trimmed)}` : ''}`;
+}
+
+export const CONTACTS_PAGE_SIZE = 500;
+const CONTACTS_MAX_PAGES = 40;
+
+/**
+ * The whole address book when the search is empty (S114): the server orders by `display_name` in C collation,
+ * so one page leaves most Chinese names out. A non-empty search stays a single request.
+ */
+export async function fetchAllContacts(request: ApiRequest, query: string): Promise<ContactDto[]> {
+  if (query.trim()) return (await request<{items: ContactDto[]}>(contactsPath(query))).items || [];
+  const all: ContactDto[] = [];
+  for (let page = 0; page < CONTACTS_MAX_PAGES; page++) {
+    const items = (await request<{items: ContactDto[]}>(contactsPath('', CONTACTS_PAGE_SIZE, all.length))).items || [];
+    all.push(...items);
+    if (items.length < CONTACTS_PAGE_SIZE) break;
+  }
+  return all;
 }
 
 export type ContactDraft = {

@@ -12,12 +12,32 @@ export function audioQualitySample(report:RTCStatsReport,elapsedMs:number):Audio
  return {elapsedMs:Math.max(0,Math.round(elapsedMs)),inbound};
 }
 const num=(value:unknown):value is number=>typeof value==='number'&&Number.isFinite(value);
-export type AudioRxTx={rx:Record<string,number>;tx:Record<string,number>};
+const ms=(seconds:number)=>Math.round(seconds*1000*10)/10;
+const CANDIDATE_TYPES=new Set(['host','srflx','prflx','relay']);
+/**
+ * P3 诊断：`rttMs` 取选中候选对的 currentRoundTripTime；`txRemote` 是对端（桥）对我方发送的回报（remote-inbound-rtp）；
+ * `localCandidateType`/`remoteCandidateType` 只是候选类型枚举（host/srflx/prflx/relay），不含地址。
+ */
+export type AudioRxTx={rx:Record<string,number>;tx:Record<string,number>;rttMs?:number;txRemote?:Record<string,number>;localCandidateType?:string;remoteCandidateType?:string};
+/** 选中的候选对：transport.selectedCandidatePairId，其次 Firefox 的 `selected`，最后已提名的对。 */
+function selectedPair(report:RTCStatsReport):Record<string,unknown>|undefined{
+ let selectedId:unknown,flagged:Record<string,unknown>|undefined,nominated:Record<string,unknown>|undefined;
+ report.forEach(stat=>{
+  if(stat.type==='transport'&&typeof stat.selectedCandidatePairId==='string')selectedId??=stat.selectedCandidatePairId;
+  if(stat.type==='candidate-pair'){if(stat.selected===true)flagged??=stat;if(stat.nominated)nominated??=stat;}
+ });
+ return (typeof selectedId==='string'?report.get(selectedId) as Record<string,unknown>|undefined:undefined)??flagged??nominated;
+}
 /** S70：通话接收/发送质量计数（inbound-rtp / outbound-rtp audio），进 30 s `media.stats` 与通话结束 `media.summary`。 */
 export function audioRxTx(report:RTCStatsReport):AudioRxTx{
- const rx:Record<string,number>={},tx:Record<string,number>={};
+ const rx:Record<string,number>={},tx:Record<string,number>={},txRemote:Record<string,number>={};
  report.forEach(stat=>{
   if((stat.kind??stat.mediaType)!=='audio')return;
+  if(stat.type==='remote-inbound-rtp'){
+   if(num(stat.fractionLost))txRemote.fractionLost=stat.fractionLost;
+   if(num(stat.roundTripTime))txRemote.roundTripTimeMs=ms(stat.roundTripTime);
+   if(num(stat.jitter))txRemote.jitterMs=ms(stat.jitter);
+  }
   if(stat.type==='inbound-rtp'){
    for(const key of ['packetsReceived','packetsLost','concealedSamples','silentConcealedSamples','totalSamplesReceived','concealmentEvents','insertedSamplesForDeceleration','removedSamplesForAcceleration'] as const)if(num(stat[key]))rx[key]=stat[key];
    if(num(stat.jitter))rx.jitterMs=Math.round(stat.jitter*1000*10)/10;
@@ -25,7 +45,17 @@ export function audioRxTx(report:RTCStatsReport):AudioRxTx{
   }
   if(stat.type==='outbound-rtp')for(const key of ['packetsSent','bytesSent'] as const)if(num(stat[key]))tx[key]=stat[key];
  });
- return {rx,tx};
+ const result:AudioRxTx={rx,tx};
+ const pair=selectedPair(report);
+ if(pair){
+  if(num(pair.currentRoundTripTime))result.rttMs=ms(pair.currentRoundTripTime);
+  for(const [side,key] of [['localCandidateId','localCandidateType'],['remoteCandidateId','remoteCandidateType']] as const){
+   const id=pair[side],type=typeof id==='string'?(report.get(id) as {candidateType?:unknown}|undefined)?.candidateType:undefined;
+   if(typeof type==='string'&&CANDIDATE_TYPES.has(type))result[key]=type;
+  }
+ }
+ if(Object.keys(txRemote).length)result.txRemote=txRemote;
+ return result;
 }
 /** S36 C3：诊断只留几个数字——够判断一通电话的音频好坏，不留任何地址或凭据。S70 追加 `rx`/`tx`。 */
 export function diagAudioStats(report:RTCStatsReport):Record<string,unknown>{

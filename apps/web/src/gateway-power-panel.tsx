@@ -3,9 +3,11 @@ import {useReportedError} from './ui-error';
 import {
   GATEWAY_POWER_REFRESH_MS,
   gatewayPowerErrorMessage,
+  gatewayPowerOffPrompt,
   gatewayPowerPendingLabel,
   gatewayPowerStatusLabel,
   gatewayPowerToggle,
+  gatewayPowerUnsupported,
   lastPowerResultText,
   remotePowerAllowedLabel,
   type GatewayPowerDto,
@@ -26,10 +28,6 @@ import {useVisibleRefresh} from './visible-refresh';
 function errorCode(error: unknown): string {
   const code = (error as {code?: unknown})?.code;
   return typeof code === 'string' ? code : '';
-}
-function errorStatus(error: unknown): number {
-  const status = (error as {status?: unknown})?.status;
-  return typeof status === 'number' ? status : 0;
 }
 
 export function GatewayPowerPanel({
@@ -76,7 +74,7 @@ export function GatewayPowerPanel({
       } catch (caught) {
         if (!mounted.current || captured !== epoch.current) return;
         // An older Control has no power routes; that is a missing feature, not a failure to report loudly.
-        if (errorStatus(caught) === 404) {
+        if (gatewayPowerUnsupported(caught)) {
           setUnsupported(true);
           setItems([]);
           setError('');
@@ -176,7 +174,7 @@ export function GatewayPowerPanel({
                 {confirmOffId === item.gatewayId ? (
                   <ConfirmAction
                     busy={busy}
-                    prompt={`关闭 ${item.name || '网关'} 的网关总控？网关设备将恢复本地通话。`}
+                    prompt={gatewayPowerOffPrompt(item.name || '网关')}
                     confirmLabel="确认关闭"
                     onConfirm={() => setPower(item, 'off')}
                     onCancel={() => setConfirmOffId(null)}

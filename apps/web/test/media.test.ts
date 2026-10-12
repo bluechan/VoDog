@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {authorizeMedia,boundedOperation,mayEndCall,requiresSessionOwnerEnd,ringingEndGuard,shouldRetryTls,validateRelayOptions} from '../src/media-policy.ts';
+import {authorizeMedia,boundedOperation,LEARNED_TRANSPORT_TTL_MS,learnedTransport,mayEndCall,networkSwitched,readTransportChoice,rememberTransport,requiresSessionOwnerEnd,ringingEndGuard,saveTransportChoice,shouldRetryTls,validateRelayOptions} from '../src/media-policy.ts';
 import {diag} from '../src/diag.ts';
-import {CallMedia,REJOIN_CONFLICT_BACKOFF_MS,REJOIN_SPACING_MS,REJOIN_WINDOW_MS,rejoinRetryDelay,rejoinTransport,OPUS_MAX_AVERAGE_BITRATE,OPUS_WIDEBAND_LIMIT,RELAY_SETTLE_MS,rewriteOpusOffer,waitForRelayCandidates} from '../src/media.ts';
+import {CallMedia,REJOIN_CONFLICT_BACKOFF_MS,REJOIN_SPACING_MS,REJOIN_WINDOW_MS,rejoinRetryDelay,rejoinTransport,OPUS_MAX_AVERAGE_BITRATE,OPUS_WIDEBAND_LIMIT,RELAY_SETTLE_MS,rewriteOpusOffer,UDP_FALLBACK_GATHER_CAP_MS,waitForRelayCandidates} from '../src/media.ts';
 
 const udp={iceServers:[{urls:['turn:relay.example:16801?transport=udp'],username:'user',credential:'credential'}],iceTransportPolicy:'relay' as const};
 type TestMediaAPI=<T>(path:string,body?:unknown,method?:string,options?:{signal?:AbortSignal;timeoutMs?:number})=>Promise<T>;
@@ -127,9 +127,11 @@ function mediaFixture(mode:PeerMode,overrides:{connectedTimeoutMs?:number;discon
  return {instance,browserWindow,peer,localTrack,audio,api,get offers(){return offers;},get offered(){return offered;},get failures(){return failures;},get drops(){return drops;}};
 }
 
+/** P2: a real network switch changes `connection.type`; Chrome's estimate-only `change` events (same type) are ignored. */
+function switchNetwork(connection:EventTarget){const target=connection as EventTarget&{type?:string};target.type=target.type==='wifi'?'cellular':'wifi';connection.dispatchEvent(new Event('change'));}
 function networkRetryFixture(authorize:TestAuthorize,onApi?:TestMediaAPI){
- const connection=new EventTarget(),browserWindow=new EventTarget(),peer=new FakePeer('connected');let microphoneRequests=0;
- const track={enabled:true,stop(){}} as unknown as MediaStreamTrack,stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
+ const connection=Object.assign(new EventTarget(),{type:'wifi'}),browserWindow=new EventTarget(),peer=new FakePeer('connected');let microphoneRequests=0;
+ const track={enabled:true,stopCount:0,stop(){this.stopCount++;}},stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
  const paths:string[]=[];
  const api:TestMediaAPI=async<T>(path,body,method,options)=>{paths.push(path);if(onApi)return onApi<T>(path,body,method,options);return (path.endsWith('/media/offer')?{type:'answer',sdp:'v=0\r\n'}:{}) as T;};
  const instance=new CallMedia(()=>assert.fail('unexpected asynchronous media failure'),{
@@ -138,14 +140,14 @@ function networkRetryFixture(authorize:TestAuthorize,onApi?:TestMediaAPI){
   remoteStream:()=>stream,audioCodecs:()=>[{mimeType:'audio/opus',clockRate:48000,channels:1}],
   window:browserWindow as unknown as Window,connection,iceTimeoutMs:20,connectedTimeoutMs:20,
  });
- return {instance,connection,api,paths,get microphoneRequests(){return microphoneRequests;}};
+ return {instance,connection,api,paths,track,get microphoneRequests(){return microphoneRequests;}};
 }
 
 test('one pre-allocation network change retries a fresh authorization before allocating once',async()=>{
  let attempts=0;const generations:string[]=[];let fixture:ReturnType<typeof networkRetryFixture>;
  const authorize:TestAuthorize=async(callId,api,_transport,signal)=>{
   const generation=`generation-${++attempts}`;generations.push(generation);await api('/media/probes/options',{networkGeneration:generation},undefined,{signal});await api('/media/quality-probes/options',{networkGeneration:generation},undefined,{signal});
-  if(attempts===1){fixture.connection.dispatchEvent(new Event('change'));assert.equal(signal.aborted,true);await assert.rejects(api(`/calls/${callId}/media/options`,{networkGeneration:generation},undefined,{signal}),error=>error instanceof DOMException&&error.name==='AbortError');return udp;}
+  if(attempts===1){switchNetwork(fixture.connection);assert.equal(signal.aborted,true);await assert.rejects(api(`/calls/${callId}/media/options`,{networkGeneration:generation},undefined,{signal}),error=>error instanceof DOMException&&error.name==='AbortError');return udp;}
   await api('/media/quality-probes/results',{networkGeneration:generation,samples:[]},undefined,{signal});
   await api(`/calls/${callId}/media/options`,{networkGeneration:generation},undefined,{signal});return udp;
  };
@@ -157,29 +159,43 @@ test('one pre-allocation network change retries a fresh authorization before all
 
 test('repeated pre-allocation network changes fail without media allocation',async()=>{
  let attempts=0;let fixture:ReturnType<typeof networkRetryFixture>;
- const authorize:TestAuthorize=async(_callId,api,_transport,signal)=>{await api('/media/probes/options',{networkGeneration:`generation-${++attempts}`},undefined,{signal});fixture.connection.dispatchEvent(new Event('change'));throw new DOMException('changed','AbortError');};
+ const authorize:TestAuthorize=async(_callId,api,_transport,signal)=>{await api('/media/probes/options',{networkGeneration:`generation-${++attempts}`},undefined,{signal});switchNetwork(fixture.connection);throw new DOMException('changed','AbortError');};
  fixture=networkRetryFixture(authorize);await assert.rejects(fixture.instance.start('call-repeat',fixture.api),error=>error instanceof DOMException&&error.name==='AbortError');
- assert.equal(attempts,2);assert.equal(fixture.paths.some(path=>path.endsWith('/media/options')),false);assert.equal(fixture.microphoneRequests,0);
+ // P3: the microphone starts with the call, in parallel with authorization, and is released when authorization fails.
+ assert.equal(attempts,2);assert.equal(fixture.paths.some(path=>path.endsWith('/media/options')),false);assert.equal(fixture.microphoneRequests,1);
+ await new Promise(resolve=>setTimeout(resolve,0));assert.equal(fixture.track.stopCount,1);
 });
 
-test('user stop during a pending probe never retries or allocates',async()=>{
+test('user stop during a pending probe never retries or allocates, and releases the parallel microphone',async()=>{
  let attempts=0;
  const authorize:TestAuthorize=async(_callId,api,_transport,signal)=>{attempts++;await api('/media/probes/options',{},undefined,{signal});return new Promise((_resolve,reject)=>{const abort=()=>reject(new DOMException('stopped','AbortError'));signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});};
  const fixture=networkRetryFixture(authorize),running=fixture.instance.start('call-stop',fixture.api);await new Promise(resolve=>setTimeout(resolve,0));fixture.instance.stop();
- await assert.rejects(running,error=>error instanceof DOMException&&error.name==='AbortError');assert.equal(attempts,1);assert.equal(fixture.paths.some(path=>path.endsWith('/media/options')),false);assert.equal(fixture.microphoneRequests,0);
+ await assert.rejects(running,error=>error instanceof DOMException&&error.name==='AbortError');assert.equal(attempts,1);assert.equal(fixture.paths.some(path=>path.endsWith('/media/options')),false);assert.equal(fixture.microphoneRequests,1);
+ await new Promise(resolve=>setTimeout(resolve,0));assert.equal(fixture.track.stopCount,1);
 });
 
 test('network change during an in-flight allocation aborts without retrying',async()=>{
  let attempts=0;let fixture:ReturnType<typeof networkRetryFixture>;
  const request:TestMediaAPI=async<T>(path,_body,_method,options)=>path.endsWith('/media/options')?new Promise<T>((_resolve,reject)=>{const abort=()=>reject(new DOMException('changed','AbortError'));options?.signal?.addEventListener('abort',abort,{once:true});if(options?.signal?.aborted)abort();}):{} as T;
- const authorize:TestAuthorize=async(callId,api,_transport,signal)=>{attempts++;const pending=api<RTCConfiguration>(`/calls/${callId}/media/options`,{},undefined,{signal});fixture.connection.dispatchEvent(new Event('change'));return pending;};
+ const authorize:TestAuthorize=async(callId,api,_transport,signal)=>{attempts++;const pending=api<RTCConfiguration>(`/calls/${callId}/media/options`,{},undefined,{signal});switchNetwork(fixture.connection);return pending;};
  fixture=networkRetryFixture(authorize,request);await assert.rejects(fixture.instance.start('call-allocated',fixture.api),error=>error instanceof DOMException&&error.name==='AbortError');
- assert.equal(attempts,1);assert.equal(fixture.paths.filter(path=>path.endsWith('/media/options')).length,1);assert.equal(fixture.microphoneRequests,0);
+ assert.equal(attempts,1);assert.equal(fixture.paths.filter(path=>path.endsWith('/media/options')).length,1);assert.equal(fixture.microphoneRequests,1);
+ await new Promise(resolve=>setTimeout(resolve,0));assert.equal(fixture.track.stopCount,1);
+});
+
+test('P2 a connection change that keeps the same type (an rtt/downlink estimate) does not interrupt setup',async()=>{
+ let attempts=0;let fixture:ReturnType<typeof networkRetryFixture>;
+ const authorize:TestAuthorize=async(callId,api,_transport,signal)=>{
+  attempts++;fixture.connection.dispatchEvent(new Event('change'));assert.equal(signal.aborted,false);
+  await api(`/calls/${callId}/media/options`,{},undefined,{signal});fixture.connection.dispatchEvent(new Event('change'));return udp;
+ };
+ fixture=networkRetryFixture(authorize);await fixture.instance.start('call-estimate',fixture.api);
+ assert.equal(attempts,1);assert.equal(fixture.paths.filter(path=>path.endsWith('/media/offer')).length,1);fixture.instance.stop();
 });
 
 test('CallMedia forever checking reaches deadline and closes tracks and playback',async()=>{
  const fixture=mediaFixture('checking',{connectedTimeoutMs:5});
- await assert.rejects(fixture.instance.start('call-1',fixture.api),/连接超时/);
+ await assert.rejects(fixture.instance.start('call-1',fixture.api,'tls'),/连接超时/);
  assert.equal(fixture.offers,1);assert.equal(fixture.peer.closeCount,1);
  assert.equal(fixture.localTrack.stopCount,1);assert.equal(fixture.audio.pauseCount,1);assert.equal(fixture.audio.srcObject,null);
 });
@@ -310,18 +326,19 @@ test('CallMedia posts an offer whose Opus fmtp is the rewritten contract',async(
 /** A gathering peer whose offer never carries a relay candidate, so the relay wait hits its cap. */
 function noRelayPeer(){const peer=new FakePeer('gathering');peer.createOffer=async()=>({type:'offer' as RTCSdpType,sdp:'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n'});return peer;}
 
-function tlsRetryFixture(peers:FakePeer[],offerError?:Error){
- const transports:string[]=[],paths:string[]=[];
+function tlsRetryFixture(peers:FakePeer[],offerError?:Error,overrides:ConstructorParameters<typeof CallMedia>[1]={}){
+ const transports:string[]=[],paths:string[]=[],peerCreatedAt:number[]=[];let failures=0;
  const track={enabled:true,stop(){}} as unknown as MediaStreamTrack,stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
- const instance=new CallMedia(()=>{},{
+ const instance=new CallMedia(()=>{failures++;},{
   authorize:async(_callId,_api,transport)=>{transports.push(transport);return udp;},
-  getUserMedia:async()=>stream,createPeer:()=>peers.shift() as unknown as RTCPeerConnection,
+  getUserMedia:async()=>stream,createPeer:()=>{peerCreatedAt.push(performance.now());return peers.shift() as unknown as RTCPeerConnection;},
   createAudio:()=>Object.assign(new EventTarget(),{autoplay:false,srcObject:null,play:async()=>{},pause(){}}) as unknown as HTMLAudioElement,
   remoteStream:()=>stream,audioCodecs:()=>[{mimeType:'audio/opus',clockRate:48000,channels:1}],
   window:new EventTarget() as unknown as Window,connection:new EventTarget(),iceTimeoutMs:20,connectedTimeoutMs:20,
+  ...overrides,
  });
  const api:TestMediaAPI=async<T>(path:string)=>{paths.push(path);if(offerError)throw offerError;return {type:'answer',sdp:'v=0\r\n'} as T;};
- return {instance,api,transports,paths};
+ return {instance,api,transports,paths,peerCreatedAt,get failures(){return failures;}};
 }
 async function diagEvents(run:()=>Promise<unknown>){
  const posted:{event:string;fields:Record<string,unknown>}[]=[];
@@ -331,9 +348,9 @@ async function diagEvents(run:()=>Promise<unknown>){
  return posted.filter(item=>item.event.startsWith('media.'));
 }
 
-test('shouldRetryTls only covers UDP relay-stage failures',()=>{
- for(const code of ['NO_RELAY_CANDIDATE','ICE_FAILED','ICE_TIMEOUT'])assert.equal(shouldRetryTls(Object.assign(new Error('x'),{code}),'udp'),true);
- assert.equal(shouldRetryTls(Object.assign(new Error('x'),{code:'ICE_TIMEOUT'}),'tls'),false);
+test('shouldRetryTls only covers UDP relay and ICE-connect failures',()=>{
+ for(const code of ['NO_RELAY_CANDIDATE','ICE_FAILED','ICE_TIMEOUT','ICE_CONNECT_TIMEOUT','ICE_CONNECT_FAILED'])assert.equal(shouldRetryTls(Object.assign(new Error('x'),{code}),'udp'),true);
+ for(const code of ['ICE_TIMEOUT','ICE_CONNECT_TIMEOUT','ICE_CONNECT_FAILED'])assert.equal(shouldRetryTls(Object.assign(new Error('x'),{code}),'tls'),false);
  assert.equal(shouldRetryTls(new DOMException('媒体连接已取消','AbortError'),'udp'),false);
  assert.equal(shouldRetryTls(Object.assign(new Error('x'),{status:401,code:'UNAUTHORIZED'}),'udp'),false);
  assert.equal(shouldRetryTls(Object.assign(new Error('x'),{code:'MEDIA_BRIDGE_UNAVAILABLE'}),'udp'),false);
@@ -351,12 +368,26 @@ test('a UDP relay timeout retries once over TLS before any offer and logs media.
  assert.deepEqual(events.find(item=>item.event==='media.retry_tls')?.fields.code,'ICE_TIMEOUT');
 });
 
-test('TLS failures, post-offer failures and bridge rejections never retry',async()=>{
+test('a UDP leg that never connects after the offer retries once over TLS (iOS iceConnectTimedOut/iceConnectionFailed parity)',async()=>{
+ const postOffer=tlsRetryFixture([new FakePeer('checking'),new FakePeer('connected')]);
+ const events=await diagEvents(async()=>{await postOffer.instance.start('call-b',postOffer.api,'udp');postOffer.instance.stop();});
+ assert.deepEqual(postOffer.transports,['udp','tls']);assert.deepEqual(postOffer.paths,['/calls/call-b/media/offer','/calls/call-b/media/offer']);
+ assert.equal(events.find(item=>item.event==='media.failed')?.fields.stage,'connect');
+ assert.equal(events.find(item=>item.event==='media.retry_tls')?.fields.code,'ICE_CONNECT_TIMEOUT');
+ const failing=new FakePeer('gathering');failing.iceGatheringState='complete';failing.localDescription={type:'offer',sdp:GATHERED_OFFER};
+ failing.setRemoteDescription=async function(this:FakePeer,value:RTCSessionDescriptionInit){this.remoteDescription=value;setTimeout(()=>{this.connectionState='failed';this.emitConnection();},0);};
+ const failed=tlsRetryFixture([failing,new FakePeer('connected')]);
+ const failedEvents=await diagEvents(async()=>{await failed.instance.start('call-f',failed.api,'udp');failed.instance.stop();});
+ assert.deepEqual(failed.transports,['udp','tls']);assert.equal(failed.failures,0,'a setup failure is not the established-call failure path');
+ assert.equal(failedEvents.find(item=>item.event==='media.retry_tls')?.fields.code,'ICE_CONNECT_FAILED');
+});
+
+test('TLS failures (before or after the offer) and bridge rejections never retry',async()=>{
  const tls=tlsRetryFixture([noRelayPeer()]);
  await assert.rejects(tls.instance.start('call-a',tls.api,'tls'),/音频网络连接超时/);assert.deepEqual(tls.transports,['tls']);
  const postOffer=tlsRetryFixture([new FakePeer('checking'),new FakePeer('connected')]);
- const events=await diagEvents(()=>assert.rejects(postOffer.instance.start('call-b',postOffer.api,'udp'),/通话音频连接超时/));
- assert.deepEqual(postOffer.transports,['udp']);assert.equal(postOffer.paths.length,1);
+ const events=await diagEvents(()=>assert.rejects(postOffer.instance.start('call-b',postOffer.api,'tls'),/通话音频连接超时/));
+ assert.deepEqual(postOffer.transports,['tls']);assert.equal(postOffer.paths.length,1);
  assert.equal(events.find(item=>item.event==='media.failed')?.fields.stage,'connect');
  const rejected=tlsRetryFixture([new FakePeer('connected'),new FakePeer('connected')],Object.assign(new Error('bridge'),{code:'MEDIA_BRIDGE_UNAVAILABLE'}));
  await assert.rejects(rejected.instance.start('call-c',rejected.api,'udp'),/bridge/);assert.deepEqual(rejected.transports,['udp']);
@@ -394,7 +425,7 @@ function statsPeer(mode:PeerMode){const peer=new FakePeer(mode) as FakePeer&{get
 function rejoinFixture(peers:FakePeer[],offer:(count:number)=>void=()=>{},authorizeHook:(rejoin:boolean)=>void=()=>{}){
  const transports:string[]=[],rejoinFlags:boolean[]=[],reconnecting:boolean[]=[];let failures=0,offers=0,microphones=0;
  const track={enabled:true,stopCount:0,stop(){this.stopCount++;}},stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
- const all=[...peers],browserWindow=new EventTarget(),connection=new EventTarget();
+ const all=[...peers],browserWindow=new EventTarget(),connection=Object.assign(new EventTarget(),{type:'wifi'});
  const instance=new CallMedia(()=>{failures++;},{
   authorize:async(_callId,_api,transport,_signal,rejoin)=>{transports.push(transport);rejoinFlags.push(rejoin===true);authorizeHook(rejoin===true);return udp;},
   getUserMedia:async()=>{microphones++;return stream;},createPeer:()=>peers.shift() as unknown as RTCPeerConnection,
@@ -560,7 +591,7 @@ test('S73d rejoin attempts skip the media-node probe (authorize gets rejoin=true
 });
 
 test('S73d a network change during a rejoin attempt consumes no attempt and keeps the transport',async()=>{
- const fixture:ReturnType<typeof rejoinFixture>=rejoinFixture([1,2,3,4,5].map(()=>statsPeer('connected')),count=>{if(count>=2&&count<=4)fixture.connection.dispatchEvent(new Event('change'));});
+ const fixture:ReturnType<typeof rejoinFixture>=rejoinFixture([1,2,3,4,5].map(()=>statsPeer('connected')),count=>{if(count>=2&&count<=4)switchNetwork(fixture.connection);});
  const events=await diagEvents(async()=>{
   await fixture.instance.start('call-flap',fixture.api,'udp');
   const first=fixture.all[0]!;first.connectionState='failed';first.emitConnection();
@@ -607,4 +638,120 @@ test('S73e setup failing while offline waits for online and retries (uncounted, 
   await assert.rejects(online.instance.start('call-setup-online',online.api,'tls'),/通话音频连接超时/);
   assert.equal(online.failures,0);assert.deepEqual(online.transports,['tls']);assert.deepEqual(online.reconnecting,[]);
  }finally{if(descriptor)Object.defineProperty(globalThis,'navigator',descriptor);else delete (globalThis as {navigator?:unknown}).navigator;}
+});
+
+function memoryStorage(){const values=new Map<string,string>();return {values,getItem:(key:string)=>values.get(key)??null,setItem:(key:string,value:string)=>{values.set(key,value);},removeItem:(key:string)=>{values.delete(key);}};}
+
+test('P1 a second call within the probe TTL reuses the accepted measurement and posts no /media/probes/options',async()=>{
+ const original=globalThis.fetch,paths:string[]=[],generations:unknown[]=[];
+ globalThis.fetch=(async()=>new Response(JSON.stringify({ok:true,nodeId:'demo-node-1'}))) as typeof fetch;
+ try{
+  const peers=[new FakePeer('connected'),new FakePeer('connected')];
+  const track={enabled:true,stop(){}},stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
+  const instance=new CallMedia(()=>{},{
+   getUserMedia:async()=>stream,createPeer:()=>peers.shift() as unknown as RTCPeerConnection,
+   createAudio:()=>Object.assign(new EventTarget(),{autoplay:false,srcObject:null,play:async()=>{},pause(){}}) as unknown as HTMLAudioElement,
+   remoteStream:()=>stream,audioCodecs:()=>[{mimeType:'audio/opus',clockRate:48000,channels:1}],
+   window:new EventTarget() as unknown as Window,connection:new EventTarget(),iceTimeoutMs:20,connectedTimeoutMs:20,storage:null,
+  });
+  const api:TestMediaAPI=async<T>(path:string,body?:unknown)=>{
+   paths.push(path);const generation=(body as {networkGeneration?:string}|undefined)?.networkGeneration;
+   if(path==='/media/probes/options')return {networkGeneration:generation,nodes:[{nodeId:'demo-node-1',probeUrl:'https://control.example.com/probe',grants:['one','two','three']}]} as T;
+   if(path==='/media/probes/results')return {accepted:(body as {samples:unknown[]}).samples.length} as T;
+   if(path==='/media/quality-probes/options')throw Object.assign(new Error('disabled'),{code:'MEDIA_QUALITY_UNAVAILABLE'});
+   if(path.endsWith('/media/options')){generations.push(generation);return udp as T;}
+   return {type:'answer',sdp:'v=0\r\n'} as T;
+  };
+  await instance.start('call-p1',api,'udp');instance.stop();
+  const firstCall=paths.length;
+  await instance.start('call-p2',api,'udp');instance.stop();
+  assert.equal(paths.filter(path=>path==='/media/probes/options').length,1);
+  assert.deepEqual(paths.slice(firstCall),['/calls/call-p2/media/options','/calls/call-p2/media/offer']);
+  assert.equal(generations.length,2);assert.equal(generations[0],generations[1],'the accepted generation is reused');
+ }finally{globalThis.fetch=original;}
+});
+
+test('P3 the microphone is requested at call start, in parallel with media authorization',async()=>{
+ const order:string[]=[];let authorized!:()=>void;
+ const peer=new FakePeer('connected'),track={enabled:true,stopCount:0,stop(){this.stopCount++;}},stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
+ const instance=new CallMedia(()=>{},{
+  authorize:async()=>{order.push('authorize');await new Promise<void>(resolve=>{authorized=resolve;});order.push('authorized');return udp;},
+  getUserMedia:async()=>{order.push('microphone');return stream;},createPeer:()=>peer as unknown as RTCPeerConnection,
+  createAudio:()=>Object.assign(new EventTarget(),{autoplay:false,srcObject:null,play:async()=>{},pause(){}}) as unknown as HTMLAudioElement,
+  remoteStream:()=>stream,audioCodecs:()=>[{mimeType:'audio/opus',clockRate:48000,channels:1}],
+  window:new EventTarget() as unknown as Window,connection:new EventTarget(),iceTimeoutMs:20,connectedTimeoutMs:20,storage:null,
+ });
+ const api:TestMediaAPI=async<T>()=>({type:'answer',sdp:'v=0\r\n'}) as T;
+ const running=instance.start('call-mic',api,'udp');
+ await new Promise(resolve=>setTimeout(resolve,0));
+ assert.deepEqual([...order].sort(),['authorize','microphone'],'both started before authorization finished');
+ authorized();await running;
+ assert.equal(order.at(-1),'authorized');assert.equal(instance.hasMicrophone,true);assert.equal(track.stopCount,0);
+ instance.stop();assert.equal(track.stopCount,1);
+});
+
+test('P3 a microphone that resolves after authorization failed is released',async()=>{
+ let grant!:(value:MediaStream)=>void;const track={enabled:true,stopCount:0,stop(){this.stopCount++;}},stream={getTracks:()=>[track],getAudioTracks:()=>[track]} as unknown as MediaStream;
+ const instance=new CallMedia(()=>{},{
+  authorize:async()=>{throw Object.assign(new Error('not winner'),{status:403,code:'MEDIA_NOT_WINNER'});},
+  getUserMedia:()=>new Promise<MediaStream>(resolve=>{grant=resolve;}),
+  window:new EventTarget() as unknown as Window,connection:new EventTarget(),storage:null,
+ });
+ await assert.rejects(instance.start('call-denied',(async()=>({})) as TestMediaAPI,'udp'),/not winner/);
+ assert.equal(track.stopCount,0);grant(stream);await new Promise(resolve=>setTimeout(resolve,0));
+ assert.equal(track.stopCount,1);assert.equal(instance.hasMicrophone,false);
+});
+
+test('P2 a UDP-first attempt with the TLS fallback ahead caps relay gathering; the TLS attempt keeps the full budget',async()=>{
+ assert.equal(UDP_FALLBACK_GATHER_CAP_MS,5000);
+ const fixture=tlsRetryFixture([noRelayPeer(),noRelayPeer()],undefined,{iceTimeoutMs:250,udpGatherCapMs:20,storage:null});
+ const began=performance.now();
+ await assert.rejects(fixture.instance.start('call-cap',fixture.api,'udp'),/音频网络连接超时/);
+ const ended=performance.now(),[udpAt,tlsAt]=fixture.peerCreatedAt as [number,number];
+ assert.deepEqual(fixture.transports,['udp','tls']);
+ assert.ok(tlsAt-udpAt<200,`UDP gathered ${Math.round(tlsAt-udpAt)} ms, capped well below the 250 ms budget`);
+ assert.ok(ended-tlsAt>=230,`TLS gathered ${Math.round(ended-tlsAt)} ms, the full budget`);
+ assert.ok(ended-began<2000);
+});
+
+test('P2 a UDP→TLS fallback is remembered so the next call starts on TLS; a failing learned TLS is forgotten',async()=>{
+ const storage=memoryStorage();
+ const first=tlsRetryFixture([noRelayPeer(),new FakePeer('connected')],undefined,{storage});
+ await first.instance.start('call-learn',first.api,'udp');first.instance.stop();
+ assert.deepEqual(first.transports,['udp','tls']);
+ const second=tlsRetryFixture([new FakePeer('connected')],undefined,{storage});
+ const events=await diagEvents(async()=>{await second.instance.start('call-learned',second.api,'udp');second.instance.stop();});
+ assert.deepEqual(second.transports,['tls'],'starts on the transport that worked here');
+ assert.equal(events.find(item=>item.event==='media.options')?.fields.learned,true);
+ const third=tlsRetryFixture([noRelayPeer()],undefined,{storage});
+ await assert.rejects(third.instance.start('call-stale',third.api,'udp'),/音频网络连接超时/);
+ assert.deepEqual(third.transports,['tls'],'no second retry from a learned TLS start');
+ const fourth=tlsRetryFixture([new FakePeer('connected')],undefined,{storage});
+ await fourth.instance.start('call-udp-again',fourth.api,'udp');fourth.instance.stop();
+ assert.deepEqual(fourth.transports,['udp']);assert.equal(storage.values.size,0);
+ const explicit=tlsRetryFixture([new FakePeer('connected')],undefined,{storage});
+ await explicit.instance.start('call-explicit',explicit.api,'tls');explicit.instance.stop();
+ assert.equal(storage.values.size,0,'an explicit TLS choice teaches nothing');
+});
+
+test('P2 transport memory: 24 h from the UDP failure, same network label only, and storage failures are harmless',()=>{
+ const storage=memoryStorage(),now=1_000_000;
+ rememberTransport('tls',storage,now,'wifi');
+ assert.equal(learnedTransport(storage,now+LEARNED_TRANSPORT_TTL_MS-1,'wifi'),'tls');
+ assert.equal(learnedTransport(storage,now+1,'cellular'),undefined,'another network starts on UDP');
+ assert.equal(storage.values.size,0,'and drops the stale memory');
+ rememberTransport('tls',storage,now,'unknown');
+ assert.equal(learnedTransport(storage,now+LEARNED_TRANSPORT_TTL_MS,'unknown'),undefined,'expired after 24 h');
+ const broken={getItem:()=>{throw new Error('denied');},setItem:()=>{throw new Error('denied');},removeItem:()=>{throw new Error('denied');}};
+ assert.doesNotThrow(()=>rememberTransport('tls',broken,now,'wifi'));assert.equal(learnedTransport(broken,now,'wifi'),undefined);
+ assert.equal(readTransportChoice(broken),'udp');assert.doesNotThrow(()=>saveTransportChoice('tls',broken));
+ assert.equal(readTransportChoice(storage),'udp');saveTransportChoice('tls',storage);assert.equal(readTransportChoice(storage),'tls');
+ saveTransportChoice('udp',storage);assert.equal(readTransportChoice(storage),'udp');assert.equal(readTransportChoice(null),'udp');
+});
+
+test('P2 only a connection type change or an onLine flip is a network switch',()=>{
+ assert.equal(networkSwitched({type:'wifi',onLine:true},{type:'wifi',onLine:true}),false);
+ assert.equal(networkSwitched({onLine:true},{onLine:true}),false,'no type (desktop Chrome): estimate changes are ignored');
+ assert.equal(networkSwitched({type:'wifi',onLine:true},{type:'cellular',onLine:true}),true);
+ assert.equal(networkSwitched({type:'wifi',onLine:true},{type:'wifi',onLine:false}),true);
 });

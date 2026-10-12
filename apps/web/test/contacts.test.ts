@@ -10,11 +10,14 @@ import {
   contactCardActions,
   contactDraftBody,
   contactDraftError,
+  locationFull,
+  locationShort,
   contactDraftFrom,
   contactPhoneFor,
   contactPickerSupported,
   contactPrimaryNumber,
   contactsPath,
+  fetchAllContacts,
   emptyContactDraft,
   emptyImportSummary,
   importBatches,
@@ -24,6 +27,7 @@ import {
   phoneLabelText,
   pickedContactsToImport,
   samePhoneNumber,
+  type ApiRequest,
   type ContactDto,
   type ContactImportEntry,
 } from '../src/contacts.ts';
@@ -233,9 +237,25 @@ test('the card unblocks with the phone-level entry, and the contact-level one on
 });
 
 test('the contacts list path carries the server-side search', () => {
-  assert.equal(contactsPath(''), '/contacts?limit=200');
-  assert.equal(contactsPath('   '), '/contacts?limit=200');
+  assert.equal(contactsPath(''), '/contacts?limit=500');
+  assert.equal(contactsPath('   '), '/contacts?limit=500');
   assert.equal(contactsPath('张三', 50), '/contacts?limit=50&query=%E5%BC%A0%E4%B8%89');
+  assert.equal(contactsPath('', 500, 1000), '/contacts?limit=500&offset=1000');
+});
+
+test('an empty search pages through the whole address book; a search is one request', async () => {
+  const paths: string[] = [];
+  const sizes = [500, 500, 13];
+  const request = (async (path: string) => {
+    paths.push(path);
+    const size = sizes[paths.length - 1] ?? 0;
+    return {items: Array.from({length: size}, (_, i) => ({id: `c-${paths.length}-${i}`, displayName: 'x'}))};
+  }) as ApiRequest;
+  assert.equal((await fetchAllContacts(request, '')).length, 1013);
+  assert.deepEqual(paths, ['/contacts?limit=500', '/contacts?limit=500&offset=500', '/contacts?limit=500&offset=1000']);
+  paths.length = 0;
+  await fetchAllContacts(request, '张三');
+  assert.equal(paths.length, 1);
 });
 
 test('Contact Picker results map onto the import body and detection stays feature based', () => {
@@ -272,4 +292,15 @@ test('Contact Picker results map onto the import body and detection stays featur
   assert.equal(contactPickerSupported({navigator: {}}), false);
   assert.equal(contactPickerSupported({navigator: {contacts: {}}}), false);
   assert.equal(contactPickerSupported({navigator: {contacts: {select: () => []}}}), true);
+});
+
+test('S96 归属地简短 / 完整形态（四端共用向量）', () => {
+  assert.equal(locationShort('广东 深圳 · 移动'), '广东 深圳');
+  assert.equal(locationShort('北京 · 联通'), '北京');
+  assert.equal(locationShort('加纳'), '加纳');
+  for (const empty of ['', '  ', undefined, null]) {
+    assert.equal(locationShort(empty), undefined);
+    assert.equal(locationFull(empty), undefined);
+  }
+  assert.equal(locationFull(' 广东 深圳 · 移动 '), '广东 深圳 · 移动');
 });

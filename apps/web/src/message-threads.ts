@@ -1,10 +1,10 @@
 import type {ApiRequest} from './contacts';
-export type ThreadMessage={id:string;simId:string;direction:string;number?:string;remoteNumber?:string;body:string;state:string;conversationAddress?:string;replyNumber?:string|null;canReply?:boolean;createdAt:string;contactId?:string|null;contactName?:string|null;blocked?:boolean;blockedEntryId?:string|null;/** S67c: missing = false. */unread?:boolean};
+export type ThreadMessage={id:string;simId:string;direction:string;number?:string;remoteNumber?:string;body:string;state:string;conversationAddress?:string;replyNumber?:string|null;canReply?:boolean;createdAt:string;contactId?:string|null;contactName?:string|null;blocked?:boolean;blockedEntryId?:string|null;/** S67c: missing = false. */unread?:boolean;/** S96 归属地（完整形态）。 */remoteLocation?:string|null};
 /**
  * `conversationAddress` is the server's own thread key (S30 §1.3 normalises both sides of it), and `remoteNumber`
  * is the raw number the rows carry — 屏蔽 takes that one, never the normalised address.
  */
-export type MessageThread={key:string;simId:string;number:string;conversationAddress:string|null;remoteNumber:string|null;contactName:string|null;messages:ThreadMessage[]};
+export type MessageThread={key:string;simId:string;number:string;conversationAddress:string|null;remoteNumber:string|null;contactName:string|null;/** S96：最新一条带值消息的归属地。 */remoteLocation?:string|null;messages:ThreadMessage[]};
 export const MAX_SMS_SELECTION = 500;
 export type SmsDeleteSkipped={id:string;reason:'not_found'|'in_flight'};
 export type SmsDeleteResult={deleted:number;skipped:SmsDeleteSkipped[]};
@@ -35,7 +35,7 @@ export function messageThreads(messages:ThreadMessage[]):MessageThread[]{
   const group=groups.get(key)||{key,simId:message.simId,number,conversationAddress:null,remoteNumber:null,contactName:null,messages:[]};
   group.messages.push(message);groups.set(key,group);
  }
- return [...groups.values()].map(group=>{const ordered=[...group.messages].sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id));return {...group,messages:ordered,contactName:threadContactName(ordered),conversationAddress:newestField(ordered,m=>m.conversationAddress),remoteNumber:newestField(ordered,m=>m.remoteNumber||m.number)};})
+ return [...groups.values()].map(group=>{const ordered=[...group.messages].sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id));return {...group,messages:ordered,contactName:threadContactName(ordered),conversationAddress:newestField(ordered,m=>m.conversationAddress),remoteNumber:newestField(ordered,m=>m.remoteNumber||m.number),remoteLocation:newestField(ordered,m=>m.remoteLocation||undefined)};})
  .sort((a,b)=>b.messages.at(-1)!.createdAt.localeCompare(a.messages.at(-1)!.createdAt)||a.key.localeCompare(b.key));
 }
 

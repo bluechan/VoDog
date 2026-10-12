@@ -131,3 +131,13 @@ export function gatewayPowerToggle(item: GatewayPowerDto, now: number = Date.now
   }
   return {desired, checked: online, disabled: false, hint: online ? '关闭后网关设备恢复本地通话。' : '开启后网关重新连接服务器。'};
 }
+
+/** S132: the 关闭 confirm shared by 设置 → 网关 and the admin 网关 cards. */
+export function gatewayPowerOffPrompt(name: string): string {
+  return `关闭 ${name} 的网关总控？网关设备将恢复本地通话。`;
+}
+
+/** S132: an older Control has no `/gateways/power` route (404) — a missing feature, not an error to show. */
+export function gatewayPowerUnsupported(error: unknown): boolean {
+  return (error as {status?: unknown})?.status === 404;
+}

@@ -80,3 +80,59 @@ test('a refreshed outgoing sent row appears in the correct SIM thread without a 
     if (renderer) await act(async () => { renderer!.unmount(); });
   }
 });
+
+test('S97: copying a verification code from a list row marks only that incoming message read', async () => {
+  const {Messages} = await loadMessages();
+  const older: ThreadMessage = {
+    id: 'older-unread', simId: 'sim-a', direction: 'incoming', remoteNumber: '10690000',
+    body: '旧消息', state: 'received', createdAt: '2026-10-01T06:40:00.000Z', unread: true,
+  };
+  const codeSms: ThreadMessage = {
+    id: 'code-sms', simId: 'sim-a', direction: 'incoming', remoteNumber: '10690000',
+    body: '您的验证码是 482913，5 分钟内有效。', state: 'received', createdAt: '2026-10-01T06:41:00.000Z', unread: true,
+  };
+  const reads: string[][] = [];
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(React.createElement(Messages, {
+        messages: [older, codeSms], simId: 'sim-a', simLabel: '号码 A', online: true, busy: false, timeZone: 'UTC',
+        account: 'copy-code-test', onSend: async () => {}, onReadIncoming: (ids: string[]) => { reads.push(ids); },
+      }));
+    });
+    const copy = renderer!.root.findAll(node => node.type === 'button' && node.props.className === 'code-copy')[0]!;
+    await act(async () => { copy.props.onClick(); });
+    assert.deepEqual(reads, [['code-sms']]);
+    // The older message is still unread, so the dot stays; only the copied message was marked.
+    const dot = () => renderer!.root.findAll(node => node.type === 'span' && String(node.props.className || '').includes('thread-unread-dot'))[0]!;
+    assert.equal(dot().props['data-on'], true);
+    await act(async () => { copy.props.onClick(); });
+    assert.deepEqual(reads, [['code-sms']], 'a second copy does not resend');
+  } finally {
+    if (renderer) await act(async () => { renderer!.unmount(); });
+  }
+});
+
+test('S97: copying the code clears the row dot when it was the only unread message', async () => {
+  const {Messages} = await loadMessages();
+  const codeSms: ThreadMessage = {
+    id: 'only-code', simId: 'sim-a', direction: 'incoming', remoteNumber: '10690001',
+    body: '验证码 7731，请勿泄露。', state: 'received', createdAt: '2026-10-01T06:41:00.000Z', unread: true,
+  };
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    await act(async () => {
+      renderer = create(React.createElement(Messages, {
+        messages: [codeSms], simId: 'sim-a', simLabel: '号码 A', online: true, busy: false, timeZone: 'UTC',
+        account: 'copy-code-dot-test', onSend: async () => {}, onReadIncoming: () => {},
+      }));
+    });
+    const dot = () => renderer!.root.findAll(node => node.type === 'span' && String(node.props.className || '').includes('thread-unread-dot'))[0]!;
+    assert.equal(dot().props['data-on'], true);
+    const copy = renderer!.root.findAll(node => node.type === 'button' && node.props.className === 'code-copy')[0]!;
+    await act(async () => { copy.props.onClick(); });
+    assert.equal(dot().props['data-on'], undefined);
+  } finally {
+    if (renderer) await act(async () => { renderer!.unmount(); });
+  }
+});

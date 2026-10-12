@@ -105,3 +105,28 @@ test('S38 手机直拨的录音默认打开 Pixel 归档，并和其他录音一
   await vite.close();
  }
 });
+
+test('S118 recordingStatus none 显示「无录音」，不开播放器也不请求录音；pending 保持「查看录音」',async()=>{
+ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+ const vite=await createServer({root,server:{middlewareMode:true},appType:'custom'});
+ const previousFetch=globalThis.fetch;let fetches=0;
+ (globalThis as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT=true;
+ globalThis.fetch=async()=>{fetches++;return new Response('{}',{status:404});};
+ let renderer:ReactTestRenderer|undefined;
+ try{
+  const {CallRecording}=await vite.ssrLoadModule('/src/recording.tsx') as typeof import('../src/recording.tsx');
+  const texts=()=>renderer!.root.findAll(node=>typeof node.type==='string'&&node.children.every(child=>typeof child==='string')).map(node=>[node.type,node.children.join(''),node.props.disabled===true]);
+  await act(async()=>{renderer=create(React.createElement(CallRecording,{callId,recordingStatus:'none'}));});
+  assert.deepEqual(texts(),[['button','无录音',true]]);
+  await act(async()=>{renderer!.update(React.createElement(CallRecording,{callId,recordingStatus:'none',alwaysOpen:true}));});
+  assert.deepEqual(texts(),[['p','本次通话没有录音',false]]);
+  assert.equal(fetches,0);
+  await act(async()=>{renderer!.update(React.createElement(CallRecording,{callId,recordingStatus:'pending'}));});
+  assert.ok(renderer!.root.findAllByType('button').some(node=>node.children.join('')==='查看录音'&&!node.props.disabled));
+ }finally{
+  if(renderer)await act(async()=>renderer!.unmount());
+  globalThis.fetch=previousFetch;
+  delete (globalThis as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT;
+  await vite.close();
+ }
+});

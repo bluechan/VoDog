@@ -1,6 +1,10 @@
 export type CallLivenessSnapshot={mediaEpoch:number;revision:number;expiresAt:string};
 export type CallLivenessAPI=<T>(path:string,body?:unknown,method?:string,options?:{signal?:AbortSignal;timeoutMs?:number})=>Promise<T>;
 type Timer=ReturnType<typeof setTimeout>;
+/** S98：PUT 没拿到 HTTP 回答（断网、超时）时多快再试；只有 HTTP 冲突才需要先 GET 对账。 */
+export const LIVENESS_NETWORK_RETRY_MS=500;
+/** HTTP 回答（含 409 冲突）带 status；断网、超时、取消没有。 */
+const answeredByServer=(error:unknown)=>typeof (error as {status?:unknown}|null)?.status==='number';
 
 export class WebCallLiveness{
  private generation=0;
@@ -10,7 +14,8 @@ export class WebCallLiveness{
  private snapshot?:CallLivenessSnapshot;
  private readonly onLost:(callId:string,message:string)=>void;
  private readonly intervalMs:number;
- constructor(onLost:(callId:string,message:string)=>void,intervalMs=5000){this.onLost=onLost;this.intervalMs=intervalMs;}
+ private readonly networkRetryMs:number;
+ constructor(onLost:(callId:string,message:string)=>void,intervalMs=5000,networkRetryMs=LIVENESS_NETWORK_RETRY_MS){this.onLost=onLost;this.intervalMs=intervalMs;this.networkRetryMs=networkRetryMs;}
  get callId(){return this.activeCallId;}
  start(callId:string,snapshot:CallLivenessSnapshot,api:CallLivenessAPI){
   this.stop();this.activeCallId=callId;this.snapshot=this.validate(snapshot);const generation=this.generation;
@@ -34,6 +39,8 @@ export class WebCallLiveness{
     if(generation!==this.generation)return;this.snapshot=this.validate(result.liveness);
    }catch(error){
     if(generation!==this.generation||controller.signal.aborted)return;
+    // S98：PUT 根本没到 Control（或回答丢了）时 GET 多半也到不了，白白再花 4 s；下一次 PUT 若撞上 409 再对账。
+    if(!answeredByServer(error))throw error;
     const detail=await api<{liveness:CallLivenessSnapshot|null}>(`/calls/${encodeURIComponent(callId)}`,undefined,'GET',{signal:controller.signal,timeoutMs:4000});
     if(generation!==this.generation)return;answered=true;
     if(!detail.liveness||detail.liveness.mediaEpoch!==current.mediaEpoch)throw error;
@@ -42,8 +49,8 @@ export class WebCallLiveness{
    this.schedule(generation,api);
   }catch{
    if(generation!==this.generation||controller.signal.aborted)return;
-   // S73 D7：连不上 Control（断网、媒体正在重连）时租约未到期就 1 s 后再试；Control 明确说租约没了或本地租约已过期才结束。
-   if(!answered&&Date.now()<Date.parse(current.expiresAt)){this.schedule(generation,api,1000);return;}
+   // S73 D7：连不上 Control（断网、媒体正在重连）时租约未到期就 0.5 s 后再试；Control 明确说租约没了或本地租约已过期才结束。
+   if(!answered&&Date.now()<Date.parse(current.expiresAt)){this.schedule(generation,api,this.networkRetryMs);return;}
    this.stop();this.onLost(callId,'无法确认通话连接，正在安全结束通话');
   }finally{if(this.operation===controller)this.operation=undefined;}
  }

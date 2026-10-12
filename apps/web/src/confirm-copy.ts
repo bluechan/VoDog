@@ -1,5 +1,8 @@
 export const GATEWAY_DELETE_PROMPT =
   '只能删除尚未产生通话、命令或防重记录的测试网关。若网关仍被占用或已有历史，服务器会拒绝删除，不会先结束通话再删除。';
+/** S130：「更换模组配对码」先确认，因为该码会把这一行改绑到新模组。 */
+export const GATEWAY_REPLACE_MODULE_PROMPT =
+  '生成更换模组配对码？用它配对后，原模组的令牌将失效，且该码只应在新模组上使用。';
 export const PASSKEY_DELETE_PROMPT = '确定删除这把通行密钥？删除后无法再用它登录。';
 /** Ending another device's answered call for this account (S20 D6). */
 export const CALL_RELEASE_PROMPT = '将挂断本账号在另一台设备上的通话。确认后这通电话立即结束。';

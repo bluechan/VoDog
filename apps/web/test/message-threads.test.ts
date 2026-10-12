@@ -61,3 +61,10 @@ test('delete-and-block reports the durable block when thread deletion fails',asy
  assert.deepEqual(paths,['/blocklist','/sms/threads/delete']);
  assert.deepEqual(bodies[0],{remoteNumber:'2025550111',scope:'sms'},'S66: 删除并屏蔽 only enters the SMS blocklist');
 });
+
+test('S96：会话归属地取最新一条带值消息的 remoteLocation，缺省兼容',()=>{
+ const at=(id:string,time:string,remoteLocation?:string|null):ThreadMessage=>({...m(id,'s','2025550111',time),...(remoteLocation===undefined?{}:{remoteLocation})});
+ assert.equal(messageThreads([at('a','2026-10-01T00:00:00Z','北京 · 移动'),at('b','2026-10-01T00:01:00Z','广东 深圳 · 移动')])[0].remoteLocation,'广东 深圳 · 移动');
+ assert.equal(messageThreads([at('a','2026-10-01T00:00:00Z','北京 · 移动'),at('b','2026-10-01T00:01:00Z',null)])[0].remoteLocation,'北京 · 移动');
+ assert.equal(messageThreads([at('a','2026-10-01T00:00:00Z')])[0].remoteLocation,null);
+});

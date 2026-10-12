@@ -24,7 +24,7 @@ test('diagnostic audio stats keep four numbers from the audio stream and the nom
   {type:'inbound-rtp',kind:'video',packetsLost:99},
   {type:'candidate-pair',nominated:false,currentRoundTripTime:9},
   {type:'candidate-pair',nominated:true,currentRoundTripTime:0.11,remoteCandidateId:'x'},
- ])),{rx:{packetsLost:7,jitterMs:20},tx:{},packetsLost:7,jitter:0.02,audioLevel:0.3,rtt:0.11});
+ ])),{rx:{packetsLost:7,jitterMs:20},tx:{},rttMs:110,packetsLost:7,jitter:0.02,audioLevel:0.3,rtt:0.11});
  assert.deepEqual(diagAudioStats(report([{type:'inbound-rtp',kind:'audio',jitter:NaN}])),{rx:{},tx:{}});
 });
 
@@ -35,4 +35,30 @@ test('S70 rx/tx map inbound/outbound audio stats and derive jitter buffer ms',()
   {type:'outbound-rtp',kind:'video',packetsSent:9},
   {type:'inbound-rtp',kind:'audio',jitterBufferDelay:1,jitterBufferEmittedCount:0},
  ])),{rx:{packetsReceived:1000,packetsLost:5,concealedSamples:4800,silentConcealedSamples:4000,totalSamplesReceived:960000,concealmentEvents:3,insertedSamplesForDeceleration:10,removedSamplesForAcceleration:20,jitterMs:15.4,jitterBufferMs:0.1},tx:{packetsSent:990,bytesSent:79200}});
+});
+
+test('P3 stats carry the selected pair rtt and candidate types and the bridge view of what we send, never addresses',async()=>{
+ const rows=[
+  {type:'transport',id:'t',selectedCandidatePairId:'pair-b'},
+  {type:'candidate-pair',id:'pair-a',nominated:true,currentRoundTripTime:9,localCandidateId:'local-a',remoteCandidateId:'remote-a'},
+  {type:'candidate-pair',id:'pair-b',nominated:true,currentRoundTripTime:0.2345,localCandidateId:'local-b',remoteCandidateId:'remote-b'},
+  {type:'local-candidate',id:'local-b',candidateType:'relay',address:'198.51.100.7',relayProtocol:'udp'},
+  {type:'remote-candidate',id:'remote-b',candidateType:'host',address:'203.0.113.9'},
+  {type:'remote-inbound-rtp',id:'ri-audio',kind:'audio',fractionLost:0.0390625,roundTripTime:0.31,jitter:0.0042},
+  {type:'remote-inbound-rtp',id:'ri-video',kind:'video',fractionLost:0.5},
+ ];
+ const stats=report(rows),byId=new Map(rows.map(row=>[row.id,row])) as unknown as RTCStatsReport;
+ const expected={rx:{},tx:{},rttMs:234.5,localCandidateType:'relay',remoteCandidateType:'host',txRemote:{fractionLost:0.0390625,roundTripTimeMs:310,jitterMs:4.2}};
+ assert.deepEqual(audioRxTx(byId),expected);
+ assert.equal(JSON.stringify(diagAudioStats(byId)).includes('198.51.100.7'),false);
+ const fallback=audioRxTx(stats);
+ assert.equal(fallback.rttMs,9000,'an unresolvable selectedCandidatePairId falls back to the nominated pair');assert.equal(fallback.localCandidateType,undefined);
+ // Without transport stats (Firefox) the `selected` pair wins; an unknown candidateType is dropped.
+ const firefox=new Map([
+  ['p',{type:'candidate-pair',id:'p',selected:true,currentRoundTripTime:0.05,localCandidateId:'l',remoteCandidateId:'r'}],
+  ['l',{type:'local-candidate',id:'l',candidateType:'relay'}],['r',{type:'remote-candidate',id:'r',candidateType:'198.51.100.7'}],
+ ]) as unknown as RTCStatsReport;
+ assert.deepEqual(audioRxTx(firefox),{rx:{},tx:{},rttMs:50,localCandidateType:'relay'});
+ const monitor=new AudioQualityMonitor({getStats:async()=>byId});await monitor.sample();monitor.stop();
+ assert.deepEqual(monitor.lastRxTx,expected,'media.summary spreads the last sample');
 });

@@ -88,3 +88,8 @@ test('interceptions are shown newest first even when the response is unsorted', 
   assert.deepEqual(items.map(item => item.id), ['b', 'a', 'c'], 'the input list is not mutated');
   assert.deepEqual(sortInterceptions([]), []);
 });
+
+test('S96：拦截行带简短归属地，缺省为空串', () => {
+  assert.equal(interceptionRow({...call, remoteLocation: '广东 深圳 · 移动'}).location, '广东 深圳');
+  assert.equal(interceptionRow(call).location, '');
+});

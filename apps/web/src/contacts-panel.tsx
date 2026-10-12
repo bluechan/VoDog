@@ -10,7 +10,7 @@ import {
   contactPickerSupported,
   contactPrimaryPhone,
   contactVersion,
-  contactsPath,
+  fetchAllContacts,
   emailLabelText,
   emptyContactDraft,
   emptyImportSummary,
@@ -97,10 +97,10 @@ export function ContactsPanel({
 
   useEffect(() => {
     let cancelled = false;
-    request<{items: ContactDto[]}>(contactsPath(search))
+    fetchAllContacts(request, search)
       .then(result => {
         if (cancelled) return;
-        setItems(result.items || []);
+        setItems(result);
         setUnsupported(false);
         setError('');
       })

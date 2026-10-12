@@ -140,7 +140,7 @@ export function InterceptionsPanel({
                 className="record interception-row"
                 key={row.id}
                 disabled={busy}
-                aria-label={`${row.kindLabel} ${row.title}`}
+                aria-label={`${row.kindLabel} ${row.title}${row.location ? `，归属地 ${row.location}` : ''}`}
                 onClick={() => onOpenRow?.(row)}
               >
                 <span className="interception-icon" aria-hidden="true">
@@ -149,6 +149,7 @@ export function InterceptionsPanel({
                 <span className="interception-body">
                   <strong dir="ltr">{row.title}</strong>
                   <small>
+                    {row.location ? <span className="number-location">{row.location} · </span> : null}
                     {row.kindLabel}
                     {row.sourceLabel ? ` · ${row.sourceLabel}` : ''}
                     {row.simLabel || rowSim ? ` · ${row.simLabel || rowSim?.phoneLabel || rowSim?.label || '未命名号码'}` : ''}

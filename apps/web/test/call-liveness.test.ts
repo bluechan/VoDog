@@ -14,20 +14,32 @@ test('heartbeat starts immediately, advances CAS revision, and stops cleanly',as
  lease.stop();const stoppedAt=calls;await wait(8);assert.equal(calls,stoppedAt);assert.equal(lost,0);
 });
 
-test('lost heartbeat response reconciles owner detail before the next CAS',async()=>{
- const bodies:unknown[]=[];let requests=0;
+const conflict=()=>Object.assign(new Error('Call liveness lease is expired or has changed'),{status:409,code:'CALL_LIVENESS_CONFLICT'});
+
+test('lost heartbeat response retries the PUT, and the resulting 409 reconciles owner detail before the next CAS',async()=>{
+ const paths:string[]=[],bodies:unknown[]=[];
  const api:CallLivenessAPI=async<T>(path,body)=>{
-  requests++;if(path.endsWith('/liveness')){bodies.push(body);if(bodies.length===1)throw new Error('response lost');return{liveness:{...initial,revision:3}} as T;}
+  paths.push(path);if(path.endsWith('/liveness')){bodies.push(body);if(bodies.length===1)throw new Error('response lost');if(bodies.length===2)throw conflict();return{liveness:{...initial,revision:3}} as T;}
   return{liveness:{...initial,revision:2}} as T;
  };
- const lease=new WebCallLiveness(()=>assert.fail('lease should reconcile'),8);lease.start('call-1',initial,api);
- await wait(3);assert.equal(requests,2);assert.deepEqual(bodies[0],{mediaEpoch:1,expectedRevision:1});
- await wait(10);assert.deepEqual(bodies[1],{mediaEpoch:1,expectedRevision:2});lease.stop();
+ const lease=new WebCallLiveness(()=>assert.fail('lease should reconcile'),40,15);lease.start('call-1',initial,api);
+ await wait(5);assert.deepEqual(paths,['/calls/call-1/liveness'],'no GET after a network failure');
+ await wait(20);assert.deepEqual(paths,['/calls/call-1/liveness','/calls/call-1/liveness','/calls/call-1']);
+ assert.deepEqual(bodies.slice(0,2),[{mediaEpoch:1,expectedRevision:1},{mediaEpoch:1,expectedRevision:1}]);
+ await wait(45);assert.deepEqual(bodies[2],{mediaEpoch:1,expectedRevision:2});lease.stop();
+});
+
+test('P3 a heartbeat PUT that never reached Control skips the GET and retries after 500 ms',async()=>{
+ const paths:string[]=[];let lost=0;
+ const api:CallLivenessAPI=async<T>(path)=>{paths.push(path);if(paths.length===1)throw new DOMException('timeout','AbortError');return{liveness:{...initial,revision:2}} as T;};
+ const lease=new WebCallLiveness(()=>{lost++;},60_000);lease.start('call-1',initial,api);
+ await wait(20);assert.deepEqual(paths,['/calls/call-1/liveness']);
+ await wait(560);assert.deepEqual(paths,['/calls/call-1/liveness','/calls/call-1/liveness']);assert.equal(lost,0);lease.stop();
 });
 
 test('missing owner lease after heartbeat failure stops once and aborts future work',async()=>{
  let lost=0,requests=0;
- const api:CallLivenessAPI=async<T>(path)=>{requests++;if(path.endsWith('/liveness'))throw new Error('network');return{liveness:null} as T;};
+ const api:CallLivenessAPI=async<T>(path)=>{requests++;if(path.endsWith('/liveness'))throw conflict();return{liveness:null} as T;};
  const lease=new WebCallLiveness((_id,message)=>{lost++;assert.match(message,/安全结束/);},5);lease.start('call-1',initial,api);
  await wait(4);assert.equal(requests,2);assert.equal(lost,1);assert.equal(lease.callId,null);
  await wait(8);assert.equal(requests,2);assert.equal(lost,1);
@@ -37,6 +49,6 @@ test('S73 unreachable Control retries until the local lease expires, then stops 
  let lost=0,requests=0;const lease=new WebCallLiveness(()=>{lost++;},5);
  const api:CallLivenessAPI=async()=>{requests++;throw new Error('offline');};
  lease.start('call-1',{...initial,expiresAt:new Date(Date.now()+500).toISOString()},api);
- await wait(20);assert.equal(requests,2);assert.equal(lost,0);assert.equal(lease.callId,'call-1');
+ await wait(20);assert.equal(requests,1,'P3: no GET after a network failure');assert.equal(lost,0);assert.equal(lease.callId,'call-1');
  await wait(1200);assert.equal(lost,1);assert.equal(lease.callId,null);
 });

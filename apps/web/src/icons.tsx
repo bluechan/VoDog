@@ -1,4 +1,4 @@
-export type IconName='phone'|'messages'|'history'|'contacts'|'settings'|'gateways'|'microphone'|'microphone-off'|'hangup'|'blocked'|'info'|'key'|'search'|'backspace'|'copy'|'more'|'compose'|'offline'|'warning'|'send';
+export type IconName='phone'|'messages'|'history'|'contacts'|'settings'|'gateways'|'microphone'|'microphone-off'|'hangup'|'blocked'|'info'|'key'|'search'|'backspace'|'copy'|'more'|'compose'|'offline'|'warning'|'send'|'plus'|'module';
 const ring=(cx:number,cy:number,r:number)=>`M${cx-r} ${cy}a${r} ${r} 0 1 0 ${2*r} 0a${r} ${r} 0 1 0 ${-2*r} 0`;
 const paths:Record<IconName,string>={
  phone:'M6.5 3.5h3l1.6 4.4-2.1 1.3a11 11 0 0 0 5.8 5.8l1.3-2.1 4.4 1.6v3a2 2 0 0 1-2.2 2A16.5 16.5 0 0 1 4.5 5.7a2 2 0 0 1 2-2.2z',
@@ -21,5 +21,7 @@ const paths:Record<IconName,string>={
  offline:'M3 3l18 18M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 4-2.4M19 12.9a10 10 0 0 0-2.6-1.9M2 9.3a15 15 0 0 1 4.3-2.8M22 9.3A15 15 0 0 0 11 5.1M12 20h.01',
  warning:'M12 4 2.8 19.5h18.4L12 4zM12 10v4.5M12 17.2h.01',
  send:'M12 19V5M6 11l6-6 6 6',
+ plus:'M12 5v14M5 12h14',
+ module:'M4 10h16v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9ZM8 10V4M5.5 5.5 8 4l2.5 1.5M8 14h3m-3 3h6m5-3h.01',
 };
 export function UiIcon({name,size=20}:{name:IconName;size?:number}){return <svg className="ui-icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d={paths[name]}/></svg>;}

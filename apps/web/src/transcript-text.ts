@@ -40,3 +40,7 @@ export function mergeTranscriptSegments(segments:TranscriptSegment[]|undefined|n
  }
  return blocks;
 }
+
+/** S101 `transcript.dialog`: both sides merged into one time-ordered conversation by Control; missing on older Control. */
+export type DialogTurn={role:'remote'|'me'|'ai';text:string;atMs:number;endAtMs?:number;source:'asr'|'ai_realtime';track?:string};
+export type TranscriptDialog={timebase:'end_aligned'|'ai_realtime';maxSkewMs:number;turns:DialogTurn[]};

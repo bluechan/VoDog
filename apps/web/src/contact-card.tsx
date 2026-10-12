@@ -9,9 +9,10 @@ import {
   contactBlockEntry,
   contactCardActions,
   contactVersion,
-  contactsPath,
+  fetchAllContacts,
   emailLabelText,
   isBlockedRow,
+  locationFull,
   numberWithContact,
   phoneLabelText,
   samePhoneNumber,
@@ -34,6 +35,8 @@ export type ContactCardTarget = {
   contactName?: string | null;
   blocked?: boolean;
   blockedEntryId?: string | null;
+  /** S96 归属地（完整形态），来自通话记录。 */
+  remoteLocation?: string | null;
   /** Present when the card was opened from a call record, which owns the transcript and recording. */
   callId?: string | null;
 };
@@ -111,6 +114,8 @@ export function ContactCard({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [refreshError, setRefreshError] = useState('');
+  // S96：`/contacts/lookup` 顶层 `location`，按号码记住，换号码后旧值不再显示。
+  const [lookupLocation, setLookupLocation] = useState<{number: string; location?: string | null} | null>(null);
   useReportedError('contact-card', 'action', error);
   useReportedError('contact-card', 'refresh', refreshError);
   const [liveTarget, setLiveTarget] = useState(target);
@@ -210,6 +215,7 @@ export function ContactCard({
         contactName: currentCall.contactName ?? null,
         blocked: currentCall.blocked,
         blockedEntryId: currentCall.blockedEntryId ?? null,
+        remoteLocation: currentCall.remoteLocation ?? current.remoteLocation,
       }));
     }
     const lookupNumber = (currentCall?.remoteNumber || remoteNumber).trim();
@@ -218,12 +224,13 @@ export function ContactCard({
       ? `/contacts/${encodeURIComponent(contactId)}`
       : lookupNumber ? `/contacts/lookup?number=${encodeURIComponent(lookupNumber)}` : '';
     const [contactResult, blocklistResult] = await Promise.allSettled([
-      contactPath ? request<{item: ContactDto | null}>(contactPath) : Promise.resolve({item: null}),
+      contactPath ? request<{item: ContactDto | null; location?: string | null}>(contactPath) : Promise.resolve({item: null}),
       lookupNumber ? request<{items?: {id?: string; remoteNumber?: string}[]}>('/blocklist?scope=call') : Promise.resolve({items: []}),
     ]);
     if (captured !== loadSequence.current) return;
     if (contactResult.status === 'fulfilled') {
       if ('item' in contactResult.value) setContact(contactResult.value.item || null);
+      if ('location' in contactResult.value && contactResult.value.location) setLookupLocation({number: lookupNumber, location: contactResult.value.location});
     } else {
       if (contactId && Number((contactResult.reason as {status?: unknown})?.status) === 404) {
         if (liveTarget.callId) setContact(null);
@@ -267,6 +274,10 @@ export function ContactCard({
   });
   const title = contactName || numberWithContact(remoteNumber, null);
   const phones = contact?.phones || [];
+  const numberLocation =
+    locationFull(phones.find(phone => samePhoneNumber(phone.rawNumber, remoteNumber))?.location) ||
+    locationFull(liveTarget.remoteLocation) ||
+    (lookupLocation?.number === remoteNumber ? locationFull(lookupLocation.location) : undefined);
   const emails = contact?.emails || [];
   const addresses = contact?.addresses || [];
 
@@ -275,8 +286,8 @@ export function ContactCard({
     setError('');
     setNotice('');
     if (candidates) return;
-    request<{items: ContactDto[]}>(contactsPath(''))
-      .then(result => setCandidates(result.items || []))
+    fetchAllContacts(request, '')
+      .then(setCandidates)
       .catch(caught => setError(caught instanceof Error ? caught.message : '无法读取通讯录'));
   }
 
@@ -408,6 +419,7 @@ export function ContactCard({
           <div>
             <h2>{title}</h2>
             {contactName && remoteNumber && <small dir="ltr">{remoteNumber}</small>}
+            {remoteNumber && numberLocation && <small className="number-location">{numberLocation}</small>}
             {blocked && <span className="blocked-badge">已屏蔽</span>}
           </div>
           <button type="button" className="contact-card-close" aria-label="关闭联系人卡片" onClick={onClose}>
@@ -440,6 +452,7 @@ export function ContactCard({
                   {/* A contact can have one blocked number and one normal one. */}
                   {phone.blocked && <span className="blocked-badge">已屏蔽</span>}
                 </span>
+                {locationFull(phone.location) && <small className="number-location">{locationFull(phone.location)}</small>}
               </p>
             ))}
             {emails.map((email, index) => (

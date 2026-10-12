@@ -19,7 +19,7 @@ export type CallOccupancy = {
   /** `locks.acquired_at` in RFC 3339, or null when the lock has already been released. */
   lockedSince: string | null;
   /** `answeredByPlatform ?? originatingPlatform` of the occupant. */
-  occupantPlatform: 'ios' | 'android' | 'macos' | 'web' | 'ai' | 'pixel' | 'device' | null;
+  occupantPlatform: 'ios' | 'watchos' | 'android' | 'macos' | 'web' | 'ai' | 'pixel' | 'device' | null;
   /** `answeredByDevice` of the occupant. */
   occupantDevice: string | null;
   /** Whether this browser session is the originator or the answering winner. */
@@ -103,6 +103,8 @@ function occupantDevice(call: OccupiableCall): string {
 export function callOccupancyLabel(call: OccupiableCall): string {
   switch (occupantPlatform(call)) {
     case 'ios': return 'iPhone 端通话';
+    // S105: Apple Watch dials/answers through its iPhone session; Control stamps the platform as watchos.
+    case 'watchos': return '手表端通话';
     case 'android': return 'Android 端通话';
     case 'macos': return 'Mac 端通话';
     case 'web': return '网页端通话';
@@ -120,6 +122,7 @@ export function callOwnerLabel(call: OccupiableCall): string | null {
   if (device) return device;
   switch (occupantPlatform(call)) {
     case 'ios': return 'iPhone 端';
+    case 'watchos': return '手表端';
     case 'android': return 'Android 端';
     case 'macos': return 'Mac 端';
     case 'web': return '网页端';
@@ -145,7 +148,7 @@ export function canReleaseOccupancy(call: OccupiableCall): boolean {
   return Boolean(call.occupancy?.canRelease && !call.occupancy.isCurrentSession);
 }
 
-const OCCUPANT_NAMES: Record<string, string> = {ios: 'iPhone 端', android: 'Android 端', macos: 'Mac 端', web: '网页端', device: '网关本机'};
+const OCCUPANT_NAMES: Record<string, string> = {ios: 'iPhone 端', watchos: '手表端', android: 'Android 端', macos: 'Mac 端', web: '网页端', device: '网关本机'};
 
 /**
  * S72 A4/B5：「通话中 · 由 {占用者} 接听 · 自 {时间}」（呼出为「拨出」，振铃中为「来电振铃」），

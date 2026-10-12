@@ -8,11 +8,80 @@ export function errorCode(error:unknown):string|undefined{return typeof error===
 
 /**
  * iOS MediaRetryPolicy.shouldRetryTLS 的 Web 对应：只有 UDP 下中继候选缺失 / ICE 失败 / ICE 超时才换 TLS 重试一次。
- * 白名单只含 offer 发出之前的失败——Web 没有媒体释放接口，offer 已被桥接受后再发会 409（Control 503 MEDIA_BRIDGE_UNAVAILABLE），
- * 所以 offer 之后的连接超时、API 错误、鉴权、麦克风、取消都不重试。
+ * offer 之前：NO_RELAY_CANDIDATE / ICE_FAILED / ICE_TIMEOUT；offer 之后：ICE_CONNECT_TIMEOUT / ICE_CONNECT_FAILED（与 iOS
+ * iceConnectTimedOut / iceConnectionFailed 相同）——腿从未 Connected，桥按 S52 同角色替换（Control 对本人的腿还带 S75c replace），不会 409。
+ * 桥拒绝（MEDIA_BRIDGE_UNAVAILABLE）、TLS 失败、API 错误、鉴权、麦克风、取消都不重试。
  */
 export function shouldRetryTls(error:unknown,transport:Transport):boolean{
- return transport==='udp'&&['NO_RELAY_CANDIDATE','ICE_FAILED','ICE_TIMEOUT'].includes(errorCode(error)??'');
+ return transport==='udp'&&['NO_RELAY_CANDIDATE','ICE_FAILED','ICE_TIMEOUT','ICE_CONNECT_TIMEOUT','ICE_CONNECT_FAILED'].includes(errorCode(error)??'');
+}
+
+export type NetworkSnapshot={type?:string;onLine?:boolean};
+/** `connection.type`（有此属性的浏览器）与 `navigator.onLine`；不含 effectiveType/rtt/downlink 这些估算值。 */
+export function networkSnapshot(connection?:EventTarget|null):NetworkSnapshot{
+ const type=(connection as {type?:unknown}|null|undefined)?.type,onLine=(globalThis.navigator as Navigator|undefined)?.onLine;
+ return {type:typeof type==='string'?type:undefined,onLine:typeof onLine==='boolean'?onLine:undefined};
+}
+/** Chrome 在 effectiveType/rtt/downlink 估算变化时也发 `change`：只有 `type` 真的变了（浏览器提供时）或 onLine 翻转才算换网。 */
+export function networkSwitched(before:NetworkSnapshot,after:NetworkSnapshot):boolean{
+ return before.onLine!==after.onLine||((before.type!==undefined||after.type!==undefined)&&before.type!==after.type);
+}
+
+let networkEpoch=0;
+const watchedNetworkTargets=new WeakSet<object>();
+/** 本页的网络代：online/offline 或换网（见 networkSwitched）时加一。测节点缓存与记住的传输都只在同一代内复用。 */
+export const currentNetworkEpoch=()=>networkEpoch;
+/** 默认监听本页 window 与 navigator.connection（Node 测试里两者都没有）；每个目标只装一次。 */
+export function watchNetworkEpoch(
+ target:Pick<EventTarget,'addEventListener'>|undefined=typeof globalThis.addEventListener==='function'?globalThis:undefined,
+ connection:EventTarget|undefined=(globalThis.navigator as (Navigator&{connection?:EventTarget})|undefined)?.connection,
+){
+ try{
+  const bump=()=>{networkEpoch++;};
+  if(target&&!watchedNetworkTargets.has(target)){watchedNetworkTargets.add(target);target.addEventListener('online',bump);target.addEventListener('offline',bump);}
+  if(connection&&!watchedNetworkTargets.has(connection)){
+   watchedNetworkTargets.add(connection);let last=networkSnapshot(connection);
+   connection.addEventListener('change',()=>{const next=networkSnapshot(connection);if(networkSwitched(last,next)){last=next;bump();}});
+  }
+ }catch{/* No network events: the TTLs still bound reuse. */}
+}
+
+type TransportStorage=Pick<Storage,'getItem'|'setItem'|'removeItem'>;
+/** 只在浏览器里用 localStorage；隐私模式、禁用存储或 Node 测试时返回 null，所有读写都是尽力而为。 */
+export function transportStorage():TransportStorage|null{try{return typeof window==='undefined'?null:window.localStorage;}catch{return null;}}
+const TRANSPORT_CHOICE_KEY='vodog:media-transport-choice:v1',LEARNED_TRANSPORT_KEY='vodog:media-transport-learned:v1';
+/** 自动回退学到的 TLS 只保留 24 h（从 UDP 失败那一刻算，TLS 起步的成功不续期），之后重新先试 UDP。 */
+export const LEARNED_TRANSPORT_TTL_MS=24*3600_000;
+const PAGE_ID=Math.random().toString(36).slice(2);
+/** 设置页「此浏览器的连接方式」：持久化在本浏览器，读不到时为标准连接（UDP）。 */
+export function readTransportChoice(storage=transportStorage()):Transport{
+ try{return storage?.getItem(TRANSPORT_CHOICE_KEY)==='tls'?'tls':'udp';}catch{return 'udp';}
+}
+export function saveTransportChoice(transport:Transport,storage=transportStorage()){
+ try{if(transport==='tls')storage?.setItem(TRANSPORT_CHOICE_KEY,'tls');else storage?.removeItem(TRANSPORT_CHOICE_KEY);}catch{/* The choice still applies to this page. */}
+}
+/** 网络标识：浏览器提供 `connection.type` 时用它（wifi/cellular…），否则 unknown；同页内还要求同一网络代。 */
+export function networkLabel(connection=(globalThis.navigator as (Navigator&{connection?:EventTarget})|undefined)?.connection):string{
+ return networkSnapshot(connection).type??'unknown';
+}
+type LearnedTransport={transport:'tls';network:string;at:number;page:string;epoch:number};
+/** 标准连接（UDP）时：本网络 24 h 内 UDP 失败、TLS 自动回退成功过 → 下一通直接从 TLS 起步，省去 UDP 的收集等待。 */
+export function learnedTransport(storage=transportStorage(),now=Date.now(),network=networkLabel()):Transport|undefined{
+ try{
+  const raw=storage?.getItem(LEARNED_TRANSPORT_KEY);if(!raw)return undefined;
+  const value=JSON.parse(raw) as Partial<LearnedTransport>;
+  const fresh=value.transport==='tls'&&value.network===network&&typeof value.at==='number'&&now-value.at>=0&&now-value.at<LEARNED_TRANSPORT_TTL_MS;
+  if(fresh&&!(value.page===PAGE_ID&&value.epoch!==currentNetworkEpoch()))return 'tls';
+  storage?.removeItem(LEARNED_TRANSPORT_KEY);return undefined;
+ }catch{return undefined;}
+}
+/** 记住 UDP→TLS 自动回退的结果（transport=tls），或在 UDP 起步成功 / 学到的 TLS 起步失败时忘掉（transport=null）。 */
+export function rememberTransport(transport:'tls'|null,storage=transportStorage(),now=Date.now(),network=networkLabel()){
+ try{
+  if(!transport){storage?.removeItem(LEARNED_TRANSPORT_KEY);return;}
+  const value:LearnedTransport={transport,network,at:now,page:PAGE_ID,epoch:currentNetworkEpoch()};
+  storage?.setItem(LEARNED_TRANSPORT_KEY,JSON.stringify(value));
+ }catch{/* Learning is an optimisation only. */}
 }
 
 /** Server media codes carry the real reason; anything else (including DOMException numeric codes) keeps its own message. */

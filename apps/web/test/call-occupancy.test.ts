@@ -51,6 +51,7 @@ const sims = [{id: 'sim-1', gatewayId: 'gateway-1'}, {id: 'sim-2', gatewayId: 'g
 test('occupant labels use the same Chinese copy as the Android client', () => {
   const platforms: [CallOccupancy['occupantPlatform'], string, string | null][] = [
     ['ios', 'iPhone 端通话', 'iPhone 端'],
+    ['watchos', '手表端通话', '手表端'],
     ['android', 'Android 端通话', 'Android 端'],
     ['macos', 'Mac 端通话', 'Mac 端'],
     ['web', '网页端通话', '网页端'],
@@ -132,6 +133,7 @@ test('the occupancy notice reports the occupant and the lock time', () => {
   );
   // S72 A4/B5：设备本机、呼出、振铃与内部通话。
   assert.equal(occupancyNotice(call({occupancy: occupancy({occupantPlatform: 'device'})})), '通话中 · 由 网关本机 接听 · 自 2026-09-11 21:05');
+  assert.equal(occupancyNotice(call({occupancy: occupancy({occupantPlatform: 'watchos'})})), '通话中 · 由 手表端 接听 · 自 2026-09-11 21:05');
   assert.equal(occupancyNotice(call({direction: 'outgoing', occupancy: occupancy({occupantPlatform: 'web'})})), '通话中 · 由 网页端 拨出 · 自 2026-09-11 21:05');
   assert.equal(occupancyNotice(call({state: 'incoming_ringing', occupancy: occupancy({occupantPlatform: null})})), '来电振铃 · 自 2026-09-11 21:05');
   assert.equal(

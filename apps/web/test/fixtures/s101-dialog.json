@@ -1,0 +1,189 @@
+{
+ "humanCall": {
+  "call": {
+   "answeredBy": "human",
+   "answeredAt": "2026-10-06T02:46:55.266Z"
+  },
+  "manifest": {
+   "pcm": {
+    "sampleRate": 16000,
+    "channels": 1,
+    "bitsPerSample": 16
+   },
+   "tracks": [
+    {
+     "track": "remote_original",
+     "bytes": 320000,
+     "droppedFrames": 0
+    },
+    {
+     "track": "caller_original",
+     "bytes": 256000,
+     "droppedFrames": 30
+    }
+   ]
+  },
+  "result": {
+   "segments": [
+    {
+     "track": "remote_original",
+     "speaker": "remote",
+     "text": "喂，你好",
+     "startMs": 500,
+     "endMs": 1200
+    },
+    {
+     "track": "remote_original",
+     "speaker": "remote",
+     "text": "是王总吗",
+     "startMs": 1300,
+     "endMs": 2000
+    },
+    {
+     "track": "remote_original",
+     "speaker": "remote",
+     "text": "好的再见",
+     "startMs": 8000,
+     "endMs": 9000
+    },
+    {
+     "track": "caller_original",
+     "speaker": "caller_center_user",
+     "text": "对，我是",
+     "startMs": 500,
+     "endMs": 1400
+    },
+    {
+     "track": "caller_original",
+     "speaker": "caller_center_user",
+     "text": "再见",
+     "startMs": 6500,
+     "endMs": 7000
+    }
+   ]
+  },
+  "aiLines": [],
+  "expected": {
+   "timebase": "end_aligned",
+   "maxSkewMs": 600,
+   "turns": [
+    {
+     "role": "remote",
+     "text": "喂，你好是王总吗",
+     "atMs": 500,
+     "endAtMs": 2000,
+     "source": "asr",
+     "track": "remote_original"
+    },
+    {
+     "role": "me",
+     "text": "对，我是",
+     "atMs": 2500,
+     "endAtMs": 3400,
+     "source": "asr",
+     "track": "caller_original"
+    },
+    {
+     "role": "remote",
+     "text": "好的再见",
+     "atMs": 8000,
+     "endAtMs": 9000,
+     "source": "asr",
+     "track": "remote_original"
+    },
+    {
+     "role": "me",
+     "text": "再见",
+     "atMs": 8500,
+     "endAtMs": 9000,
+     "source": "asr",
+     "track": "caller_original"
+    }
+   ]
+  }
+ },
+ "aiCallRealtime": {
+  "call": {
+   "answeredBy": "ai",
+   "answeredAt": "2026-10-06T02:16:26.681Z"
+  },
+  "manifest": {
+   "pcm": {
+    "sampleRate": 16000,
+    "channels": 1,
+    "bitsPerSample": 16
+   },
+   "tracks": [
+    {
+     "track": "remote_original",
+     "bytes": 800000,
+     "droppedFrames": 0
+    },
+    {
+     "track": "caller_original",
+     "bytes": 800000,
+     "droppedFrames": 0
+    }
+   ]
+  },
+  "result": {
+   "segments": [
+    {
+     "track": "remote_original",
+     "speaker": "remote",
+     "text": "你好",
+     "startMs": 9000,
+     "endMs": 9800
+    },
+    {
+     "track": "caller_original",
+     "speaker": "caller_center_user",
+     "text": "您好，这里是王总的助理",
+     "startMs": 3700,
+     "endMs": 6000
+    }
+   ]
+  },
+  "aiLines": [
+   {
+    "role": "ai",
+    "text": "您好，这里是王总的助理，请问哪位？",
+    "at": "2026-10-06T02:16:29.434Z"
+   },
+   {
+    "role": "caller",
+    "text": "你好，我找王总",
+    "at": "2026-10-06T02:16:38.912Z"
+   },
+   {
+    "role": "ai",
+    "text": "好的，请问您贵姓？",
+    "at": "2026-10-06T02:16:39.500Z"
+   }
+  ],
+  "expected": {
+   "timebase": "ai_realtime",
+   "maxSkewMs": 0,
+   "turns": [
+    {
+     "role": "ai",
+     "text": "您好，这里是王总的助理，请问哪位？",
+     "atMs": 2753,
+     "source": "ai_realtime"
+    },
+    {
+     "role": "remote",
+     "text": "你好，我找王总",
+     "atMs": 12231,
+     "source": "ai_realtime"
+    },
+    {
+     "role": "ai",
+     "text": "好的，请问您贵姓？",
+     "atMs": 12819,
+     "source": "ai_realtime"
+    }
+   ]
+  }
+ }
+}

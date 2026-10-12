@@ -4,7 +4,7 @@
  * The list is served by `GET /api/v1/blocklist/interceptions`, which an older Control does not expose at all;
  * callers treat a 404 as "no interceptions yet" rather than an error.
  */
-import {isBlockedRow, numberWithContact} from './contacts.ts';
+import {isBlockedRow, locationShort, numberWithContact} from './contacts.ts';
 
 export type InterceptionItem = {
   id: string;
@@ -13,6 +13,8 @@ export type InterceptionItem = {
   simLabel?: string | null;
   gatewayTimeZone?: string | null;
   remoteNumber?: string | null;
+  /** S96 归属地（完整形态）。 */
+  remoteLocation?: string | null;
   contactId?: string | null;
   contactName?: string | null;
   occurredAt: string;
@@ -54,6 +56,8 @@ export type InterceptionRow = {
   id: string;
   kindLabel: string;
   title: string;
+  /** S96 简短形态；空串 = 无。 */
+  location: string;
   preview: string;
   sourceLabel: string;
   occurredAt: string;
@@ -77,6 +81,7 @@ export function interceptionRow(item: InterceptionItem): InterceptionRow {
     id: item.id,
     kindLabel: interceptionKindLabel(item.kind),
     title: interceptionTitle(item),
+    location: locationShort(item.remoteLocation) || '',
     preview: interceptionPreview(item),
     sourceLabel: interceptionSourceLabel(item.source),
     occurredAt: item.occurredAt,

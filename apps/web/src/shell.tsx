@@ -1,3 +1,4 @@
+import {simsOnlineFirst} from './sim-order';
 import {useEffect,useState,useSyncExternalStore,type ReactNode} from 'react';
 import {UiIcon,type IconName} from './icons';
 import {AiBadge,SimChip,StatusShape,simColorStyle,type SimStatus} from './sim-chip';
@@ -55,7 +56,7 @@ export function Sidebar({tabs,tab,badge,onSelect,sims,username,role,busy,onLogou
   <nav aria-label="主导航">{tabs.map(([t,icon])=><button key={t} aria-current={tab===t?'page':undefined} onClick={()=>onSelect(t)}><UiIcon name={icon}/>{tabTitle(t)}{badge(t)}</button>)}</nav>
   {sims.length>0&&<section className="side-lines" aria-label="线路">
    <p className="side-caption">线路</p>
-   {sims.map(s=>{const status=simStatus(s),tail=simTail(s);return <div className="side-line sim-tint" key={s.id} style={simColorStyle(simPaletteColor(s,sims))}>
+   {simsOnlineFirst(sims).map(s=>{const status=simStatus(s),tail=simTail(s);return <div className="side-line sim-tint" key={s.id} style={simColorStyle(simPaletteColor(s,sims))}>
     <span className="side-line-bar" aria-hidden="true"/>
     <div><strong><span>{simName(s)}</span><AiBadge ai={s.settings} full/></strong><span>{gatewayName(s)} · {s.present===false?'未待机':status==='offline'?'离线':tail?<>尾号 <span className="num">{tail}</span></>:'在线'}</span></div>
     <StatusShape status={status}/>

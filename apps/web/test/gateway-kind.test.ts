@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {gatewayArchiveLabel,gatewayKindLabel,gatewayShortLabel,gatewayTag} from '../src/gateway-kind.ts';
+import {gatewayArchiveLabel,gatewayKindLabel,gatewayModuleText,gatewayNameError,gatewayRenameErrorText,gatewayShortLabel,gatewayTag} from '../src/gateway-kind.ts';
 
 test('S58: missing or unknown gatewayKind reads as Pixel',()=>{
  for(const kind of [undefined,null,'','pixel','future']){
@@ -26,4 +26,19 @@ test('S58: dji4g labels follow the contract table',()=>{
  assert.equal(gatewayArchiveLabel('dji4g'),'DJI 4G 原始归档');
  assert.equal(gatewayKindLabel('dji4g').deviceDial,'通过 DJI 4G 模组拨打');
  assert.equal(gatewayKindLabel('dji4g').occupied,'DJI 4G 模组通话中');
+});
+
+test('S130/S131: module label reads 模组尾号 <label>, unbound rows read 未绑定模组',()=>{
+ assert.equal(gatewayModuleText('109525'),'模组尾号 109525');
+ for(const label of [undefined,null,''])assert.equal(gatewayModuleText(label),'未绑定模组');
+});
+
+test('S131: rename input is trimmed to 1..120 chars and 409 GATEWAY_NAME_TAKEN reads 已有同名网关',()=>{
+ assert.equal(gatewayNameError('  DJI 4G 家里  '),'');
+ assert.equal(gatewayNameError('   '),'请输入网关名称');
+ assert.equal(gatewayNameError(` ${'a'.repeat(120)} `),'');
+ assert.equal(gatewayNameError('a'.repeat(121)),'网关名称最多 120 个字');
+ assert.equal(gatewayRenameErrorText('GATEWAY_NAME_TAKEN','x'),'已有同名网关');
+ assert.equal(gatewayRenameErrorText('NOT_FOUND','Gateway not found'),'Gateway not found');
+ assert.equal(gatewayRenameErrorText(undefined,'重命名失败'),'重命名失败');
 });

@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import React from 'react';
 import {act,create,type ReactTestRenderer} from 'react-test-renderer';
 import {createServer} from 'vite';
-import {GATEWAY_DELETE_PROMPT,PASSKEY_DELETE_PROMPT} from '../src/confirm-copy.ts';
+import {GATEWAY_DELETE_PROMPT,GATEWAY_REPLACE_MODULE_PROMPT,PASSKEY_DELETE_PROMPT} from '../src/confirm-copy.ts';
 
 function collectText(node:unknown):string{
  if(typeof node==='string'||typeof node==='number')return String(node);
@@ -30,6 +30,8 @@ test('ConfirmAction, PasskeyPanel delete, and history 回拨/发短信/屏蔽 ha
   const {HistoryCallActions}=await vite.ssrLoadModule('/src/history-call-actions.tsx') as typeof import('../src/history-call-actions.tsx');
 
   assert.match(GATEWAY_DELETE_PROMPT,/不会先结束通话再删除/);
+  assert.match(GATEWAY_REPLACE_MODULE_PROMPT,/原模组的令牌将失效/);
+  assert.match(GATEWAY_REPLACE_MODULE_PROMPT,/只应在新模组上使用/);
   let confirmed=false;
   await act(async()=>{
    renderer=create(React.createElement(ConfirmAction,{
