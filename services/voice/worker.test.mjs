@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { VoiceWorker, controlHealth, logLevel } from './worker.mjs';
-import { VoiceControlClient } from './control-client.mjs';
+import { ControlError, VoiceControlClient } from './control-client.mjs';
 import { defaultProvider, jsonLogger, maxCallSeconds, mediaTransport, vadSettings, workerNodeId, xaiRealtimePort } from './server.mjs';
 
 const run = () => ({ id: '11111111-1111-4111-8111-111111111111', callId: '22222222-2222-4222-8222-222222222222',
@@ -54,7 +54,9 @@ test('provider preparation failure cannot create an answer or offer', async () =
   await s.worker.execute(run()); assert.deepEqual(s.calls, ['fail:worker_run_failed']); assert.equal(s.agent.stopped, true);
 });
 test('human winner during prewarm cancels provider without sending answer or media', async () => {
-  const s = setup({ renewMs: 5, control: { renew: async () => { throw new Error('lease lost'); } } });
+  // S98: a human winning clears the lease, so Control answers the renewal 409 AI_LEASE_LOST — a
+  // refusal, which ends the run at once (a renewal lost in transit is retried; see the S98 tests).
+  const s = setup({ renewMs: 5, control: { renew: async () => { throw new ControlError(409, 'AI_LEASE_LOST'); } } });
   await s.worker.execute({ ...run(), triggerAt: new Date(Date.now() + 30_000).toISOString() });
   assert.deepEqual(s.calls, ['fail:lease_renew_failed']); assert.equal(s.agent.stopped, true);
 });
@@ -142,7 +144,7 @@ test('the greeting waits for real audio authority, is sent once, and its transcr
   s.control.read = async () => ({ run: { state: 'ended' }, callState: 'ended', audioAllowed: false });
   await task;
   assert.deepEqual(s.posts.map(item => [item.role, item.sequence, item.text]), [['ai', 0, '你好'], ['caller', 1, '我要退款']]);
-  assert.deepEqual(s.logs.at(-1).transcripts, { sent: 2, dropped: 0, failed: 0, pending: 0, merged: 0 });
+  assert.deepEqual(s.logs.at(-1).transcripts, { sent: 2, dropped: 0, failed: 0, pending: 0, merged: 0, cut: 0 });
 });
 test('a best-effort provider notice is logged instead of failing the run', async () => {
   const s = setup({ control: { read: async () => ({ run: { state: 'active' }, callState: 'active', audioAllowed: true }) } });
@@ -528,6 +530,42 @@ test('S27 决策 13: a provider that simply disconnects is still reported as one
   assert.equal(s.logs.some(record => record.event === 'provider_closed_after_end_call'), false);
 });
 
+// S127（真实通话）: the caller hung up while the farewell was still queued. The teardown clears
+// the bridge before the collector's last flush, and the row is posted saying it was not heard out.
+test('S127: an AI row whose audio the teardown dropped is posted with the not-played-out marker', async () => {
+  const s = await activated();
+  const queue = { enqueued: 0, played: 0, cleared: 0 };
+  s.bridge.playout = () => ({ ...queue });
+  s.bridge.close = () => { s.bridge.closed = true; queue.cleared = queue.enqueued - queue.played; };
+  s.agent.emit('transcript', { text: '好的，再见', final: true, responseId: 'r1' });
+  queue.enqueued = 64_000;
+  s.agent.emit('completed', { status: 'completed', responseId: 'other', current: true });
+  queue.played = 16_000;
+  s.control.read = async () => ({ run: { state: 'ended' }, callState: 'ended', audioAllowed: false });
+  await s.task;
+  assert.deepEqual(s.posts.map(item => [item.role, item.text]), [['ai', '好的，再见（未播完）']]);
+  assert.equal(s.logs.at(-1).transcripts.cut, 1);
+});
+
+// S127: the remote party hung up while the goodbye was draining. The run used to log `ai_ended_call`
+// anyway, and the timeline named the AI as the one who ended the call.
+test('S127: a call that ends under the goodbye drain is never logged as ended by the AI', async () => {
+  const leaseLost = async () => { throw Object.assign(new Error('Control AI_LEASE_LOST (409)'), { status: 409, code: 'AI_LEASE_LOST' }); };
+  const endedRead = async () => ({ run: { state: 'ended' }, callState: 'ended', audioAllowed: false });
+  for (const [read, calls, reason] of [[leaseLost, ['commit', 'offer', 'fail:call_terminal'], 'call_terminal'], [endedRead, ['commit', 'offer'], 'terminal']]) {
+    const s = await activated();
+    // Like the real bridge: the drain only returns early because the teardown closed it.
+    s.bridge.whenPlaybackDrained = async () => { s.bridge.drained = 1; while (!s.bridge.closed) await delay(2); return true; };
+    s.agent.emit('notice', { kind: 'end_call' });
+    await until(() => s.bridge.drained === 1);
+    s.control.read = read;
+    await s.task;
+    assert.equal(s.logs.some(record => record.event === 'ai_ended_call'), false);
+    assert.deepEqual(s.calls, calls);
+    assert.equal(s.logs.at(-1).reason, reason);
+  }
+});
+
 test('S27: an ordinary provider notice never ends the call', async () => {
   const s = await activated();
   s.agent.emit('notice', { kind: 'input_backlog' });
@@ -879,4 +917,183 @@ test('S73f: a media gap longer than the rejoin window ends the run as media_lost
   assert.deepEqual(s.logs.find(record => record.event === 'media_gap_hangup'), { event: 'media_gap_hangup', runId: run().id, gapMs: 60 });
   assert.equal(s.logs.find(record => record.event === 'run_closed').reason, 'media_lost');
   assert.equal(s.logs.some(record => record.event === 'silence_hangup'), false);
+});
+
+test('S97b: a speech start whose turn never completes cannot disarm the silence rule for good', async () => {
+  const s = setup({ control: { read: async () => ({ run: { state: 'active' }, callState: 'active', audioAllowed: true }) } });
+  s.agent.config = { silenceHangupSeconds: 0.05 };
+  const task = s.worker.execute(run());
+  await until(() => s.bridge.history.includes(true));
+  s.agent.emit('completed', { status: 'completed', current: true });
+  s.agent.emit('speechStarted', { guarded: true, responseActive: true });
+  assert.deepEqual(s.logs.find(record => record.event === 'caller_speech_started'), { event: 'caller_speech_started', runId: run().id, guarded: true, responseActive: true });
+  // Not at the ordinary 50 ms: speech swapped it for the 100 ms stall bound.
+  await delay(70);
+  assert.equal(s.calls.some(call => call.startsWith('fail:')), false);
+  await task;
+  assert.deepEqual(s.calls, ['commit', 'offer', 'fail:caller_silence_timeout']);
+  assert.deepEqual(s.logs.find(record => record.event === 'silence_hangup'), { event: 'silence_hangup', runId: run().id, seconds: 0.05, cause: 'caller_turn_stalled' });
+});
+
+test('S97b: a finished caller utterance is logged without its text and brings the ordinary silence rule back', async () => {
+  const s = setup({ control: { read: async () => ({ run: { state: 'active' }, callState: 'active', audioAllowed: true }) } });
+  s.agent.config = { silenceHangupSeconds: 0.05 };
+  const task = s.worker.execute(run());
+  await until(() => s.bridge.history.includes(true));
+  s.agent.emit('response', 'resp_1');
+  s.agent.emit('completed', { status: 'completed', responseId: 'resp_1', current: true });
+  s.agent.emit('speechStarted', {});
+  s.agent.emit('transcript', { text: '我是顺丰快递', final: true, speaker: 'caller' });
+  await task;
+  assert.deepEqual(s.logs.find(record => record.event === 'silence_hangup'), { event: 'silence_hangup', runId: run().id, seconds: 0.05 });
+  const completed = s.logs.find(record => record.event === 'caller_speech_completed');
+  assert.equal(completed.chars, 6);
+  assert.ok(completed.msSinceStart >= 0);
+  assert.deepEqual(s.logs.find(record => record.event === 'caller_speech_started'), { event: 'caller_speech_started', runId: run().id, guarded: false, responseActive: null });
+  assert.deepEqual(s.logs.find(record => record.event === 'response_started'), { event: 'response_started', runId: run().id, responseId: 'resp_1' });
+  assert.deepEqual(s.logs.find(record => record.event === 'response_done'), { event: 'response_done', runId: run().id, responseId: 'resp_1', status: 'completed', current: true });
+  assert.equal(JSON.stringify(s.logs).includes('顺丰'), false);
+});
+
+// S98: Control sits behind a tunnel with 70–200 ms RTT and occasional 1–3 s stalls. Control only
+// treats the worker as gone once its heartbeat is 15 s stale and leases last 10 s, so one failed request
+// must not end a live call.
+const authority = () => ({ run: { state: 'active' }, callState: 'active', audioAllowed: true });
+const ended = () => ({ run: { state: 'ended' }, callState: 'ended', audioAllowed: false });
+function claimOnce(s) { let claimed = false; s.control.claim = async () => { if (claimed) return null; claimed = true; return run(); }; }
+
+test('S98: one failed heartbeat neither ends the live run nor waits a full period to retry', async () => {
+  const s = setup({ heartbeatMs: 200, controlRetryMs: 10, control: { read: async () => authority() } });
+  claimOnce(s); const beats = [];
+  s.control.heartbeat = async () => { beats.push(Date.now()); if (beats.length === 2) throw new TypeError('fetch failed'); };
+  const task = s.worker.start();
+  await until(() => s.bridge.history.includes(true));
+  await until(() => beats.length >= 3);
+  assert.ok(beats[2] - beats[1] < 150, `the failed beat was retried after ${beats[2] - beats[1]} ms, not after controlRetryMs`);
+  assert.notEqual(s.worker.activeAbort, null, 'the run is still live');
+  assert.deepEqual(s.logs.filter(entry => entry.event === 'heartbeat_failed'), [{ event: 'heartbeat_failed', errorName: 'TypeError', runAborted: false }]);
+  s.control.read = async () => ended();
+  await until(() => s.logs.some(entry => entry.event === 'run_closed'));
+  await s.worker.stop(); await task;
+  assert.deepEqual(s.calls, ['commit', 'offer']);
+  assert.equal(s.logs.find(entry => entry.event === 'run_closed').reason, 'terminal');
+});
+
+test('S98: a heartbeat down past the grace ends the live run as worker_heartbeat_failed, not worker_shutdown', async () => {
+  const s = setup({ heartbeatMs: 10, controlRetryMs: 5, heartbeatGraceMs: 60, control: { read: async () => authority() } });
+  claimOnce(s); let beats = 0;
+  s.control.heartbeat = async () => { if (++beats > 1) throw new ControlError(503, 'REQUEST_FAILED'); };
+  const task = s.worker.start();
+  await until(() => s.logs.some(entry => entry.event === 'run_closed'));
+  await s.worker.stop(); await task;
+  assert.deepEqual(s.calls, ['commit', 'offer', 'fail:worker_heartbeat_failed']);
+  const closed = s.logs.find(entry => entry.event === 'run_closed');
+  assert.equal(closed.reason, 'worker_heartbeat_failed');
+  assert.equal(logLevel(closed), 'warn');
+  const failed = s.logs.filter(entry => entry.event === 'heartbeat_failed');
+  assert.deepEqual(failed.map(entry => entry.runAborted), [false, true], 'one line for the streak, one when it costs the run');
+  assert.ok(failed[1].outageMs > 60 && failed[1].outageMs < 15_000);
+});
+
+test('S98: the heartbeat grace is a timer, so a beat stuck in its 3 s timeout cannot push the abort past the TTL', async () => {
+  // One failure starts the streak; the next attempt is far away (it stands in for a request hanging
+  // in its timeout). The run must still be abandoned when the grace runs out, not at the next failure.
+  const s = setup({ heartbeatMs: 10, controlRetryMs: 10_000, heartbeatGraceMs: 60, control: { read: async () => authority() } });
+  claimOnce(s); let beats = 0, failedAt = 0;
+  s.control.heartbeat = async () => { if (++beats > 1) { failedAt = Date.now(); throw new TypeError('fetch failed'); } };
+  const task = s.worker.start();
+  await until(() => s.logs.some(entry => entry.event === 'run_closed'));
+  const abortedAt = Date.now();
+  await s.worker.stop(); await task;
+  assert.equal(beats, 2, 'no further heartbeat was attempted');
+  assert.ok(abortedAt - failedAt < 1_000, `abandoned ${abortedAt - failedAt} ms after the only failure`);
+  assert.equal(s.logs.find(entry => entry.event === 'run_closed').reason, 'worker_heartbeat_failed');
+});
+
+test('S98: a renewal lost in transit is retried inside the lease and the run carries on', async () => {
+  let renews = 0;
+  const s = setup({ renewMs: 20, controlRetryMs: 5, control: { read: async () => authority(),
+    renew: async () => { if (++renews === 1) throw new TypeError('fetch failed'); return { leaseExpiresAt: new Date(Date.now() + 10_000).toISOString() }; } } });
+  const task = s.worker.execute(run());
+  await until(() => renews >= 3);
+  assert.equal(s.worker.activeAbort?.signal.aborted, false);
+  s.control.read = async () => ended(); await task;
+  assert.deepEqual(s.calls, ['commit', 'offer']);
+  assert.deepEqual(s.logs.filter(entry => entry.event === 'lease_renew_failed').map(entry => entry.retrying), [true]);
+  assert.deepEqual(s.logs.find(entry => entry.event === 'lease_renew_recovered'), { event: 'lease_renew_recovered', runId: run().id, failures: 1 });
+});
+
+test('S98: renewals that never come back still end the run at the local lease deadline', async () => {
+  let renews = 0;
+  const s = setup({ renewMs: 5, controlRetryMs: 5, leaseMarginMs: 1, control: { renew: async () => { renews++; throw new TypeError('fetch failed'); } } });
+  await s.worker.execute({ ...run(), triggerAt: new Date(Date.now() + 30_000).toISOString(), leaseExpiresAt: new Date(Date.now() + 80).toISOString() });
+  assert.deepEqual(s.calls, ['fail:lease_deadline']);
+  assert.ok(renews >= 3, `renewal was retried ${renews} times`);
+  assert.equal(s.logs.filter(entry => entry.event === 'lease_renew_failed').length, 1, 'one line per failure streak');
+});
+
+test('S98: one authority read lost in transit is read again at once; an answer from Control is never retried', async () => {
+  const s = setup({ control: { read: async () => authority() } });
+  const task = s.worker.execute(run()); await until(() => s.bridge.history.includes(true));
+  let reads = 0;
+  s.control.read = async () => { if (++reads === 1) throw new TypeError('fetch failed'); return authority(); };
+  await until(() => reads >= 3);
+  assert.equal(s.worker.activeAbort?.signal.aborted, false);
+  assert.deepEqual(s.logs.filter(entry => entry.event === 'authority_read_retry'), [{ event: 'authority_read_retry', runId: run().id, errorName: 'TypeError' }]);
+  // A second blip later in the call gets its own single retry: the budget is per failure, not per run.
+  reads = 0; await until(() => reads >= 3);
+  s.control.read = async () => ended(); await task;
+  assert.deepEqual(s.calls, ['commit', 'offer']);
+
+  const refused = setup({ control: { read: async () => authority() } });
+  const second = refused.worker.execute(run()); await until(() => refused.bridge.history.includes(true));
+  let answered = 0;
+  refused.control.read = async () => { answered++; throw new ControlError(503, 'REQUEST_FAILED'); };
+  await second;
+  assert.equal(answered, 1);
+  assert.deepEqual(refused.calls, ['commit', 'offer', 'fail:authority_read_failed']);
+  assert.equal(refused.logs.some(entry => entry.event === 'authority_read_retry'), false);
+});
+
+test('S98: run_closed carries the provider event counts and how long ago the provider last spoke', async () => {
+  const s = await activated();
+  s.agent.providerEvents = { 'response.output_audio.delta': 12, 'conversation.item.input_audio_transcription.started': 2 };
+  s.agent.providerLastEventAtMs = Date.now() - 1_500;
+  s.control.read = async () => ended(); await s.task;
+  const closed = s.logs.find(entry => entry.event === 'run_closed');
+  assert.deepEqual(closed.providerEvents, { 'response.output_audio.delta': 12, 'conversation.item.input_audio_transcription.started': 2 });
+  assert.ok(closed.providerLastEventAgeMs >= 1_500 && closed.providerLastEventAgeMs < 10_000);
+  // An agent that reports nothing adds nothing.
+  const quiet = await activated();
+  quiet.control.read = async () => ended(); await quiet.task;
+  assert.equal('providerEvents' in quiet.logs.find(entry => entry.event === 'run_closed'), false);
+});
+
+test('S98: an idle worker claims every 250 ms by default', () => {
+  const worker = new VoiceWorker({ control: {} });
+  assert.equal(worker.idleMs, 250);
+  worker.gcObserver?.disconnect();
+});
+
+test('S129: response_done carries leadTrimMs when the provider reports it, and run_closed carries the peer receive-buffer summary', async () => {
+  const s = await activated();
+  const rx = { jbMeanMs: 142, jbTargetMeanMs: 120, jbWindowMaxMs: 310, concealedSamples: 960, rttMsLast: 38, rttMsMax: 61, missing: ['jitter'] };
+  s.peer.rxSummary = () => rx;
+  s.agent.emit('completed', { status: 'completed', responseId: 'resp_1', current: true, leadTrimMs: 320 });
+  s.agent.emit('completed', { status: 'completed', responseId: 'resp_2', current: true, leadTrimMs: 0 });
+  s.agent.emit('completed', { status: 'cancelled', responseId: 'resp_3', current: false, leadTrimMs: '320' });
+  s.control.read = async () => ended(); await s.task;
+  const done = s.logs.filter(entry => entry.event === 'response_done');
+  assert.deepEqual(done[0], { event: 'response_done', runId: run().id, responseId: 'resp_1', status: 'completed', current: true, leadTrimMs: 320 });
+  assert.equal(done[1].leadTrimMs, 0);
+  assert.equal('leadTrimMs' in done[2], false, 'only a number is logged');
+  assert.deepEqual(s.logs.find(entry => entry.event === 'run_closed').rx, rx);
+
+  // No inbound RTP stats (null), a peer without the getter, or a getter that throws: no `rx`, and the run still closes.
+  for (const getter of [() => null, undefined, () => { throw new Error('boom'); }]) {
+    const t = await activated();
+    if (getter) t.peer.rxSummary = getter;
+    t.control.read = async () => ended(); await t.task;
+    assert.equal('rx' in t.logs.find(entry => entry.event === 'run_closed'), false);
+  }
 });

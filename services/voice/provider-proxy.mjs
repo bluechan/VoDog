@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { Worker } from 'node:worker_threads';
 import { transferableBytes } from './pcm-pipeline.mjs';
+import { providerInputBatchFrames } from './providers/index.mjs';
 
 const THREAD_URL = new URL('./provider-thread.mjs', import.meta.url);
 /** One second of PCM16 mono at 16 kHz. A transport bound, identical for every provider. */
@@ -37,9 +38,14 @@ export class ThreadedVoiceAgent extends EventEmitter {
     this.outputGeneration = 0;
     this.greeted = false;
     this.closedEmitted = false;
+    // S98: the adapter lives in the thread, so the bridge reads its uplink batch size off the registry here.
+    this.inputBatchFrames = providerInputBatchFrames(provider);
     // R7 §2(d): the provider thread's own isolate reports its GC here; `run_closed` logs it beside
     // the main thread's so a stall can be attributed to the right heap.
     this.providerGc = null;
+    // S98: per-type counts of what the provider sent and when it last sent anything (provider-thread.mjs).
+    this.providerEvents = null;
+    this.providerLastEventAtMs = null;
   }
 
   async start({ signal } = {}) {
@@ -89,7 +95,7 @@ export class ThreadedVoiceAgent extends EventEmitter {
   receive(message) {
     // A stopped session still accepts the thread's parting garbage-collection totals: they are
     // written into `run_closed`, which happens after the agent has already been stopped.
-    if (this.state === 'closed') { if (message?.t === 'gc') this.providerGc = message.gc ?? null; return; }
+    if (this.state === 'closed') { if (message?.t === 'gc') this.providerGc = message.gc ?? null; else if (message?.t === 'events') this.acceptEvents(message); return; }
     // The thread is authoritative for the playback generation while the session is live.
     if (this.state !== 'closed' && Number.isSafeInteger(message?.gen)) this.outputGeneration = message.gen;
     switch (message?.t) {
@@ -103,6 +109,7 @@ export class ThreadedVoiceAgent extends EventEmitter {
       }
       case 'startFailed': return void this.stop(new Error(message.message || 'AI setup failed'));
       case 'gc': this.providerGc = message.gc ?? null; return;
+      case 'events': this.acceptEvents(message); return;
       case 'pcm':
         // `Buffer.from(arrayBuffer)` is a view, not a copy: the bytes were moved, never cloned.
         return void this.emit('audio', { pcm: Buffer.from(message.pcm), sampleRate: message.sampleRate, responseId: message.responseId, generation: message.generation });
@@ -122,6 +129,11 @@ export class ThreadedVoiceAgent extends EventEmitter {
       }
       default: return;
     }
+  }
+
+  acceptEvents(message) {
+    if (message.events && typeof message.events === 'object') this.providerEvents = message.events;
+    if (Number.isFinite(message.lastEventAtMs)) this.providerLastEventAtMs = message.lastEventAtMs;
   }
 
   /** A thread that dies mid-call is a provider that disconnected; the run ends the same way. */

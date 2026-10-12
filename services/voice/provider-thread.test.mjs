@@ -262,3 +262,37 @@ test('S27 决策 13: an ordinary close crosses the port as an empty payload', as
   assert.equal(events.some(e => e.name === 'flushAudio'), true, 'an ordinary close still fences playback');
   proxy.stop();
 });
+
+test('S98: the thread counts provider events by type only, bounded, and the proxy carries them to run_closed', async () => {
+  const socket = new Socket();
+  const agent = new XaiVoiceAgent({ apiKey: 'test', agentId: 'test', socketFactory: () => socket });
+  const channel = new MessageChannel();
+  serveVoiceAgent(channel.port2, agent, { gcReportMs: 5 });
+  const proxy = new ThreadedVoiceAgent({ port: channel.port1 });
+  const started = proxy.start();
+  await until(() => agent.state === 'connecting');
+  socket.emit('open'); socket.emit('message', Buffer.from('{"type":"session.updated"}'));
+  await started;
+  const before = Date.now();
+  socket.emit('message', Buffer.from('{"type":"input_audio_buffer.speech_started","text":"never logged"}'));
+  socket.emit('message', Buffer.from('{"type":"input_audio_buffer.speech_started"}'));
+  socket.emit('message', Buffer.from('{"type":"Not A Type!"}'));
+  for (let i = 0; i < 50; i++) socket.emit('message', Buffer.from(`{"type":"x.unknown_${i}"}`));
+  await until(() => proxy.providerEvents?.other > 0);
+  const events = proxy.providerEvents;
+  assert.equal(events['session.updated'], 1);
+  assert.equal(events['input_audio_buffer.speech_started'], 2);
+  assert.equal(events.invalid, 1);
+  assert.equal(Object.keys(events).length, 40, 'at most 40 distinct types');
+  // Three names above, then 36 of the 50 unknown types fill the 39 named slots; the last 14 are "other".
+  assert.equal(events.other, 14);
+  assert.equal(JSON.stringify(events).includes('never logged'), false);
+  assert.ok(proxy.providerLastEventAtMs >= before && proxy.providerLastEventAtMs <= Date.now());
+  proxy.stop();
+  channel.port2.close();
+});
+
+test('S98: the proxy reports the provider\'s uplink batch from the registry; xAI keeps the default', () => {
+  assert.equal(new ThreadedVoiceAgent({ provider: 'doubao' }).inputBatchFrames, 1);
+  assert.equal(new ThreadedVoiceAgent({ provider: 'xai' }).inputBatchFrames, undefined);
+});

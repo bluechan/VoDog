@@ -1,4 +1,4 @@
-import {test} from 'node:test';import assert from 'node:assert/strict';import {EventEmitter} from 'node:events';import {XaiVoiceAgent,transcribeOgg,xaiRealtimeUrl} from './adapter.mjs';import {XAI_ENV_KEYS,xaiTranscriptionLanguage} from './providers/xai.mjs';import {createVoiceAgent} from './providers/index.mjs';
+import {test} from 'node:test';import assert from 'node:assert/strict';import {EventEmitter} from 'node:events';import {XaiVoiceAgent,transcribeOgg,xaiRealtimeUrl} from './adapter.mjs';import {XAI_ENV_KEYS,xaiTranscriptionLanguage,xaiConfig} from './providers/xai.mjs';import {createVoiceAgent} from './providers/index.mjs';
 class Socket extends EventEmitter{readyState=1;bufferedAmount=0;sent=[];send(s){this.sent.push(JSON.parse(s));}close(){this.readyState=3;this.emit('close');}}
 const appendsOf=socket=>socket.sent.filter(event=>event.type==='input_audio_buffer.append');
 // S27（2026-09-12 真实探针）: in agent mode the adapter HOLDS the Space agent's opener until greet()
@@ -88,7 +88,9 @@ test('S25: the forwarding port survives the startup parse and reaches the socket
  assert.equal(seen[0].options.headers.Host,'api.x.ai','a forwarded port would otherwise announce Host: api.x.ai:16890 to xAI');
  assert.equal(seen[0].options.headers.Authorization,'Bearer test');
  // Nothing here weakens verification: no rejectUnauthorized, no checkServerIdentity, no servername override.
- assert.deepEqual(Object.keys(seen[0].options).sort(),['handshakeTimeout','headers','maxPayload']);
+ assert.deepEqual(Object.keys(seen[0].options).sort(),['handshakeTimeout','headers','maxPayload','perMessageDeflate']);
+ // S98: no permessage-deflate — base64 PCM barely compresses and zlib on every frame costs the provider thread.
+ assert.equal(seen[0].options.perMessageDeflate,false);
  agent.stop();
 
  const direct=new Socket();const plain=[];
@@ -358,7 +360,7 @@ test('S27: agent mode omits instructions from the initial session.update; model 
  const agent=createVoiceAgent({provider:'xai',env:{XAI_API_KEY:'test',XAI_AGENT_ID:'agent_custom'},overrides:{socketFactory:()=>space}});
  const started=agent.start();space.emit('open');
  // S27 决策 13: agent mode also omits `tools` and restores the Space agent's own two idle fields.
- assert.equal(space.raw[0],'{"type":"session.update","session":{"turn_detection":{"type":"server_vad","idle_timeout_ms":5000,"end_call_after_idle_reminder_count":2},"audio":{"input":{"format":{"type":"audio/pcm","rate":16000},"transport":"json"},"output":{"format":{"type":"audio/pcm","rate":16000},"transport":"json"}}}}');
+ assert.equal(space.raw[0],'{"type":"session.update","session":{"turn_detection":{"type":"server_vad","idle_timeout_ms":15000,"end_call_after_idle_reminder_count":2},"audio":{"input":{"format":{"type":"audio/pcm","rate":16000},"transport":"json"},"output":{"format":{"type":"audio/pcm","rate":16000},"transport":"json"}}}}');
  space.emit('message',Buffer.from('{"type":"session.updated"}'));await started;agent.stop();
  const pinned=new RawSocket();
  const model=createVoiceAgent({provider:'xai',env:{XAI_API_KEY:'test',XAI_REALTIME_MODEL:'pinned-model'},overrides:{socketFactory:()=>pinned}});
@@ -398,11 +400,26 @@ test('S27: agent mode sends no tools key at all; model mode still sends the empt
 
 test('S27: agent-mode turn_detection carries the Space agent\'s own idle fields beside ours',()=>{
  assert.deepEqual(new XaiVoiceAgent({apiKey:'test',agentId:'a'}).turnDetection,
-  {type:'server_vad',idle_timeout_ms:5000,end_call_after_idle_reminder_count:2});
+  {type:'server_vad',idle_timeout_ms:15000,end_call_after_idle_reminder_count:2});
  assert.deepEqual(new XaiVoiceAgent({apiKey:'test',agentId:'a',vadThreshold:0.5,vadPrefixMs:300,vadSilenceMs:800}).turnDetection,
-  {type:'server_vad',threshold:0.5,prefix_padding_ms:300,silence_duration_ms:800,idle_timeout_ms:5000,end_call_after_idle_reminder_count:2});
+  {type:'server_vad',threshold:0.5,prefix_padding_ms:300,silence_duration_ms:800,idle_timeout_ms:15000,end_call_after_idle_reminder_count:2});
  // Model mode is unchanged: there is no Space agent behind it to preserve.
  assert.deepEqual(new XaiVoiceAgent({apiKey:'test',model:'m',vadSilenceMs:800}).turnDetection,{type:'server_vad',silence_duration_ms:800});
+});
+
+test('S119b: agent idle timeout defaults to 15 s, XAI_AGENT_IDLE_TIMEOUT_MS overrides it, model mode carries neither field',()=>{
+ const agentEnv={XAI_API_KEY:'k',XAI_AGENT_ID:'a'};
+ const td=env=>new XaiVoiceAgent(xaiConfig(env)).turnDetection;
+ assert.deepEqual(td(agentEnv),{type:'server_vad',idle_timeout_ms:15000,end_call_after_idle_reminder_count:2});
+ assert.deepEqual(td({...agentEnv,XAI_AGENT_IDLE_TIMEOUT_MS:' 20000 '}),{type:'server_vad',idle_timeout_ms:20000,end_call_after_idle_reminder_count:2});
+ assert.deepEqual(td({...agentEnv,XAI_AGENT_IDLE_TIMEOUT_MS:''}).idle_timeout_ms,15000);
+ for(const bad of ['4999','60001','1e4','-5000','15000.5','abc'])assert.throws(()=>xaiConfig({...agentEnv,XAI_AGENT_IDLE_TIMEOUT_MS:bad}),/XAI_AGENT_IDLE_TIMEOUT_MS/);
+ assert.throws(()=>new XaiVoiceAgent({apiKey:'k',agentId:'a',agentIdleTimeoutMs:1000}),/XAI_AGENT_IDLE_TIMEOUT_MS/);
+ // Model mode: no Space agent, no idle fields, and the key is ignored rather than validated.
+ const modelEnv={XAI_API_KEY:'k',XAI_REALTIME_MODEL:'m',XAI_AGENT_IDLE_TIMEOUT_MS:'20000'};
+ assert.equal('agentIdleTimeoutMs' in xaiConfig(modelEnv),false);
+ assert.deepEqual(td(modelEnv),{type:'server_vad'});
+ assert.equal(XAI_ENV_KEYS.includes('XAI_AGENT_IDLE_TIMEOUT_MS'),true);
 });
 
 test('S27: end_call is one notice, answers nothing on the wire, and never asks for another response',async()=>{
@@ -517,4 +534,16 @@ test('S27: XAI_TRANSCRIPTION_LANGUAGE defaults to zh in agent mode, is overridab
  for(const bad of ['z','chinese please','zh_CN','1234'])
   assert.throws(()=>xaiTranscriptionLanguage({XAI_TRANSCRIPTION_LANGUAGE:bad},{agentMode:true}),/XAI_TRANSCRIPTION_LANGUAGE/);
  assert.equal(XAI_ENV_KEYS.includes('XAI_TRANSCRIPTION_LANGUAGE'),true,'and the key is announced with the rest');
+});
+
+test('S120a: caller finals carry the provider item id, bounded, and only when present',async()=>{
+ const {agent,socket}=await ready();
+ const finals=[];agent.on('transcript',event=>{if(event.speaker==='caller'&&event.final)finals.push(event);});
+ feed(socket,{type:'conversation.item.input_audio_transcription.completed',item_id:'item_a',transcript:'你好'});
+ feed(socket,{type:'conversation.item.input_audio_transcription.completed',item_id:'x'.repeat(500),transcript:'喂'});
+ feed(socket,{type:'conversation.item.input_audio_transcription.completed',transcript:'在吗'});
+ assert.deepEqual(finals[0],{text:'你好',final:true,speaker:'caller',itemId:'item_a'});
+ assert.equal(finals[1].itemId.length,128);
+ assert.deepEqual(finals[2],{text:'在吗',final:true,speaker:'caller'});
+ agent.stop();
 });

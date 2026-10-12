@@ -73,6 +73,10 @@ func TestS75RoomStatsMatchesRoomClosedAndStopsOnClose(t *testing.T) {
 	if got := keysOf(stats); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("room_stats keys %v, room_closed counters %v", got, want)
 	}
+	// New counters are appended after rejoins so existing positions stay stable.
+	if tail := want[len(want)-4:]; strings.Join(tail, ",") != "rejoins,up_seq_missing,up_max_srtt_ms,down_max_src_lag_ms" {
+		t.Fatalf("counter tail %v", tail)
+	}
 	b.logRoomStats()
 	if n, _ := w.count("media.room_stats"); n != 1 {
 		t.Fatal("closed room kept logging room_stats")

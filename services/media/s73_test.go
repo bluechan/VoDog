@@ -292,7 +292,9 @@ func TestS73RejoinedClientLegKeepsRoomRecordingAndSeq(t *testing.T) {
 	log.SetOutput(w)
 	defer log.SetOutput(os.Stderr)
 	b.closeRoom(id, "test")
-	if line := w.roomClosed(); !strings.Contains(line, "rejoins=1") {
+	// Both legs are contiguous and the rejoined leg's first packet starts a new
+	// timeline (+1, not a source gap), so no bridge sequence was skipped.
+	if line := w.roomClosed(); !strings.Contains(line, "rejoins=1") || !strings.Contains(line, " up_seq_missing=0 ") {
 		t.Fatalf("room_closed line %q", line)
 	}
 	r.mu.Lock()

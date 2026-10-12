@@ -159,11 +159,17 @@ export class Pcm20msFramer {
   }
 }
 
-/** Batches five verified 20 ms frames into the provider's recommended 100 ms append. */
+/**
+ * Batches verified 20 ms frames into one provider append: five (100 ms, xAI's recommended append) by
+ * default. S98: a provider that paces its own uplink declares `inputBatchFrames` (Doubao: 1), because
+ * holding 100 ms here only to have it re-split into 20 ms packets is pure uplink latency.
+ */
 export class ProviderInputBatcher {
-  constructor({ maxFrames = 25 } = {}) {
+  constructor({ maxFrames = 25, batchFrames = 5 } = {}) {
     if (!Number.isInteger(maxFrames) || maxFrames < 5 || maxFrames > 50) throw new Error('Invalid provider input bound');
+    if (!Number.isInteger(batchFrames) || batchFrames < 1 || batchFrames > maxFrames) throw new Error('Invalid provider input batch');
     this.maxFrames = maxFrames;
+    this.batchFrames = batchFrames;
     this.frames = [];
     this.droppedFrames = 0;
     this.lastSequence = -1;
@@ -178,8 +184,8 @@ export class ProviderInputBatcher {
       this.frames.shift();
       this.droppedFrames++;
     }
-    if (this.frames.length < 5) return null;
-    const batch = this.frames.splice(0, 5);
+    if (this.frames.length < this.batchFrames) return null;
+    const batch = this.frames.splice(0, this.batchFrames);
     return {
       sequence: batch.at(-1).sequence,
       firstCapturedAtUs: batch[0].capturedAtUs,
@@ -214,6 +220,9 @@ export class GenerationPlaybackQueue {
     this.staleChunks = 0;
     this.inactiveChunks = 0;
     this.accounting = new Map();
+    // S127: whole-run byte totals (the per-generation map above is capped at 100). `enqueued` counts
+    // tail padding too, so enqueued === played + cleared + queuedBytes() holds exactly at any time.
+    this.total = { enqueued: 0, played: 0, cleared: 0 };
   }
 
   account(generation = this.generation) {
@@ -264,6 +273,7 @@ export class GenerationPlaybackQueue {
       return false;
     }
     stats.enqueuedBytes += pcm16k.length;
+    this.total.enqueued += pcm16k.length;
     this.pendingBytes = Buffer.concat([this.pendingBytes, pcm16k]);
     while (this.pendingBytes.length >= PCM16K_20MS_BYTES) {
       this.frames.push(Buffer.from(this.pendingBytes.subarray(0, PCM16K_20MS_BYTES)));
@@ -278,6 +288,7 @@ export class GenerationPlaybackQueue {
     // At most one partial frame is padded; no provider samples are discarded.
     this.frames.push(Buffer.concat([this.pendingBytes, Buffer.alloc(padding)]));
     this.account().tailPaddingBytes += padding;
+    this.total.enqueued += padding;
     this.pendingBytes = Buffer.alloc(0);
   }
 
@@ -294,15 +305,19 @@ export class GenerationPlaybackQueue {
       this.half = frame.subarray(PCM16K_10MS_BYTES);
     }
     this.account().playedBytes += result.length;
+    this.total.played += result.length;
     return result;
   }
 
   clear() {
     this.account().clearedBytes += this.queuedBytes();
+    this.total.cleared += this.queuedBytes();
     this.pendingBytes = Buffer.alloc(0);
     this.frames.length = 0;
     this.half = null;
   }
+
+  totals() { return { ...this.total }; }
 
   stats() {
     return { queuedFrames: this.frames.length + (this.half ? 0.5 : 0), queuedBytes: this.queuedBytes(),

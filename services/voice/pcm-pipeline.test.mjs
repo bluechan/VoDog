@@ -73,6 +73,12 @@ test('arbitrary chunks become monotonic 20ms frames and exact 100ms provider bat
   let batch;for(const frame of frames)batch=batcher.push(frame)??batch;
   assert.equal(batch.pcm16le.length,3200);assert.equal(batch.sequence,4);assert.deepEqual(batch.pcm16le,bytes);
   assert.throws(()=>batcher.push({...frames[4],sequence:4}),/increase/);
+  // S98: a provider that paces its own uplink takes every 20 ms frame as it comes (Doubao: 1).
+  const single = new ProviderInputBatcher({ batchFrames: 1 });
+  const singles = frames.map(frame => single.push(frame));
+  assert.deepEqual(singles.map(x => [x.sequence, x.pcm16le.length]), [[0,640],[1,640],[2,640],[3,640],[4,640]]);
+  assert.deepEqual(Buffer.concat(singles.map(x => x.pcm16le)), bytes);
+  for (const batchFrames of [0, 1.5, 26]) assert.throws(() => new ProviderInputBatcher({ batchFrames }), /batch/);
 });
 
 test('playback is ACTIVE-only, bounded, and fenced by response generation', () => {
@@ -132,6 +138,8 @@ test('audio bridge sends silence before ACTIVE, batches caller PCM, and drops la
   bridge.setActive(true);
   for(let i=0;i<10;i++)peer.emit('pcm',{pcm:pcm(48_000,10,1_000),sampleRate:48_000,numberOfFrames:480});
   assert.equal(agent.appends.length,1);assert.equal(agent.appends[0].pcm.length,3200);
+  // S98: every caller frame that reached the open bridge is counted, and these all carried sound.
+  assert.deepEqual([bridge.stats().upFrames,bridge.stats().upNonSilentFrames],[10,10]);
   agent.emit('audio',{pcm:pcm(16_000,20,440),generation:0});tick();assert.ok(rms(peer.writes.at(-1))>1000);
   agent.emit('flushAudio',{generation:1});agent.emit('audio',{pcm:pcm(16_000,20,440),generation:0});tick();assert.ok(peer.writes.at(-1).equals(Buffer.alloc(320)));
   bridge.close();assert.equal(peer.closed,true);assert.equal(agent.stopped,true);
@@ -378,4 +386,38 @@ test('S70: float32 is resampled as float and quantized once, matching the int16 
   const bad = Buffer.alloc(12); bad.writeFloatLE(Number.NaN, 0); bad.writeFloatLE(9, 4); bad.writeFloatLE(-9, 8);
   assert.equal(new Pcm24kTo16kResampler().processFloat32(bad).length, 4);
   assert.throws(() => new Pcm24kTo16kResampler().processFloat32(Buffer.alloc(6)), /complete samples/);
+});
+
+test('S98: the bridge hands each 20 ms frame over at once to a provider that asks for one, and counts silent uplink', () => {
+  const agent = new FakeAgent(), peer = new FakePeer();
+  agent.inputBatchFrames = 1;
+  const bridge = new RealtimeAudioBridge({ agent, peer, paceNowUs: () => 0, tickMs: 1_000 });
+  bridge.start();
+  // Nothing is counted before ACTIVE: those frames never reach the provider either.
+  peer.emit('pcm', { pcm: pcm(16_000, 10, 500), sampleRate: 16_000 });
+  bridge.setActive(true);
+  for (let i = 0; i < 4; i++) peer.emit('pcm', { pcm: pcm(16_000, 10, 500), sampleRate: 16_000 });
+  for (let i = 0; i < 6; i++) peer.emit('pcm', { pcm: Buffer.alloc(320), sampleRate: 16_000 });
+  assert.deepEqual(agent.appends.map(append => append.pcm.length), [640, 640, 640, 640, 640]);
+  assert.deepEqual(agent.appends.map(append => append.meta.sequence), [0, 1, 2, 3, 4]);
+  const stats = bridge.stats();
+  assert.deepEqual([stats.upFrames, stats.upNonSilentFrames], [10, 4]);
+  bridge.close();
+});
+
+test('S127: whole-run totals keep enqueued = played + cleared + queued through padding, barge-in and close', () => {
+  const agent=new FakeAgent(),peer=new FakePeer();let paceNow=0;
+  const bridge=new RealtimeAudioBridge({agent,peer,paceNowUs:()=>paceNow,tickMs:1000});bridge.start();bridge.setActive(true);bridge.tick();
+  const holds=()=>{const t=bridge.playout();assert.equal(t.enqueued,t.played+t.cleared+bridge.stats().queuedBytes);return t;};
+  const tick=(frames=1)=>{for(let i=0;i<frames;i++){paceNow+=10_000;bridge.tick();}};
+  // A turn that completes: 962 bytes become two frames, the second padded by 318.
+  agent.emit('audio',{pcm:Buffer.alloc(962,1),generation:0});holds();
+  agent.emit('completed',{status:'completed',current:true,generation:0});assert.equal(holds().enqueued,1280);
+  tick(4);assert.deepEqual(holds(),{enqueued:1280,played:1280,cleared:0});
+  // Barge-in with a half frame and a sub-frame remainder still queued.
+  agent.emit('audio',{pcm:Buffer.alloc(1_500,2),generation:0});tick();
+  agent.emit('flushAudio',{generation:1});assert.deepEqual(holds(),{enqueued:2780,played:1600,cleared:1180});
+  // Teardown drops what is queued, and the totals stay readable on the closed bridge.
+  agent.emit('audio',{pcm:Buffer.alloc(6_400,3),generation:1});tick(2);bridge.close();
+  assert.deepEqual(holds(),{enqueued:9180,played:2240,cleared:6940});assert.equal(bridge.stats().queuedBytes,0);
 });

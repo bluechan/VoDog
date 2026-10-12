@@ -52,7 +52,11 @@ type room struct {
 	upSeq                  uint32 // S73 D4: room-level so a rejoined client leg keeps numbering towards the gateway
 	upLegs                 int    // S73 D4: client legs that forwarded audio; a later leg is offset so timestamps never go back
 	upLastUS               uint64
+	upLastDurMS            uint16 // duration of the upLastUS frame: where the next frame should start
 	upLastArrivalUS        int64
+	downTimingSeen         bool // per gateway leg, like upTimingSeen per client leg
+	downFirstSourceUS      uint64
+	downFirstArrivalUS     int64
 	rejoin                 map[string]*rejoinState
 	rejoins                int
 }
@@ -84,10 +88,13 @@ var localOpusFmtpLine = fmt.Sprintf("minptime=10;useinbandfec=1;stereo=0;sprop-s
 
 // D9: an off-by-default SCTP congestion tuning switch. "off" keeps the bare
 // pion constructor so production behaviour is byte-for-byte unchanged.
+// dtlsFlight (CC_MEDIA_DTLS_FLIGHT_MS) rides on the same SettingEngine; zero
+// keeps pion's default and, with SCTP tuning off, the bare constructor.
 type sctpTuning struct {
-	name    string
-	minCwnd uint32
-	rtoMax  time.Duration
+	name       string
+	minCwnd    uint32
+	rtoMax     time.Duration
+	dtlsFlight time.Duration
 }
 
 const sctpTuningV1MinCwnd = 8 * 1200
@@ -104,6 +111,22 @@ func configuredSCTPTuning(raw string) (sctpTuning, error) {
 	return sctpTuning{}, errors.New("CC_MEDIA_SCTP_TUNING must be unset, off or v1")
 }
 
+// CC_MEDIA_DTLS_FLIGHT_MS: the bridge answers, so it is the DTLS client, and pion
+// retransmits a handshake flight first after 1 s (then doubling): one lost flight
+// on a lossy leg costs at least 1 s of time-to-audio. Unset or 0 keeps pion's
+// default (and the bare constructor); 50-1000 sets the initial interval, still
+// doubling. Below 50 ms a relayed leg's RTT alone would trigger resends.
+func configuredDTLSFlight(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value != 0 && (value < 50 || value > 1000) {
+		return 0, errors.New("CC_MEDIA_DTLS_FLIGHT_MS must be unset, 0 or an integer 50-1000")
+	}
+	return time.Duration(value) * time.Millisecond, nil
+}
+
 // label is what lands in transport-stats.json; the zero value reports "off".
 func (t sctpTuning) label() string {
 	if t.name == "" {
@@ -118,7 +141,7 @@ func (t sctpTuning) label() string {
 // MediaEngine or an interceptor.Registry was not supplied, so passing only a
 // SettingEngine keeps NACK/RR/TWCC registration identical.
 func (t sctpTuning) newPeerConnection(configuration webrtc.Configuration) (*webrtc.PeerConnection, error) {
-	if t.name == "" {
+	if t.name == "" && t.dtlsFlight == 0 {
 		return webrtc.NewPeerConnection(configuration)
 	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(t.settingEngine())).NewPeerConnection(configuration)
@@ -129,6 +152,9 @@ func (t sctpTuning) settingEngine() webrtc.SettingEngine {
 	if t.name != "" {
 		engine.SetSCTPMinCwnd(t.minCwnd)
 		engine.SetSCTPRTOMax(t.rtoMax)
+	}
+	if t.dtlsFlight > 0 {
+		engine.SetDTLSRetransmissionInterval(t.dtlsFlight)
 	}
 	return engine
 }
@@ -310,6 +336,50 @@ func (r *room) acceptDownSequence(sequence uint32) (late, forward bool) {
 	return true, true
 }
 
+// observeDownLag is the down twin of UpMaxSourceLagMillis (caller holds r.mu): how
+// far a forwarded gateway packet arrived behind its own source timeline, relative
+// to the leg's first forwarded packet.
+func (r *room) observeDownLag(sourceUS uint64, arrivalUS int64) {
+	if !r.downTimingSeen {
+		r.downTimingSeen = true
+		r.downFirstSourceUS, r.downFirstArrivalUS = sourceUS, arrivalUS
+		return
+	}
+	if lag := (arrivalUS - r.downFirstArrivalUS) - int64(sourceUS-r.downFirstSourceUS); lag > 0 && uint64(lag/1000) > r.transport.DownMaxSourceLagMillis {
+		r.transport.DownMaxSourceLagMillis = uint64(lag / 1000)
+	}
+}
+
+// maxUpSourceGap caps the bridge sequences skipped for one source-timeline hole,
+// well under the gateways' 50-sequence stream reset (S73 D4).
+const maxUpSourceGap = 20
+
+// upSourceGap is the number of whole frames missing between the previous forwarded
+// up frame (starting at prevUS, prevDurMS long) and the frame starting at timestampUS.
+// alignedLegGap keeps a rejoined / replaced leg's timeline on the previous leg's frame grid. The raw
+// wall-clock gap put the new leg's packets a few ms off every 20 ms slot the gateway expects: it
+// concealed each slot and then discarded the real packet as late, for the rest of the call (watch
+// leg replaced after a Bluetooth path switch, 2026-10-07: 100% PLC, zero underruns). The gap is
+// rounded to whole frames and never shorter than one, so the first packet still follows the last.
+func alignedLegGap(gapUS uint64, frameMS uint16) uint64 {
+	frame := uint64(frameMS) * 1000
+	if frame == 0 {
+		return gapUS
+	}
+	return max((gapUS+frame/2)/frame, 1) * frame
+}
+
+func upSourceGap(prevUS uint64, prevDurMS uint16, timestampUS uint64) uint32 {
+	if prevDurMS == 0 || timestampUS <= prevUS {
+		return 0
+	}
+	frames := (timestampUS - prevUS) / (uint64(prevDurMS) * 1000)
+	if frames <= 1 {
+		return 0
+	}
+	return uint32(min(frames-1, maxUpSourceGap))
+}
+
 // roomIdleLimit closes a room only after this long without a forwarded packet or
 // a peer state change; a healthy long call is never torn down by age alone.
 const roomIdleLimit = 2 * time.Hour
@@ -417,9 +487,10 @@ func (s *bridge) closeRoomAtEpoch(id string, mediaEpoch int64, reason string) bo
 
 // roomCounters is the counter tail shared by media.room_closed and media.room_stats (S75).
 func roomCounters(down, up uint64, t mediaTransportStats, rejoins int) string {
-	return fmt.Sprintf("down_pkts=%d up_pkts=%d down_forwarded=%d down_seq_missing=%d down_late=%d down_send_err=%d up_sent=%d up_backpressure_drop=%d up_channel_unavailable=%d up_oversized_drop=%d up_duration_drop=%d up_clock_drop=%d up_send_err=%d up_max_src_lag_ms=%d recording_drops=%d down_late_forwarded=%d up_late=%d up_test_drops=%d up_padding_ignored=%d up_invalid_sample=%q rejoins=%d",
+	return fmt.Sprintf("down_pkts=%d up_pkts=%d down_forwarded=%d down_seq_missing=%d down_late=%d down_send_err=%d up_sent=%d up_backpressure_drop=%d up_channel_unavailable=%d up_oversized_drop=%d up_duration_drop=%d up_clock_drop=%d up_send_err=%d up_max_src_lag_ms=%d recording_drops=%d down_late_forwarded=%d up_late=%d up_test_drops=%d up_padding_ignored=%d up_invalid_sample=%q rejoins=%d up_seq_missing=%d up_max_srtt_ms=%d down_max_src_lag_ms=%d",
 		down, up, t.DownForwarded, t.DownSequenceMissing, t.DownLate, t.DownSendErrors,
-		t.UpSent, t.UpBackpressureDrops, t.UpChannelUnavailable, t.UpOversizedDrop, t.UpDurationInvalidDrop, t.UpClockRejectDrop, t.UpSendErrors, t.UpMaxSourceLagMillis, t.RecordingDrops, t.DownLateForwarded, t.UpLate, t.UpTestDrops, t.UpPaddingIgnored, t.UpInvalidSample, rejoins)
+		t.UpSent, t.UpBackpressureDrops, t.UpChannelUnavailable, t.UpOversizedDrop, t.UpDurationInvalidDrop, t.UpClockRejectDrop, t.UpSendErrors, t.UpMaxSourceLagMillis, t.RecordingDrops, t.DownLateForwarded, t.UpLate, t.UpTestDrops, t.UpPaddingIgnored, t.UpInvalidSample, rejoins,
+		t.UpSequenceMissing, t.UpMaxSRTTMillis, t.DownMaxSourceLagMillis)
 }
 
 // roomStatsInterval spaces the S75 in-call media.room_stats lines.
@@ -726,6 +797,7 @@ func (s *bridge) offer(w http.ResponseWriter, req *http.Request) {
 					return
 				}
 				r.transport.DownUniqueReceived++
+				r.observeDownLag(p.TimestampUS, time.Since(r.created).Microseconds())
 				packet := &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 111, SequenceNumber: uint16(p.Sequence), Timestamp: uint32(p.TimestampUS * 48 / 1000), SSRC: 1}, Payload: p.Opus}
 				r.record(r.recorder.down, packet, "remote_original", p.Sequence, p.TimestampUS, p.DurationMS, late)
 				if err := r.track.WriteRTP(packet); err != nil {
@@ -752,7 +824,7 @@ func (s *bridge) offer(w http.ResponseWriter, req *http.Request) {
 				}
 			}
 		}()
-		pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 			defer s.recoverCallback(g.CallID, g.MediaEpoch, g.Role, "track")
 			log.Printf("media.leg_open call=%s role=client kind=%s", g.CallID, track.Kind())
 			if !strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeOpus) {
@@ -762,6 +834,18 @@ func (s *bridge) offer(w http.ResponseWriter, req *http.Request) {
 				}
 				return
 			}
+			// Drained like the sender's RTCP: pion's report interceptor sees the client's
+			// Sender Reports only on this read path, and without them the bridge's Receiver
+			// Reports carry LSR/DLSR 0, so the client gets no remote-inbound round trip.
+			go func() {
+				defer s.recoverCallback(g.CallID, g.MediaEpoch, g.Role, "rtcp_receiver_read")
+				buf := make([]byte, 1500)
+				for {
+					if _, _, e := receiver.Read(buf); e != nil {
+						return
+					}
+				}
+			}()
 			var clock rtpClock
 			// S73 D4: each client leg's RTP clock starts at 0; a rejoined leg continues from the
 			// previous leg's last timestamp plus the wall-clock gap, so gateways see monotonic time.
@@ -814,16 +898,18 @@ func (s *bridge) offer(w http.ResponseWriter, req *http.Request) {
 						return true
 					}
 					arrivalUS := time.Since(r.created).Microseconds()
+					freshLeg := !legStarted
 					if !legStarted {
 						legStarted = true
 						if r.upLegs > 0 {
-							legBase = r.upLastUS + uint64(max(arrivalUS-r.upLastArrivalUS, 0))
+							legBase = r.upLastUS + alignedLegGap(uint64(max(arrivalUS-r.upLastArrivalUS, 0)), r.upLastDurMS)
 						}
 						r.upLegs++
 					}
 					timestampUS += legBase
+					prevUS, prevDurMS := r.upLastUS, r.upLastDurMS
 					if !late {
-						r.upLastUS, r.upLastArrivalUS = timestampUS, arrivalUS
+						r.upLastUS, r.upLastDurMS, r.upLastArrivalUS = timestampUS, duration, arrivalUS
 					}
 					r.record(r.recorder.up, packet, "caller_original", uint32(packet.SequenceNumber), timestampUS, duration, late)
 					dc := r.dc
@@ -844,7 +930,17 @@ func (s *bridge) offer(w http.ResponseWriter, req *http.Request) {
 							r.transport.UpMaxSourceLagMillis = uint64(lag / 1000)
 						}
 					}
-					r.upSeq++
+					// A frame lost before the bridge leaves a hole in the source timeline but
+					// not in arrival order: skip as many bridge sequences so the gateway sees
+					// the loss and can use the next packet's LBRR (S70). Timestamps, not RTP
+					// sequence distance: BWE padding consumes RTP sequences only (S70d). A
+					// fresh leg starts a new timeline (S73 D4), so its first packet is +1.
+					missing := uint32(0)
+					if !freshLeg {
+						missing = upSourceGap(prevUS, prevDurMS, timestampUS)
+					}
+					r.transport.UpSequenceMissing += uint64(missing)
+					r.upSeq += 1 + missing
 					packetBytes := uint64(headerSize + len(packet.Payload))
 					// Pion BufferedAmount includes unacknowledged in-flight bytes (released
 					// by SACK), not only unsent audio. Allow one bounded RTT and delayed
@@ -973,6 +1069,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	tuning.dtlsFlight, err = configuredDTLSFlight(os.Getenv("CC_MEDIA_DTLS_FLIGHT_MS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if tuning.dtlsFlight > 0 {
+		log.Printf("media.config key=CC_MEDIA_DTLS_FLIGHT_MS value_ms=%d", tuning.dtlsFlight.Milliseconds())
+	}
 	lossFloor, err := configuredRRLossFloorPct(os.Getenv("CC_MEDIA_RR_LOSS_FLOOR_PCT"))
 	if err != nil {
 		log.Fatal(err)
@@ -1091,6 +1194,12 @@ type mediaTransportStats struct {
 	UpMaxSourceLagMillis  uint64                 `json:"upMaxSourceLagMillis"`
 	SCTPTuning            string                 `json:"sctpTuning"`
 	Samples               []mediaTransportSample `json:"samples,omitempty"`
+
+	// UpSequenceMissing: whole frames missing from the up source timeline between
+	// forwarded packets (lost before the bridge, or dropped ahead of its RTP clock),
+	// skipped in the bridge sequence; at most maxUpSourceGap per hole.
+	UpSequenceMissing      uint64 `json:"upSequenceMissing"`
+	DownMaxSourceLagMillis uint64 `json:"downMaxSourceLagMillis"`
 }
 
 type mediaTransportSample struct {

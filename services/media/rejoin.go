@@ -69,6 +69,7 @@ func (r *room) clearLegLocked(role string) {
 	if role == "gateway" {
 		r.dc = nil
 		r.seen = false
+		r.downTimingSeen = false
 	} else {
 		r.upTimingSeen = false
 	}

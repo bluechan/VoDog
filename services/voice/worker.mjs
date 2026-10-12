@@ -11,10 +11,12 @@ const wait = (ms, signal) => delay(Math.max(0, ms), undefined, { signal });
 const fault = code => Object.assign(new Error(code), { code });
 /** S69: the error's class and machine code only — never its message, which may carry provider text. */
 const errorFields = error => ({ errorName: String(error?.name ?? 'Error').slice(0, 64), ...(error?.code != null ? { code: String(error.code).slice(0, 80) } : {}) });
+/** `ControlError` carries the HTTP status Control answered with; anything without one never reached Control (timeout, reset tunnel). */
+const controlAnswered = error => Number.isInteger(error?.status);
 
 /** S69: every JSON log line carries a level. A provider notice is judged by its kind. */
 const ERROR_EVENTS = new Set(['socket_error', 'setup_timeout', 'worker_run_failed']);
-const WARN_EVENTS = new Set(['control_unavailable', 'heartbeat_failed', 'lease_renew_failed', 'control_fail_report_failed', 'provider_disconnected', 'provider_fault',
+const WARN_EVENTS = new Set(['control_unavailable', 'heartbeat_failed', 'lease_renew_failed', 'authority_read_retry', 'control_fail_report_failed', 'provider_disconnected', 'provider_fault',
   'media_fault', 'media_disconnected', 'greet_failed', 'provider_send_failed', 'revoked', 'worker_restart', 'message_too_large', 'invalid_json', 'message_handler_error',
   'session_create_send_failed', 'greeting_failed', 'transcription_failed', 'playback_overflow', 'input_backlog', 'input_backpressure', 'media_gap', 'media_gap_hangup']);
 /** Run endings that are an ordinary call finishing; anything else is a failed run. */
@@ -94,7 +96,8 @@ export class VoiceWorker {
     connectPeer = options => ClientMediaPeer.connect({ wrtc, ...options }),
     createBridge = options => new RealtimeAudioBridge(options),
     createTranscripts = options => new TranscriptCollector(options),
-    heartbeatMs = 5_000, renewMs = 3_000, pollMs = 250, idleMs = 1_000, leaseMarginMs = 1_000, activationTimeoutMs = 45_000, maxCallSeconds = 600, mediaTransport = 'udp',
+    // S98: an idle worker claims every 250 ms (handbook 02), not every second — the claim gap is pure answer latency.
+    heartbeatMs = 5_000, renewMs = 3_000, pollMs = 250, idleMs = 250, leaseMarginMs = 1_000, activationTimeoutMs = 45_000, maxCallSeconds = 600, mediaTransport = 'udp',
     // S25 决策 8: how long the greeting waits for proof that the gateway's data channel is open
     // before it is sent anyway. A silent caller must still be greeted.
     // S70e: the fallback only fires when no RTP ever arrives (a silent caller still sends RTP, the
@@ -108,10 +111,14 @@ export class VoiceWorker {
     // 2026-09-21 relay-secondary heap OOM mid-uptime: restart between calls once the heap stays above this
     // (MB); docker `unless-stopped` brings the process back. Never while a run is active.
     heapRestartMb = 120, memoryUsage = () => process.memoryUsage(), forceGc = () => globalThis.gc?.(), exit = code => process.exit(code),
+    // S98: Control sits behind a tunnel with 1–3 s stalls. A failed heartbeat or lease renewal is
+    // retried after `controlRetryMs`; a live run is only abandoned once no heartbeat has succeeded for
+    // `heartbeatGraceMs` — strictly inside Control's 15 s worker TTL (`ai_worker_instances.expires_at`).
+    controlRetryMs = 1_000, heartbeatGraceMs = 12_000,
     // S69: how often an idle worker reports its heap (`worker_idle`).
     idleReportMs = 3_600_000, uptime = () => process.uptime(),
     log = () => {} }) {
-    Object.assign(this, { control, defaultProvider, createAgent, connectPeer, createBridge, createTranscripts, heartbeatMs, renewMs, pollMs, idleMs, leaseMarginMs, activationTimeoutMs, maxCallSeconds, mediaTransport, greetingWaitMs, aiEndTailMs, mediaGapHangupMs, heapRestartMb, memoryUsage, forceGc, exit, idleReportMs, uptime, log });
+    Object.assign(this, { control, defaultProvider, createAgent, connectPeer, createBridge, createTranscripts, heartbeatMs, renewMs, pollMs, idleMs, leaseMarginMs, activationTimeoutMs, maxCallSeconds, mediaTransport, greetingWaitMs, aiEndTailMs, mediaGapHangupMs, heapRestartMb, memoryUsage, forceGc, exit, controlRetryMs, heartbeatGraceMs, idleReportMs, uptime, log });
     this.controlHealth = controlHealth(record => this.log(record));
     // S23 forensics: the 10 ms/5 ms pacing timer only keeps real time when the event loop is
     // responsive; report its delay per run so stalls are visible next to paceStalls.
@@ -139,19 +146,33 @@ export class VoiceWorker {
   async stop() { this.activeAbort?.abort(fault('worker_shutdown')); this.shutdown.abort(); await this.running; try { this.gcObserver?.disconnect(); } catch {} }
   async loop() {
     const signal = this.shutdown.signal;
-    let heartbeatReady = false, heartbeatFailing = false, lastIdleReport = Date.now();
+    let heartbeatReady = false, heartbeatFailing = false, heartbeatOkAtMs = Date.now(), graceTimer, lastIdleReport = Date.now();
+    // S98: the live run is abandoned only once no heartbeat has succeeded for `heartbeatGraceMs`. Its
+    // abort reason is the run's failure code (`execute`'s finally reads it), not `worker_shutdown`.
+    const abandonRun = error => {
+      const active = this.activeAbort, outageMs = Date.now() - heartbeatOkAtMs;
+      if (!active || active.signal.aborted || outageMs <= this.heartbeatGraceMs) return false;
+      this.log({ event: 'heartbeat_failed', ...errorFields(error), runAborted: true, outageMs });
+      active.abort(fault('worker_heartbeat_failed'));
+      return true;
+    };
     const heartbeat = (async () => { while (!signal.aborted) {
-      try { await this.control.heartbeat(signal); heartbeatReady = true; heartbeatFailing = false; this.controlHealth('heartbeat'); } catch (error) {
+      let failed = false;
+      try { await this.control.heartbeat(signal); clearTimeout(graceTimer); heartbeatReady = true; heartbeatFailing = false; heartbeatOkAtMs = Date.now(); this.controlHealth('heartbeat'); } catch (error) {
         if (signal.aborted) break;
-        heartbeatReady = false;
+        // No new claim while the heartbeat is failing; the live run is a different question.
+        heartbeatReady = false; failed = true;
         this.controlHealth('heartbeat', error);
-        // One line per failure streak; `runAborted` is the case that used to be silent.
-        if (!heartbeatFailing) this.log({ event: 'heartbeat_failed', ...errorFields(error), runAborted: Boolean(this.activeAbort) });
+        const aborted = abandonRun(error);
+        // One line per failure streak, plus one when the streak finally costs the live run.
+        if (!heartbeatFailing && !aborted) this.log({ event: 'heartbeat_failed', ...errorFields(error), runAborted: false });
         heartbeatFailing = true;
-        this.activeAbort?.abort(fault('worker_heartbeat_failed'));
+        // The grace runs on a timer, not until the next failure: a beat that times out takes 3 s to say
+        // so, and the decision must still land inside Control's 15 s TTL.
+        if (!aborted) { clearTimeout(graceTimer); graceTimer = setTimeout(() => abandonRun(error), Math.max(0, heartbeatOkAtMs + this.heartbeatGraceMs + 1 - Date.now())); graceTimer.unref?.(); }
       }
-      try { await wait(this.heartbeatMs, signal); } catch { break; }
-    } })();
+      try { await wait(failed ? this.controlRetryMs : this.heartbeatMs, signal); } catch { break; }
+    } clearTimeout(graceTimer); })();
     let restart = false;
     try { while (!signal.aborted) {
       let phase = 'claim';
@@ -202,7 +223,9 @@ export class VoiceWorker {
       providerId = null, bargeIns = 0, lastState = null, disconnectedAtMs = 0,
       // S73f: `silenceArmed` is whether the caller-silence rule applies right now (AI finished a
       // turn, caller has not spoken since); `mediaGap` whether caller RTP has stopped arriving.
-      silenceArmed = false, mediaGap = false;
+      silenceArmed = false, mediaGap = false,
+      // S97b: when the caller's current utterance started (worker clock), for `caller_speech_completed`.
+      speechStartedAtMs = 0;
     const stopOutput = () => { try { bridge?.setActive(false); bridge?.close(); } catch {} try { peer?.close(); } catch {} try { agent?.stop(); } catch {} };
     const stop = code => { if (!signal.aborted) { failure = code; abort.abort(fault(code)); } };
     const onAbort = () => stopOutput(); signal.addEventListener('abort', onAbort, { once: true });
@@ -223,6 +246,8 @@ export class VoiceWorker {
         try { await bridge?.whenPlaybackDrained({ timeoutMs: AI_END_DRAIN_TIMEOUT_MS, minMs: AI_END_DRAIN_MIN_MS, quietMs: AI_END_DRAIN_QUIET_MS }); } catch {}
         // S27 决策 15: the queue reading empty is not the caller having heard it (see AI_END_TAIL_MS).
         try { await wait(this.aiEndTailMs, signal); } catch {}
+        // S127: the call ended under the drain (remote hangup) — the AI did not end it.
+        if (signal.aborted) return;
         this.log({ event: 'ai_ended_call', runId: run.id, kind, tailMs: this.aiEndTailMs });
         stop('ai_ended_call');
       })();
@@ -312,24 +337,50 @@ export class VoiceWorker {
     // 算"AI 停下来了"——否则打断之后模型若不再作答，计时器永远不会重新武装，只能等 3 分钟上限。
     // `enabledOnce` 是必须的：音频权限开放之前那些回复来电者根本没听到。
     const onAgentCompleted = data => {
+      if (!signal.aborted) logResponseDone(data);
       if (!enabledOnce || silenceHangupSeconds <= 0 || signal.aborted) return;
       if (data?.current !== true) return;
       clearTimeout(silenceTimer);
       // 队列里还没放完的音频先折算成毫秒（16 kHz PCM16 = 32 字节/ms）：15 秒要从来电者
       // 有可能开口的那一刻算起，而不是从供应商发完最后一个包算起。
-      let pendingMs = 0;
-      try { pendingMs = Math.min(60_000, Math.round((bridge?.stats()?.queuedBytes ?? 0) / 32)); } catch {}
       silenceArmed = true;
-      if (!mediaGap) armSilence(silenceHangupSeconds * 1_000 + pendingMs);
+      if (!mediaGap) armSilence(silenceHangupSeconds * 1_000 + pendingPlaybackMs());
     };
-    const armSilence = ms => {
+    const pendingPlaybackMs = () => { try { return Math.min(60_000, Math.round((bridge?.stats()?.queuedBytes ?? 0) / 32)); } catch { return 0; } };
+    const armSilence = (ms, cause) => {
       clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
-        this.log({ event: 'silence_hangup', runId: run.id, seconds: silenceHangupSeconds });
+        this.log({ event: 'silence_hangup', runId: run.id, seconds: silenceHangupSeconds, ...(cause ? { cause } : {}) });
         stop('caller_silence_timeout');
       }, ms);
     };
-    const onSpeechStarted = () => { bargeIns += 1; silenceArmed = false; clearTimeout(silenceTimer); silenceTimer = undefined; };
+    // S97b（真实通话）: a speech start whose turn never completes used to leave the silence
+    // rule disarmed for good — the provider went quiet for 40 s and nothing ended the call. Speech
+    // now swaps the 15 s rule for a stall bound of twice that; the caller's finished utterance (a
+    // caller transcript) brings the ordinary rule back, and the AI's next turn re-arms it as before.
+    const onSpeechStarted = ({ guarded = false, responseActive = null, playoutMs } = {}) => {
+      bargeIns += 1; silenceArmed = false; clearTimeout(silenceTimer); silenceTimer = undefined;
+      speechStartedAtMs = Date.now();
+      // S98: `playoutMs` is the adapter's estimate of AI audio still to be heard (Doubao only).
+      this.log({ event: 'caller_speech_started', runId: run.id, guarded: guarded === true, responseActive: typeof responseActive === 'boolean' ? responseActive : null,
+        ...(Number.isFinite(playoutMs) ? { playoutMs: Math.max(0, Math.round(playoutMs)) } : {}) });
+      if (enabledOnce && silenceHangupSeconds > 0 && !signal.aborted && !mediaGap) armSilence(silenceHangupSeconds * 2_000, 'caller_turn_stalled');
+    };
+    // Length and timing only: transcript text never reaches a log line.
+    const onAgentTranscript = event => {
+      if (event?.speaker !== 'caller' || event.final !== true || signal.aborted) return;
+      // S127: `timing` is the Doubao adapter's per-turn diagnostics (numbers only); xAI sends none.
+      this.log({ event: 'caller_speech_completed', runId: run.id, chars: String(event.text ?? '').length, msSinceStart: speechStartedAtMs ? Date.now() - speechStartedAtMs : null, ...event.timing });
+      speechStartedAtMs = 0;
+      if (!enabledOnce || silenceHangupSeconds <= 0) return;
+      silenceArmed = true;
+      if (!mediaGap) armSilence(silenceHangupSeconds * 1_000 + pendingPlaybackMs());
+    };
+    const responseIdOf = value => (typeof value === 'string' && value ? value.slice(0, 64) : null);
+    const onAgentResponse = responseId => this.log({ event: 'response_started', runId: run.id, responseId: responseIdOf(responseId) });
+    const logResponseDone = data => this.log({ event: 'response_done', runId: run.id, responseId: responseIdOf(data?.responseId), status: typeof data?.status === 'string' ? data.status.slice(0, 32) : null, current: data?.current === true,
+      // S129: milliseconds of Doubao lead-in dropped from the start of this reply; xAI sends none.
+      ...(typeof data?.leadTrimMs === 'number' ? { leadTrimMs: data.leadTrimMs } : {}) });
     // S73f: no caller RTP is not a silent caller — pause the silence rule, bound the gap instead.
     const onMediaGap = ({ sinceMs = 0 } = {}) => {
       if (mediaGap || signal.aborted) return;
@@ -366,9 +417,21 @@ export class VoiceWorker {
     };
     try {
       signal.throwIfAborted(); lease(run.leaseExpiresAt);
-      renewTask = (async () => { while (!signal.aborted) {
-        try { await wait(this.renewMs, signal); const result = await this.control.renew(run, signal); signal.throwIfAborted(); lease(result.leaseExpiresAt); }
-        catch (error) { if (!signal.aborted) { this.log({ event: 'lease_renew_failed', runId: run.id, ...errorFields(error) }); stop('lease_renew_failed'); } break; }
+      // S98: Control refusing the lease (lost, run gone, worker stale: a 4xx) is final. Anything else — a
+      // timeout, a reset tunnel, a 5xx from the edge — is retried every `controlRetryMs`; the local lease
+      // timer set by `lease()` stays the hard stop, so a renewal that never comes back still ends the run on time.
+      renewTask = (async () => { let failures = 0; while (!signal.aborted) {
+        try {
+          await wait(failures ? this.controlRetryMs : this.renewMs, signal);
+          const result = await this.control.renew(run, signal); signal.throwIfAborted(); lease(result.leaseExpiresAt);
+          if (failures) { this.log({ event: 'lease_renew_recovered', runId: run.id, failures }); failures = 0; }
+        } catch (error) {
+          if (signal.aborted) break;
+          const refused = controlAnswered(error) && error.status < 500;
+          if (!failures || refused) this.log({ event: 'lease_renew_failed', runId: run.id, ...errorFields(error), retrying: !refused });
+          if (refused) { stop('lease_renew_failed'); break; }
+          failures += 1;
+        }
       } })();
       // S24 决策 3: the claim decides the provider; a run that names one this worker cannot build
       // ends as `provider_unavailable` through the existing failure path, which is what lets
@@ -376,7 +439,7 @@ export class VoiceWorker {
       providerId = providerOf(run, this.defaultProvider);
       if (!providerId) throw providerUnavailable();
       agent = this.createAgent({ provider: providerId }); agent.on('fault', onProviderFault); agent.on('closed', onProviderClosed); agent.on('notice', onProviderNotice);
-      agent.on('completed', onAgentCompleted); agent.on('speechStarted', onSpeechStarted);
+      agent.on('completed', onAgentCompleted); agent.on('speechStarted', onSpeechStarted); agent.on('transcript', onAgentTranscript); agent.on('response', onAgentResponse);
       // S27 决策 6 (a)/(b): the already-parsed startup configuration is on the proxy synchronously —
       // no thread round trip. A provider that carries no limits of its own keeps the worker's.
       maxCallSecondsForRun = agent.config?.maxCallSeconds ?? this.maxCallSeconds;
@@ -401,7 +464,9 @@ export class VoiceWorker {
         }
       }
       await agent.start({ signal }); signal.throwIfAborted();
-      collector = this.createTranscripts({ post: items => this.control.transcript(run, items, AbortSignal.timeout(3_000)), recording: false });
+      collector = this.createTranscripts({ post: items => this.control.transcript(run, items, AbortSignal.timeout(3_000)), recording: false,
+        // S127: the bridge is built later; until then nothing has been queued.
+        playout: () => bridge?.playout?.() ?? { enqueued: 0, played: 0, cleared: 0 } });
       collector.attach(agent); collector.start();
       await wait(Math.max(0, trigger - Date.now()), signal);
       await this.control.commit(run, signal); signal.throwIfAborted();
@@ -409,10 +474,10 @@ export class VoiceWorker {
       activationTimer = setTimeout(() => stop('telecom_active_timeout'), this.activationTimeoutMs);
       // Start observing before ICE; authority loss aborts setup as well as playback.
       let latestAudioAllowed = false;
-      monitorTask = (async () => { while (!signal.aborted) {
+      monitorTask = (async () => { let readRetried = false; while (!signal.aborted) {
         try {
           const state = await this.control.read(run, signal); signal.throwIfAborted();
-          lastState = state;
+          lastState = state; readRetried = false;
           if (terminal.has(state.run?.state) || ['ended', 'failed'].includes(state.callState)) { finished = true; abort.abort(fault('call_terminal')); break; }
           latestAudioAllowed = state.audioAllowed === true;
           if (latestAudioAllowed) clearTimeout(activationTimer);
@@ -423,10 +488,14 @@ export class VoiceWorker {
           if (bridge) { if (latestAudioAllowed) activate(); else bridge.setActive(false); }
           await wait(this.pollMs, signal);
         } catch (error) {
+          if (signal.aborted) break;
+          // S98: one read lost to a tunnel stall is not lost authority — a read that never reached
+          // Control is repeated once, at once. An answer from Control (an HTTP status) is never retried.
+          if (!readRetried && !controlAnswered(error)) { readRetried = true; this.log({ event: 'authority_read_retry', runId: run.id, ...errorFields(error) }); continue; }
           // Control clears the run lease in the same transaction that moves the call to a
           // terminal state, so a lease Control refuses while this worker still holds a valid
           // one means the call ended under the poll, not that the authority read broke.
-          if (!signal.aborted) stop(['AI_LEASE_LOST', 'AI_RUN_NOT_FOUND'].includes(error?.code) && Date.now() < leaseExpiresAtMs ? 'call_terminal' : 'authority_read_failed');
+          stop(['AI_LEASE_LOST', 'AI_RUN_NOT_FOUND'].includes(error?.code) && Date.now() < leaseExpiresAtMs ? 'call_terminal' : 'authority_read_failed');
           break;
         }
       } })();
@@ -469,11 +538,14 @@ export class VoiceWorker {
       }
     }
     finally {
+      // An abort from outside the run (the heartbeat loop, `stop()`) names its code on the reason.
+      const external = abort.signal.aborted ? abort.signal.reason?.code : undefined;
+      if (!finished && !failure && typeof external === 'string' && /^[a-z0-9_]{1,80}$/.test(external)) failure = external;
       if (!signal.aborted) abort.abort(fault(failure ?? 'run_finished'));
       stopOutput(); clearTimeout(leaseTimer); clearTimeout(activationTimer); clearTimeout(maxCallTimer); clearTimeout(greetTimer); clearTimeout(silenceTimer); clearTimeout(mediaLostTimer);
       // `aiEndTask` is bounded by the drained bridge, which `stopOutput()` has already closed.
       await Promise.allSettled([renewTask, monitorTask, mediaFaultTask, aiEndTask].filter(Boolean));
-      agent?.off('fault', onProviderFault); agent?.off('closed', onProviderClosed); agent?.off('notice', onProviderNotice); agent?.off('completed', onAgentCompleted); agent?.off('speechStarted', onSpeechStarted); peer?.off('fault', onMediaFault); peer?.off('inboundRtp', onInboundRtp); peer?.off('mediaGap', onMediaGap); peer?.off('mediaResumed', onMediaResumed); bridge?.off('fault', onMediaFault); bridge?.off('notice', onProviderNotice);
+      agent?.off('fault', onProviderFault); agent?.off('closed', onProviderClosed); agent?.off('notice', onProviderNotice); agent?.off('completed', onAgentCompleted); agent?.off('speechStarted', onSpeechStarted); agent?.off('transcript', onAgentTranscript); agent?.off('response', onAgentResponse); peer?.off('fault', onMediaFault); peer?.off('inboundRtp', onInboundRtp); peer?.off('mediaGap', onMediaGap); peer?.off('mediaResumed', onMediaResumed); bridge?.off('fault', onMediaFault); bridge?.off('notice', onProviderNotice);
       // Last transcript flush. S27 失败记录 6: Control keeps the run's lease identity for 60 s after it
       // moves the run to `ended`, so this batch is still authenticated even when the caller hung up
       // first; for a worker-initiated failure it simply runs before `fail()` clears the identity.
@@ -484,12 +556,17 @@ export class VoiceWorker {
       if (!finished) await this.control.fail(run, failure ?? 'worker_shutdown', AbortSignal.timeout(3_000)).catch(error => this.log({ event: 'control_fail_report_failed', runId: run.id, ...errorFields(error) }));
       let memory = {};
       try { const usage = this.memoryUsage(); memory = { heapUsedMb: Math.round(usage.heapUsed / 1_048_576), rssMb: Math.round(usage.rss / 1_048_576) }; } catch {}
+      // S129: the receive (jitter) buffer and RTT totals the peer cached from its own stats poll; read-only, null when no RTP ever arrived.
+      let rx = null; try { rx = peer?.rxSummary?.() ?? null; } catch {}
       this.log({ event: 'run_closed', runId: run.id, callId: run.callId, provider: providerId, reason: finished ? 'terminal' : failure ?? 'worker_shutdown',
         // durationMs counts from the audio gate (activation); 0 means the caller never heard the AI.
-        durationMs: activatedAtMs ? Date.now() - activatedAtMs : 0, greeted, bargeIns, callState: lastState?.callState ?? null, runState: lastState?.run?.state ?? null, ...memory, ...(bridge ? { audio: bridge.stats() } : {}), ...(collector ? { transcripts: collector.stats() } : {}), ...(this.loopDelay ? { eventLoopMs: eventLoopSummary(this.loopDelay) } : {}), ...(this.gcObserver ? { gc: gcSummary(this.gc) } : {}),
+        durationMs: activatedAtMs ? Date.now() - activatedAtMs : 0, greeted, bargeIns, callState: lastState?.callState ?? null, runState: lastState?.run?.state ?? null, ...memory, ...(bridge ? { audio: bridge.stats() } : {}), ...(rx ? { rx } : {}), ...(collector ? { transcripts: collector.stats() } : {}), ...(this.loopDelay ? { eventLoopMs: eventLoopSummary(this.loopDelay) } : {}), ...(this.gcObserver ? { gc: gcSummary(this.gc) } : {}),
         // R7 §2(d): `gc` is this thread's — the one that paces audio. `providerGc` is the provider
         // thread's own isolate, so a stall can be charged to the heap that caused it.
-        ...(agent?.providerGc ? { providerGc: agent.providerGc } : {}) });
+        ...(agent?.providerGc ? { providerGc: agent.providerGc } : {}),
+        // S98: what the provider itself sent, per event type (no payload), and how long ago it last
+        // sent anything — a "deaf" call reads as either a provider gone quiet or one still talking.
+        ...(agent?.providerEvents ? { providerEvents: agent.providerEvents, providerLastEventAgeMs: Number.isFinite(agent.providerLastEventAtMs) ? Math.max(0, Date.now() - agent.providerLastEventAtMs) : null } : {}) });
       this.activeAbort = null;
     }
   }

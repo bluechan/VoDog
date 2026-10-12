@@ -44,7 +44,7 @@ const agentMode = Boolean(cfg.agentId);
  * two agent-mode idle fields (S27 决策 13). Leaving them out changes behaviour (the agent's own
  * 「15 秒不说话就挂断」rule), so this is not cosmetic.
  */
-const AGENT_IDLE_TIMEOUT_MS = 5_000;
+const AGENT_IDLE_TIMEOUT_MS = 15_000; // S119b: production default (providers/xai.mjs)
 const AGENT_END_CALL_AFTER_IDLE_REMINDER_COUNT = 2;
 const turnDetection = {
   type: 'server_vad',

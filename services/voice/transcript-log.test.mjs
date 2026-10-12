@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { TranscriptCollector } from './transcript-log.mjs';
+import { CUT_MARKER, TranscriptCollector } from './transcript-log.mjs';
 
 function setup(options = {}) {
   const posts = [];
@@ -43,7 +43,7 @@ test('batches never exceed maxBatch and the size threshold flushes without the t
   for (let i = 0; i < 7; i++) agent.emit('transcript', { text: `t${i}`, final: true, speaker: 'caller' });
   await flush();
   assert.deepEqual(posts.map(batch => batch.length), [3, 3, 1]);
-  assert.deepEqual(collector.stats(), { sent: 7, dropped: 0, failed: 0, pending: 0, merged: 0 });
+  assert.deepEqual(collector.stats(), { sent: 7, dropped: 0, failed: 0, pending: 0, merged: 0, cut: 0 });
   await collector.close();
 });
 
@@ -61,7 +61,7 @@ test('a throwing post is swallowed, counted and never retried', async () => {
   const { agent, collector, flush } = setup({ post: async () => { throw new Error('control down'); } });
   agent.emit('transcript', { text: '我要退款', final: true, speaker: 'caller' });
   await flush();
-  assert.deepEqual(collector.stats(), { sent: 0, dropped: 0, failed: 1, pending: 0, merged: 0 });
+  assert.deepEqual(collector.stats(), { sent: 0, dropped: 0, failed: 1, pending: 0, merged: 0, cut: 0 });
   await collector.close();
 });
 
@@ -216,4 +216,171 @@ test('detach stops collecting and no timer runs before start', async () => {
   await collector.close();
   assert.deepEqual(posts, []);
   assert.equal(collector.timer, undefined);
+});
+
+test('S120a: finals sharing a provider item id are one row holding the LAST revision', async () => {
+  const { agent, collector, posts, clock, flush } = setup();
+  // One field call: one xAI item, five finals, the English first guess and a mid-sentence rewrite.
+  const caller = (text, itemId) => agent.emit('transcript', { text, final: true, speaker: 'caller', itemId });
+  caller("I'm", 'item_1');
+  const firstAt = collector.callerPending.at;
+  for (const text of ['你好，请问需要保洁。', '你好，请问你需要保洁服务吗？', '你好，请问你需要保洁服务吗？']) { clock.ms += 1_000; caller(text, 'item_1'); }
+  // A shorter later revision still wins: the provider's latest final is its correction.
+  clock.ms += 1_000; caller('你好，请问你需要保洁服务吗', 'item_1');
+  await flush();
+  assert.deepEqual(posts[0].map(item => [item.role, item.text, item.at]), [['caller', '你好，请问你需要保洁服务吗', firstAt]]);
+  assert.equal(collector.stats().merged, 4);
+  await collector.close();
+});
+
+test('S120a: different item ids are never merged, however alike the text', async () => {
+  const { agent, collector, posts, flush } = setup();
+  agent.emit('transcript', { text: '好', final: true, speaker: 'caller', itemId: 'a' });
+  agent.emit('transcript', { text: '好的谢谢', final: true, speaker: 'caller', itemId: 'b' });
+  agent.emit('transcript', { text: '好的谢谢', final: true, speaker: 'caller', itemId: 'c' });
+  await flush();
+  assert.deepEqual(posts[0].map(item => item.text), ['好', '好的谢谢', '好的谢谢']);
+  assert.equal(collector.stats().merged, 0);
+  await collector.close();
+});
+
+test('S120a: a same-id final after the hold expired opens a new row (no Control update path)', async () => {
+  const { agent, collector, posts, clock, flush } = setup();
+  agent.emit('transcript', { text: '你好', final: true, speaker: 'caller', itemId: 'a' });
+  clock.ms += 3_000;
+  agent.emit('transcript', { text: '你好，请问', final: true, speaker: 'caller', itemId: 'a' });
+  await flush();
+  assert.deepEqual(posts.flat().map(item => item.text), ['你好', '你好，请问']);
+  await collector.close();
+});
+
+test('S120a: a final without an item id against an id-carrying one keeps the prefix rule', async () => {
+  const { agent, collector, posts, flush } = setup();
+  // Doubao flushes its cumulative partial (no id) when the model answers; the late completed has one.
+  agent.emit('transcript', { text: '我是顺丰', final: true, speaker: 'caller' });
+  agent.emit('transcript', { text: '我是顺丰快递', final: true, speaker: 'caller', itemId: 'i1' });
+  agent.emit('transcript', { text: '我是', final: true, speaker: 'caller' });
+  await flush();
+  assert.deepEqual(posts[0].map(item => item.text), ['我是顺丰快递']);
+  await collector.close();
+});
+
+// S127: `playout` is the playback queue's whole-run byte totals; tests move them by hand. 32 bytes
+// are 1 ms of 16 kHz PCM16, and 16 000 (500 ms) cleared is the least that counts as a cut.
+function playoutSetup(options = {}) {
+  const queue = { enqueued: 0, played: 0, cleared: 0 };
+  return { queue, ...setup({ playout: () => queue, ...options }) };
+}
+const rows = posts => posts.flat().map(item => [item.role, item.sequence, item.text]);
+
+test('S127: a guarded greeting, a barged-in reply and a farewell cut by the hangup are all marked', async () => {
+  const { agent, collector, posts, queue, flush } = playoutSetup();
+  agent.emit('transcript', { text: '您好，我是助理', final: true, responseId: 'K1', immediate: true });
+  queue.enqueued = 100_000; queue.played = 40_000;
+  await flush();
+  assert.deepEqual(posts, [], 'the greeting is held while its audio is queued');
+  queue.cleared += 60_000; // greeting-guard cancel flushes the queue
+  await flush();
+  assert.deepEqual(rows(posts), [['ai', 0, `您好，我是助理${CUT_MARKER}`]]);
+  agent.emit('transcript', { text: '喂', final: true, speaker: 'caller' });
+  agent.emit('transcript', { text: '好的，我帮您转达，请问', final: true, responseId: 'r1' });
+  queue.enqueued += 80_000; queue.played += 20_000;
+  queue.cleared += 60_000; // barge-in
+  agent.emit('completed', { status: 'cancelled', responseId: 'x1' });
+  agent.emit('transcript', { text: '等一下', final: true, speaker: 'caller' });
+  agent.emit('transcript', { text: '好的，再见', final: true, responseId: 'r2' });
+  queue.enqueued += 50_000;
+  agent.emit('completed', { status: 'completed', responseId: 'x2' });
+  queue.played += 10_000;
+  queue.cleared += 40_000; // the caller hung up: teardown clears the bridge before close()
+  await collector.close();
+  // Neither `completed` matched its key, so both replies become rows at close — after the caller rows.
+  assert.deepEqual(rows(posts), [['ai', 0, `您好，我是助理${CUT_MARKER}`], ['caller', 1, '喂'], ['caller', 2, '等一下'],
+    ['ai', 3, `好的，我帮您转达，请问${CUT_MARKER}`], ['ai', 4, `好的，再见${CUT_MARKER}`]]);
+  assert.deepEqual(collector.stats(), { sent: 5, dropped: 0, failed: 0, pending: 0, merged: 0, cut: 3 });
+});
+
+test('S127: a farewell that drained before the hangup is not marked though its row is made at close', async () => {
+  const { agent, collector, posts, queue } = playoutSetup();
+  agent.emit('transcript', { text: '好的，再见', final: true, responseId: 'r2' });
+  queue.enqueued = 256_000;
+  agent.emit('completed', { status: 'completed', responseId: 'x2' });
+  // An unanswered end_call leaves a sub-frame remainder that only the teardown clears.
+  queue.played = 255_500; queue.cleared = 500;
+  await collector.close();
+  assert.deepEqual(rows(posts), [['ai', 0, '好的，再见']]);
+  assert.equal(collector.stats().cut, 0);
+});
+
+test('S127: a reply that played out stays unmarked when a later reply is cut, mismatched ids throughout', async () => {
+  const { agent, collector, posts, queue } = playoutSetup();
+  agent.emit('transcript', { text: '请问您找哪位', final: true, responseId: 'r1' });
+  queue.enqueued = 50_000;
+  agent.emit('completed', { status: 'completed', responseId: 'x1' });
+  queue.played = 50_000;
+  agent.emit('transcript', { text: '我找王先生', final: true, speaker: 'caller' });
+  agent.emit('transcript', { text: '好的，我帮您转达', final: true, responseId: 'r2' });
+  queue.enqueued = 110_000;
+  agent.emit('completed', { status: 'completed', responseId: 'x2' });
+  queue.played = 60_000; queue.cleared = 50_000;
+  await collector.close();
+  assert.deepEqual(rows(posts).filter(row => row[0] === 'ai').map(row => row[2]), ['请问您找哪位', `好的，我帮您转达${CUT_MARKER}`]);
+});
+
+test('S127: a mid-call reply is held while its audio is queued, and a caller row never passes it', async () => {
+  const { agent, collector, posts, queue, flush } = playoutSetup();
+  agent.emit('transcript', { text: '好的，', final: false, responseId: 'r1' });
+  agent.emit('transcript', { text: '请稍等', final: false, responseId: 'r1' });
+  queue.enqueued = 64_000;
+  agent.emit('completed', { status: 'completed', responseId: 'r1' });
+  await flush();
+  agent.emit('transcript', { text: '谢谢', final: true, speaker: 'caller' });
+  queue.played = 32_000;
+  await flush();
+  assert.deepEqual(posts, [], 'two rows wait behind the audio still queued');
+  assert.equal(collector.stats().pending, 2);
+  // `end` was read before the bridge padded the tail: one frame short of it is played out.
+  queue.played = 63_500;
+  await flush();
+  assert.deepEqual(rows(posts), [['ai', 0, '好的，请稍等'], ['caller', 1, '谢谢']]);
+  await collector.close();
+});
+
+test('S127: a hangup inside the last half second is not a cut', async () => {
+  const { agent, collector, posts, queue } = playoutSetup();
+  agent.emit('transcript', { text: '好的，再见', final: true, responseId: 'r1' });
+  queue.enqueued = 64_000;
+  agent.emit('completed', { status: 'completed', responseId: 'x1' });
+  queue.played = 48_032; queue.cleared = 15_968;
+  await collector.close();
+  assert.deepEqual(rows(posts), [['ai', 0, '好的，再见']]);
+});
+
+test('S127: without a playout accessor an AI row posts once any completed arrives, or at close', async () => {
+  const { agent, collector, posts, flush } = setup();
+  agent.emit('transcript', { text: '您好', final: true, responseId: 'K1', immediate: true });
+  await flush();
+  assert.deepEqual(posts, [], 'no completed yet');
+  agent.emit('completed', { responseId: 'other' });
+  agent.emit('transcript', { text: '请讲', final: false, responseId: 'r1' });
+  agent.emit('completed', { responseId: 'r1' });
+  await flush();
+  assert.deepEqual(rows(posts), [['ai', 0, '您好'], ['ai', 1, '请讲']]);
+  agent.emit('transcript', { text: '再见', final: true, responseId: 'K2', immediate: true });
+  await collector.close();
+  assert.deepEqual(rows(posts).at(-1), ['ai', 2, '再见']);
+});
+
+test('S127: the marker fits inside the text limit Control enforces, and a throwing accessor is harmless', async () => {
+  let cleared = 0;
+  const { agent, collector, posts } = setup({ playout: () => { if (cleared < 0) throw new Error('bridge gone'); return { enqueued: 0, played: 0, cleared }; } });
+  agent.emit('transcript', { text: '长'.repeat(20_000), final: false, responseId: 'r1' });
+  cleared = 16_000;
+  agent.emit('completed', { responseId: 'r1' });
+  cleared = -1;
+  agent.emit('transcript', { text: '喂', final: true, speaker: 'caller' });
+  await collector.close();
+  assert.equal(posts[0][0].text.length, 16_384);
+  assert.ok(posts[0][0].text.endsWith(CUT_MARKER));
+  assert.equal(posts[0][1].text, '喂');
 });

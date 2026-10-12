@@ -408,8 +408,8 @@ func TestRemoteEncryptedBridge(t *testing.T) {
 }
 
 const (
-	probePrimaryTurnUDP  = "turn:vodog.example.com:16801?transport=udp"
-	probePrimaryTurnTLS  = "turns:vodog.example.com:16802?transport=tcp"
+	probePrimaryTurnUDP     = "turn:vodog.example.com:16801?transport=udp"
+	probePrimaryTurnTLS     = "turns:vodog.example.com:16802?transport=tcp"
 	probeSecondaryTurnTLS   = "turns:relay-secondary.example.com:16802?transport=tcp"
 	probeSecondaryTurnIPUDP = "turn:203.0.113.20:16801?transport=udp"
 )
@@ -628,6 +628,11 @@ func TestSCTPTuningKeepsDefaultCodecsAndInterceptors(t *testing.T) {
 	v1Feedback, v1Extensions := describe(sctpTuning{name: "v1", minCwnd: 8 * 1200, rtoMax: 2 * time.Second})
 	if offFeedback != v1Feedback || offExtensions != v1Extensions {
 		t.Fatalf("tuned peer lost default interceptor registration:\noff fb=%q ext=%q\nv1 fb=%q ext=%q", offFeedback, offExtensions, v1Feedback, v1Extensions)
+	}
+	// CC_MEDIA_DTLS_FLIGHT_MS alone also leaves the bare constructor for NewAPI.
+	dtlsFeedback, dtlsExtensions := describe(sctpTuning{dtlsFlight: 200 * time.Millisecond})
+	if offFeedback != dtlsFeedback || offExtensions != dtlsExtensions {
+		t.Fatalf("DTLS flight tuning changed default interceptor registration:\noff fb=%q ext=%q\ndtls fb=%q ext=%q", offFeedback, offExtensions, dtlsFeedback, dtlsExtensions)
 	}
 	// S70: the RR loss floor rebuilds the default registry itself; alone and
 	// composed with SCTP tuning it must negotiate exactly the same feedback.

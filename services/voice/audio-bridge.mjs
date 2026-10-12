@@ -6,6 +6,8 @@ const SILENCE_10MS = Buffer.alloc(pcmConstants.PCM16K_10MS_BYTES);
 const PACE_FRAME_US = 10_000;
 /** 50 ms: enough to absorb ordinary timer lateness, small enough never to flood the encoder. */
 const PACE_MAX_CATCHUP_FRAMES = 5;
+/** S98: any non-zero sample means RMS > 0 — cheap enough to run on every 10 ms caller frame. */
+const nonSilent = pcm => { for (let i = 0; i < pcm.length; i++) if (pcm[i] !== 0) return true; return false; };
 
 /**
  * Couples an already-authorized WebRTC client peer to a realtime PCM provider.
@@ -23,7 +25,12 @@ export class RealtimeAudioBridge extends EventEmitter {
     this.tickMs = tickMs;
     this.resampler = new Pcm16kResampler();
     this.framer = new Pcm20msFramer();
-    this.input = new ProviderInputBatcher({ maxFrames: 25 });
+    // S98: the provider says how many 20 ms frames it wants per append (xAI: the default 5, Doubao: 1).
+    this.input = new ProviderInputBatcher({ maxFrames: 25, batchFrames: agent.inputBatchFrames });
+    // S98: caller frames that reached this bridge while it was open, and how many of them carried any
+    // sound at all — a "deaf" call then reads as either silent uplink or a provider that ignored speech.
+    this.upFrames = 0;
+    this.upNonSilentFrames = 0;
     // Providers emit far faster than wall clock: a whole reply, and the Space agent's
     // own session opener, arrive as one burst. Hold a full minute of it. An overflow is
     // reported as a notice and never as a fault: losing audio must not lose the call.
@@ -96,6 +103,8 @@ export class RealtimeAudioBridge extends EventEmitter {
 
   handlePeerPcm({ pcm, sampleRate }) {
     if (this.closed || !this.active) return;
+    this.upFrames += 1;
+    if (pcm && nonSilent(pcm)) this.upNonSilentFrames += 1;
     // S27 决策 16: the session is gone; these bytes have nowhere to go. Forwarding them only
     // produces the adapter's `AI not ready` throw, which used to end the run as `media_failed`
     // while the caller was still listening to the goodbye.
@@ -194,8 +203,11 @@ export class RealtimeAudioBridge extends EventEmitter {
     return true;
   }
 
+  /** S127: cumulative playback bytes of the run; still readable after close(). */
+  playout() { return this.playback.totals(); }
+
   stats() {
-    return { active: this.active, inputDroppedFrames: this.input.droppedFrames, upDroppedAfterAgentClosed: this.upDroppedAfterAgentClosed,
+    return { active: this.active, upFrames: this.upFrames, upNonSilentFrames: this.upNonSilentFrames, inputDroppedFrames: this.input.droppedFrames, upDroppedAfterAgentClosed: this.upDroppedAfterAgentClosed,
       pacedFrames: this.pacedFrames ?? 0, paceCatchupFrames: this.paceCatchupFrames ?? 0, paceStalls: this.paceStalls ?? 0,
       ...this.playback.stats() };
   }

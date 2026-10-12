@@ -249,8 +249,12 @@ func TestLossFloorReachesRTPSenderReceiverReport(t *testing.T) {
 		floor  uint8
 		tuning sctpTuning
 		want   uint8
-	}{{0, sctpTuning{}, 0}, {5, sctpTuning{}, 12}, {5, sctpTuning{name: "v1", minCwnd: sctpTuningV1MinCwnd, rtoMax: sctpTuningV1RTOMax}, 12}} {
-		t.Run(tc.tuning.label()+"-"+string(rune('0'+tc.floor)), func(t *testing.T) {
+	}{{0, sctpTuning{}, 0}, {5, sctpTuning{}, 12}, {5, sctpTuning{name: "v1", minCwnd: sctpTuningV1MinCwnd, rtoMax: sctpTuningV1RTOMax}, 12}, {0, sctpTuning{dtlsFlight: 100 * time.Millisecond}, 0}, {5, sctpTuning{dtlsFlight: 100 * time.Millisecond}, 12}} {
+		name := tc.tuning.label() + "-" + string(rune('0'+tc.floor))
+		if tc.tuning.dtlsFlight > 0 {
+			name += "-dtls" // the answerer is the DTLS client whose flight interval this sets
+		}
+		t.Run(name, func(t *testing.T) {
 			sender, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 			if err != nil {
 				t.Fatal(err)
@@ -363,5 +367,238 @@ func TestEncryptedBridgeRoundTripWithLossFloorAndTestDrop(t *testing.T) {
 	other := stats.UpChannelUnavailable + stats.UpBackpressureDrops
 	if stats.UpReceived == 0 || stats.UpTestDrops > stats.UpReceived/2 || stats.UpTestDrops+other < stats.UpReceived/2 || stats.UpSent+stats.UpTestDrops+other != stats.UpReceived {
 		t.Fatalf("drop knob: %+v", stats)
+	}
+}
+
+// A hole in the up source timeline becomes the same number of skipped bridge
+// sequences, in whole frames of the previous packet's length, capped per hole.
+func TestUpSourceGapCountsWholeMissingFrames(t *testing.T) {
+	for _, tc := range []struct {
+		prev        uint64
+		dur         uint16
+		ts          uint64
+		want        uint32
+		description string
+	}{
+		{0, 20, 20000, 0, "contiguous"},
+		{0, 20, 40000, 1, "one frame lost"},
+		{0, 20, 80000, 3, "three frame burst"},
+		{0, 20, 39999, 0, "partial frame is not a loss"},
+		{1000, 10, 31000, 2, "10 ms frames"},
+		{0, 60, 120000, 1, "60 ms frames"},
+		{0, 20, 20000 * 100, maxUpSourceGap, "capped below the stream reset gap"},
+		{0, 0, 40000, 0, "no previous duration"},
+		{40000, 20, 40000, 0, "same timestamp"},
+		{60000, 20, 40000, 0, "backwards"},
+	} {
+		if got := upSourceGap(tc.prev, tc.dur, tc.ts); got != tc.want {
+			t.Fatalf("%s: upSourceGap(%d, %d, %d)=%d want %d", tc.description, tc.prev, tc.dur, tc.ts, got, tc.want)
+		}
+	}
+	if maxUpSourceGap+1 >= 50 {
+		t.Fatal("the largest skip must stay under the gateways' 50-sequence stream reset")
+	}
+}
+
+// DownMaxSourceLagMillis is measured from the gateway leg's first forwarded packet
+// and restarts with a new gateway leg.
+func TestDownMaxSourceLagFollowsGatewayLeg(t *testing.T) {
+	r := &room{}
+	r.observeDownLag(5_000_000, 100_000) // first packet: the reference only
+	r.observeDownLag(5_020_000, 120_000) // on time
+	r.observeDownLag(5_040_000, 150_000) // 10 ms behind
+	r.observeDownLag(5_060_000, 145_000) // early
+	if r.transport.DownMaxSourceLagMillis != 10 {
+		t.Fatalf("lag %d", r.transport.DownMaxSourceLagMillis)
+	}
+	r.clearLegLocked("gateway")
+	r.observeDownLag(0, 10_000_000) // a rejoined leg: new reference, no 10 s lag
+	r.observeDownLag(20_000, 10_045_000)
+	if r.transport.DownMaxSourceLagMillis != 25 {
+		t.Fatalf("lag after a new gateway leg %d", r.transport.DownMaxSourceLagMillis)
+	}
+}
+
+func TestDTLSFlightEnvParsing(t *testing.T) {
+	for raw, want := range map[string]time.Duration{"": 0, "0": 0, "50": 50 * time.Millisecond, "200": 200 * time.Millisecond, "1000": time.Second} {
+		if got, err := configuredDTLSFlight(raw); err != nil || got != want {
+			t.Fatalf("dtls flight %q: %v %v", raw, got, err)
+		}
+	}
+	for _, raw := range []string{"1", "49", "1001", "-1", "x", "200ms", " 200", "1.5"} {
+		if _, err := configuredDTLSFlight(raw); err == nil {
+			t.Fatalf("dtls flight %q accepted", raw)
+		}
+	}
+}
+
+// Through the bridge: frames lost before the bridge skip bridge sequences (a single
+// loss by 2, a 3-frame burst by 4) so the gateway's FEC sees them, while BWE padding
+// (an RTP sequence with no new timestamp) skips nothing. The client's Sender Reports
+// reach the bridge's report interceptor, so its Receiver Reports carry LSR.
+func TestUpSequenceSkipsSourceGapsNotPaddingAndReceiverReportsCarryLSR(t *testing.T) {
+	secret := bytes.Repeat([]byte("g"), 32)
+	b := &bridge{rooms: map[string]*room{}, verifier: GrantVerifier{Secret: secret}, recordDir: t.TempDir()}
+	server := httptest.NewServer(http.HandlerFunc(b.offer))
+	defer server.Close()
+	id := "70707070-7070-7070-7070-707070707072"
+	defer b.closeRoom(id, "test")
+
+	gateway, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	ordered, retries := false, uint16(0)
+	dc, err := gateway.CreateDataChannel("cellular-opus-v1", &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &retries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+	var mu sync.Mutex
+	seqAt := map[uint64]uint32{} // source timestamp -> bridge sequence
+	dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		if p, e := decodePacket(m.Data); e == nil {
+			mu.Lock()
+			seqAt[p.TimestampUS] = p.Sequence
+			mu.Unlock()
+		}
+	})
+	if code := postOffer(t, server.URL, id, "gateway", "s70e-gateway-nonce-0001", secret, gateway, true); code != 200 {
+		t.Fatalf("gateway offer: %d", code)
+	}
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway DataChannel did not open")
+	}
+
+	client, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}, "mic", "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := client.AddTrack(track)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lsr := make(chan uint32, 1)
+	go func() {
+		for {
+			pkts, _, e := sender.ReadRTCP()
+			if e != nil {
+				return
+			}
+			for _, p := range pkts {
+				var reports []rtcp.ReceptionReport
+				switch report := p.(type) {
+				case *rtcp.ReceiverReport:
+					reports = report.Reports
+				case *rtcp.SenderReport:
+					reports = report.Reports
+				}
+				for _, block := range reports {
+					if block.LastSenderReport != 0 {
+						select {
+						case lsr <- block.LastSenderReport:
+						default:
+						}
+					}
+				}
+			}
+		}
+	}()
+	if code := postOffer(t, server.URL, id, "client", "s70e-client-nonce-0001", secret, client, true); code != 200 {
+		t.Fatalf("client offer: %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && client.ConnectionState() != webrtc.PeerConnectionStateConnected {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.ConnectionState() != webrtc.PeerConnectionStateConnected {
+		t.Fatalf("client leg did not connect: %s", client.ConnectionState())
+	}
+
+	payload := []byte{0xf8, 0xff, 0xfe} // one 20 ms Opus frame
+	rtpSeq := uint16(100)
+	write := func(frame uint32, padding bool) {
+		t.Helper()
+		packet := &rtp.Packet{Header: rtp.Header{Version: 2, SequenceNumber: rtpSeq, Timestamp: 5000 + frame*960}, Payload: payload}
+		if padding {
+			packet.Header.Padding, packet.Header.PaddingSize, packet.Payload = true, 4, nil
+		}
+		if e := track.WriteRTP(packet); e != nil {
+			t.Fatal(e)
+		}
+		rtpSeq++
+		time.Sleep(20 * time.Millisecond)
+	}
+	lose := func() { rtpSeq++ } // a packet lost on the client->bridge leg
+	for frame := uint32(0); frame <= 4; frame++ {
+		write(frame, false)
+	}
+	lose() // frame 5
+	write(6, false)
+	write(7, false)
+	lose() // frames 8, 9, 10
+	lose()
+	lose()
+	write(11, false)
+	write(12, false)
+	write(12, true) // padding-only: a new RTP sequence on the last audio timestamp
+	write(13, false)
+	// Keep talking until a Receiver Report echoes the client's Sender Report.
+	frame := uint32(14)
+	var echoed uint32
+	for deadline = time.Now().Add(8 * time.Second); echoed == 0 && time.Now().Before(deadline); frame++ {
+		write(frame, false)
+		select {
+		case echoed = <-lsr:
+		default:
+		}
+	}
+	if echoed == 0 {
+		t.Fatal("no Receiver Report with LSR reached the client: receiver RTCP is not drained")
+	}
+
+	at := func(frame uint32) uint64 { return uint64(frame) * 20000 }
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		_, last := seqAt[at(frame-1)]
+		mu.Unlock()
+		if last || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, step := range []struct {
+		from, to uint32
+		advance  uint32
+	}{{3, 4, 1}, {4, 6, 2}, {6, 7, 1}, {7, 11, 4}, {11, 12, 1}, {12, 13, 1}, {13, 14, 1}} {
+		from, okFrom := seqAt[at(step.from)]
+		to, okTo := seqAt[at(step.to)]
+		if !okFrom || !okTo {
+			t.Fatalf("frames %d/%d not both delivered: %v", step.from, step.to, seqAt)
+		}
+		if to-from != step.advance {
+			t.Fatalf("bridge sequence %d->%d advanced by %d, want %d", step.from, step.to, to-from, step.advance)
+		}
+	}
+	b.mu.Lock()
+	r := b.rooms[id]
+	b.mu.Unlock()
+	r.mu.Lock()
+	stats := r.transport
+	r.mu.Unlock()
+	if stats.UpSequenceMissing != 4 || stats.UpPaddingIgnored != 1 {
+		t.Fatalf("upSequenceMissing=%d upPaddingIgnored=%d, want 4 and 1", stats.UpSequenceMissing, stats.UpPaddingIgnored)
 	}
 }

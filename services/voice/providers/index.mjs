@@ -1,4 +1,4 @@
-import { DOUBAO_ENV_KEYS, DoubaoVoiceAgent, doubaoConfig, doubaoConfigured } from './doubao.mjs';
+import { DOUBAO_ENV_KEYS, DOUBAO_INPUT_BATCH_FRAMES, DoubaoVoiceAgent, doubaoConfig, doubaoConfigured } from './doubao.mjs';
 import { XAI_ENV_KEYS, XaiVoiceAgent, xaiConfig, xaiConfigured } from './xai.mjs';
 
 /**
@@ -18,7 +18,9 @@ const REGISTRY = {
   xai: { label: 'xAI', envKeys: XAI_ENV_KEYS, configured: xaiConfigured, config: xaiConfig, create: config => new XaiVoiceAgent(config) },
   // S27 决策 4: 第二家供应商。Control 的 `VOICE_PROVIDER_LABELS` 里"豆包"早就存在，三端设置页
   // 是数据驱动的，所以新增一家就是这一行 + 一个模块，worker 与三端都不需要改。
-  doubao: { label: '豆包', envKeys: DOUBAO_ENV_KEYS, configured: doubaoConfigured, config: doubaoConfig, create: config => new DoubaoVoiceAgent(config) },
+  // S98: `inputBatchFrames` — how many 20 ms caller frames the bridge hands over per append. Absent
+  // means the batcher's default of five (100 ms), which is what xAI keeps.
+  doubao: { label: '豆包', envKeys: DOUBAO_ENV_KEYS, configured: doubaoConfigured, config: doubaoConfig, create: config => new DoubaoVoiceAgent(config), inputBatchFrames: DOUBAO_INPUT_BATCH_FRAMES },
 };
 
 /**
@@ -33,6 +35,9 @@ export function providerUnavailable() {
 export function providerIds() { return Object.keys(REGISTRY); }
 
 export function providerLabel(provider) { return entry(provider)?.label ?? null; }
+
+/** S98: the provider's uplink batch in 20 ms frames, or `undefined` for the bridge's default. */
+export function providerInputBatchFrames(provider) { return entry(provider)?.inputBatchFrames; }
 
 /** Presence-only answer: what this worker may announce to Control in its heartbeat. */
 export function availableProviders(env = {}) {

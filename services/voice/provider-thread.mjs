@@ -29,6 +29,14 @@ const FORWARDED = ['flushAudio', 'completed', 'transcript', 'notice', 'speechSta
 const STOP_CLOSE_WAIT_MS = 300;
 
 /**
+ * S98: what the provider sent, counted per event type (the adapter's `providerEvent`). Types only —
+ * never a payload — and at most 40 of them: a type that does not look like one counts as `invalid`,
+ * and once 39 names are taken the rest count as `other`.
+ */
+const MAX_EVENT_TYPES = 40;
+const EVENT_TYPE = /^[a-z0-9_.]{1,64}$/;
+
+/**
  * Binds one already-constructed agent to one `MessagePort`. Exported so the proxy can be tested
  * over a `MessageChannel` without paying for a real thread, and so the entry point below is three
  * lines that cannot drift from what the tests cover.
@@ -58,8 +66,20 @@ export function serveVoiceAgent(port, agent, { onClosed = () => {}, gcReportMs =
     } catch { return null; }
   })();
   const reportGc = () => { if (gcObserver) post({ t: 'gc', gc: { ...gc } }); };
-  const gcTimer = gcObserver ? setInterval(reportGc, gcReportMs) : null;
-  gcTimer?.unref?.();
+  const eventCounts = new Map();
+  let lastEventAtMs = null;
+  const onProviderEvent = type => {
+    let key = typeof type === 'string' && EVENT_TYPE.test(type) ? type : 'invalid';
+    if (!eventCounts.has(key) && eventCounts.size >= MAX_EVENT_TYPES - 1) key = 'other';
+    eventCounts.set(key, (eventCounts.get(key) ?? 0) + 1);
+    lastEventAtMs = Date.now();
+  };
+  agent.on('providerEvent', onProviderEvent);
+  const reportEvents = () => { if (eventCounts.size) post({ t: 'events', events: Object.fromEntries(eventCounts), lastEventAtMs }); };
+  // Same cadence and the same reason as the GC totals: `run_closed` must not wait for a dying thread.
+  const report = () => { reportGc(); reportEvents(); };
+  const gcTimer = setInterval(report, gcReportMs);
+  gcTimer.unref?.();
   // Provider text never reaches a log line; the proxy re-raises a bounded message as an Error.
   // S69: `name`/`code` cross too, so the worker can log `provider_fault {errorName, code}` without the message.
   const faulted = error => post({ t: 'ev', name: 'fault', payload: { message: String(error?.message ?? error).slice(0, 500), name: String(error?.name ?? 'Error').slice(0, 64),
@@ -80,12 +100,12 @@ export function serveVoiceAgent(port, agent, { onClosed = () => {}, gcReportMs =
 
   const finish = () => {
     if (finished) return;
-    reportGc();
+    report();
     finished = true;
     clearInterval(gcTimer);
     try { gcObserver?.disconnect(); } catch {}
     for (const [name, handler] of listeners) agent.off(name, handler);
-    agent.off('audio', onAudio); agent.off('fault', onFault);
+    agent.off('audio', onAudio); agent.off('fault', onFault); agent.off('providerEvent', onProviderEvent);
     try { port.close(); } catch {}
     onClosed();
   };
@@ -114,8 +134,8 @@ export function serveVoiceAgent(port, agent, { onClosed = () => {}, gcReportMs =
           // 否则服务端记 55000001 ContextCanceled（R11 §6.2）。`finish()` 会触发线程入口的
           // `process.exit(0)`，立刻收尾就等于在那一帧写出去之前杀掉 isolate。所以这里等适配器
           // 自己的 `closed`，上限 STOP_CLOSE_WAIT_MS——必须小于 proxy 的 TERMINATE_GRACE_MS。
-          // 先把 GC 统计发出去，`run_closed` 不必等这段收尾。
-          reportGc();
+          // 先把 GC 统计与事件计数发出去，`run_closed` 不必等这段收尾。
+          report();
           let timer;
           const end = () => { clearTimeout(timer); agent.off('closed', end); finish(); };
           timer = setTimeout(end, STOP_CLOSE_WAIT_MS);

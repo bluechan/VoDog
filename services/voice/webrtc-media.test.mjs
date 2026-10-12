@@ -207,3 +207,71 @@ test('S70: the rewritten offer is what setLocalDescription gets and what the bri
   assert.equal(sent,state.pcs[0].localDescription.sdp);
   peer.close();
 });
+
+// S129: the receive-buffer numbers ride the existing inbound-RTP poll; `rxSummary()` only reads what it cached.
+function rxPeer(reports, options = {}) {
+  const pc={connectionState:'connected',onconnectionstatechange:null,close(){},getStats:async()=>new Map(reports().map(report=>[report.id??report.type,report]))};
+  return new ClientMediaPeer({wrtc:{},pc,source:{},sourceTrack:{stop(){}},sink:null,callId,mediaNodeId:'test',mediaEpoch:1,inboundRtpPollMs:5,inboundRtpWatchMs:5,...options});
+}
+const rxWait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+test('S129: rxSummary reports jitter-buffer means, the worst poll window, sample counters and the selected pair RTT', async()=>{
+  // Three states of the cumulative counters; each is polled several times (a repeat poll has Δemitted = 0 and is skipped).
+  const states=[
+    {inbound:{packetsReceived:50,packetsLost:0,jitterBufferDelay:48,jitterBufferTargetDelay:32,jitterBufferMinimumDelay:30,jitterBufferEmittedCount:480,concealedSamples:0,removedSamplesForAcceleration:0,insertedSamplesForDeceleration:10,jitter:0.004},rtt:0.021},
+    {inbound:{packetsReceived:100,packetsLost:1,jitterBufferDelay:240,jitterBufferTargetDelay:80,jitterBufferMinimumDelay:60,jitterBufferEmittedCount:960,concealedSamples:480,removedSamplesForAcceleration:96,insertedSamplesForDeceleration:10,jitter:0.0127},rtt:0.0456},
+    {inbound:{packetsReceived:150,packetsLost:2,jitterBufferDelay:288,jitterBufferTargetDelay:120,jitterBufferMinimumDelay:90,jitterBufferEmittedCount:1440,concealedSamples:600,removedSamplesForAcceleration:200,insertedSamplesForDeceleration:30,jitter:0.002},rtt:0.03},
+  ];
+  let state=states[0];
+  const peer=rxPeer(()=>[
+    {type:'inbound-rtp',kind:'video',id:'v',packetsReceived:9,jitterBufferDelay:999,jitterBufferEmittedCount:1},
+    {type:'inbound-rtp',kind:'audio',id:'a',...state.inbound},
+    {type:'transport',id:'t',selectedCandidatePairId:'p2'},
+    // A nominated pair that is not the selected one must not win.
+    {type:'candidate-pair',id:'p1',nominated:true,state:'succeeded',currentRoundTripTime:9},
+    {type:'candidate-pair',id:'p2',nominated:true,state:'succeeded',currentRoundTripTime:state.rtt},
+  ]);
+  assert.equal(peer.rxSummary(),null,'nothing polled yet');
+  await rxWait(30);state=states[1];await rxWait(30);state=states[2];await rxWait(30);
+  peer.close();
+  // Means over the whole call: 288/1440 s and 120/1440 s per sample. Windows: 100, 400 and 100 ms.
+  assert.deepEqual(peer.rxSummary(),{jbMeanMs:200,jbTargetMeanMs:83,jbWindowMaxMs:400,concealedSamples:600,acceleratedSamples:200,deceleratedSamples:30,
+    jitterMsMax:13,packetsLost:2,packetsReceived:150,rttMsLast:30,rttMsMax:46});
+  assert.deepEqual(peer.rxSummary(),peer.rxSummary(),'still answers after close, from the cache');
+});
+
+test('S129: rxSummary names the stats it never saw, falls back to the nominated pair, and skips a counter reset', async()=>{
+  let inbound={packetsReceived:10,jitterBufferDelay:96,jitterBufferEmittedCount:480,concealedSamples:5,jitter:'n/a'};
+  const peer=rxPeer(()=>[{type:'inbound-rtp',mediaType:'audio',id:'a',...inbound},
+    {type:'candidate-pair',id:'p0',nominated:false,state:'succeeded',currentRoundTripTime:5},
+    {type:'candidate-pair',id:'p1',nominated:true,state:'succeeded',currentRoundTripTime:0.0704}]);
+  await rxWait(30);
+  // S73 rejoin: a new SSRC restarts the cumulative counters. That poll is not a window.
+  inbound={packetsReceived:20,jitterBufferDelay:1,jitterBufferEmittedCount:10,concealedSamples:5,jitter:'n/a'};
+  await rxWait(30);peer.close();
+  assert.deepEqual(peer.rxSummary(),{jbMeanMs:100,jbWindowMaxMs:200,concealedSamples:5,packetsReceived:20,rttMsLast:70,rttMsMax:70,
+    missing:['jitterBufferTargetDelay','removedSamplesForAcceleration','insertedSamplesForDeceleration','jitter','packetsLost']});
+
+  // No candidate pair and no jitter-buffer counters at all: still an object, RTT listed as missing.
+  const bare=rxPeer(()=>[{type:'inbound-rtp',kind:'audio',id:'a',packetsReceived:3}]);
+  await rxWait(30);bare.close();
+  assert.deepEqual(bare.rxSummary(),{packetsReceived:3,missing:['jitterBufferDelay','jitterBufferTargetDelay','jitterBufferEmittedCount','concealedSamples',
+    'removedSamplesForAcceleration','insertedSamplesForDeceleration','jitter','packetsLost','currentRoundTripTime']});
+});
+
+test('S129: no inbound audio RTP stats means rxSummary is null, and bad stats never disturb gap detection', async()=>{
+  const none=rxPeer(()=>[{type:'inbound-rtp',kind:'video',id:'v',packetsReceived:9},{type:'candidate-pair',id:'p',nominated:true,state:'succeeded',currentRoundTripTime:0.02}]);
+  await rxWait(30);none.close();assert.equal(none.rxSummary(),null);
+  // getStats rejecting: polling goes on, nothing is cached, no event fires.
+  let polls=0;
+  const failing=new ClientMediaPeer({wrtc:{},pc:{connectionState:'connected',onconnectionstatechange:null,close(){},getStats:async()=>{polls++;throw new Error('boom')}},source:{},sourceTrack:{stop(){}},sink:null,callId,mediaNodeId:'test',mediaEpoch:1,inboundRtpPollMs:5});
+  await rxWait(30);failing.close();assert.equal(polls>1,true);assert.equal(failing.rxSummary(),null);
+  // A report whose fields throw when read breaks only the summary: inboundRtp / mediaGap / mediaResumed are as before.
+  let packets=0;
+  const hostile=rxPeer(()=>[{type:'inbound-rtp',kind:'audio',id:'a',packetsReceived:packets,get jitterBufferDelay(){throw new Error('boom')}}],{inboundRtpGapMs:40});
+  const events=[];for(const name of ['inboundRtp','mediaGap','mediaResumed'])hostile.on(name,()=>events.push(name));
+  for(let i=0;i<6;i++){packets++;await rxWait(10);}
+  assert.deepEqual(events,['inboundRtp']);
+  await rxWait(80);packets++;await rxWait(20);hostile.close();
+  assert.deepEqual(events,['inboundRtp','mediaGap','mediaResumed']);
+});

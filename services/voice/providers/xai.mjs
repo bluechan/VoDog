@@ -43,8 +43,23 @@ const MAX_STRAY_RESPONSES = 20;
  * 不说话就挂断」rule its own prompt promises. Agent mode therefore re-sends both fields verbatim;
  * the same probe shows unknown fields are accepted and echoed back. Model mode has no Space agent
  * behind it and stays byte-for-byte what production already runs.
+ *
+ * S119b（field calls）: 5 s was the agent's baseline, and it was too short:
+ * the caller had ~2 s after hearing the greeting before xAI opened an idle turn and called
+ * `end_call` (run_closed providerEvents `input_audio_buffer.timeout_triggered:1` → provider_notice
+ * end_call → ai_ended_call). In-image probe (uplink zeros):
+ * xAI starts the idle clock at ITS OWN notion of the opener's playback end — opener
+ * `response.created` + audio duration (+2.17 s + 10.1 s), not when the ~1.5 s burst finished
+ * sending — and `timeout_triggered` arrived at +27.38 s = that + 15 s, then `end_call` at once (no
+ * reminder turn). But we HOLD the opener until Control opens the audio gate (`greet()`), so the
+ * caller hears it later than xAI assumes, and every second of that hold comes off the idle window.
+ * The worker's own silence hang-up is 0 for xAI, so this is the only idle timer. Default is now
+ * 15 s, matching the「超过 15 秒不说话就挂断」the agent's prompt promises; `XAI_AGENT_IDLE_TIMEOUT_MS`
+ * overrides it within [5000, 60000]; xAI echoes 15000 in `session.updated`. Reminder count stays 2,
+ * but the probe shows it buys no spoken reminder: the first idle turn went straight to `end_call`.
  */
-const AGENT_IDLE_TIMEOUT_MS = 5_000;
+const AGENT_IDLE_TIMEOUT_MS = 15_000;
+const AGENT_IDLE_TIMEOUT_BOUNDS = [5_000, 60_000];
 const AGENT_END_CALL_AFTER_IDLE_REMINDER_COUNT = 2;
 
 /**
@@ -55,7 +70,9 @@ const AGENT_END_CALL_AFTER_IDLE_REMINDER_COUNT = 2;
  * ~20 s, so this is the provider's rule and not something this change introduced — but a claim may
  * prewarm up to 30 s before `timeout_ai`, so the session must not be opened at claim time. 8 s sits
  * comfortably inside that ~17 s budget and still leaves room for the handshake plus the
- * `session.updated` round trip (1.6–1.9 s measured in-image). Model mode has no Space agent and no
+ * `session.updated` round trip (1.6–1.9 s measured in-image). S119b: that ~17 s was opener start +
+ * ~10 s audio + the 5 s idle timeout; with 15 s the same probe died at ~27 s, so the budget only got
+ * longer and the 8 s lead is kept. Model mode has no Space agent and no
  * such idle rule, so it carries no lead and keeps opening at claim time.
  */
 const AGENT_PREWARM_LEAD_MS = 8_000;
@@ -85,7 +102,7 @@ const TRANSCRIPTION_LANGUAGE_PATTERN = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$/;
  * fields and for the threshold, so presence is tested, never truthiness.
  * S27 决策 13: `agentMode` appends the Space agent's own two idle fields (see the constants above).
  */
-function turnDetection({ vadThreshold, vadPrefixMs, vadSilenceMs, agentMode = false } = {}) {
+function turnDetection({ vadThreshold, vadPrefixMs, vadSilenceMs, agentMode = false, agentIdleTimeoutMs = AGENT_IDLE_TIMEOUT_MS } = {}) {
   const bounded = (value, name, max, integer) => {
     if (!Number.isFinite(value) || value < 0 || value > max || (integer && !Number.isInteger(value))) throw new Error(`Invalid ${name}`);
     return value;
@@ -95,8 +112,14 @@ function turnDetection({ vadThreshold, vadPrefixMs, vadSilenceMs, agentMode = fa
     ...(vadThreshold === undefined ? {} : { threshold: bounded(vadThreshold, 'VAD threshold', 1, false) }),
     ...(vadPrefixMs === undefined ? {} : { prefix_padding_ms: bounded(vadPrefixMs, 'VAD prefix padding', 5_000, true) }),
     ...(vadSilenceMs === undefined ? {} : { silence_duration_ms: bounded(vadSilenceMs, 'VAD silence duration', 5_000, true) }),
-    ...(agentMode ? { idle_timeout_ms: AGENT_IDLE_TIMEOUT_MS, end_call_after_idle_reminder_count: AGENT_END_CALL_AFTER_IDLE_REMINDER_COUNT } : {}),
+    ...(agentMode ? { idle_timeout_ms: checkedIdleTimeout(agentIdleTimeoutMs), end_call_after_idle_reminder_count: AGENT_END_CALL_AFTER_IDLE_REMINDER_COUNT } : {}),
   };
+}
+
+const IDLE_TIMEOUT_ERROR = `XAI_AGENT_IDLE_TIMEOUT_MS must be an integer between ${AGENT_IDLE_TIMEOUT_BOUNDS[0]} and ${AGENT_IDLE_TIMEOUT_BOUNDS[1]}`;
+function checkedIdleTimeout(value) {
+  if (!Number.isInteger(value) || value < AGENT_IDLE_TIMEOUT_BOUNDS[0] || value > AGENT_IDLE_TIMEOUT_BOUNDS[1]) throw new Error(IDLE_TIMEOUT_ERROR);
+  return value;
 }
 
 /** The provider hostname is fixed: it is what the TLS certificate is checked against. */
@@ -158,6 +181,8 @@ export class XaiVoiceAgent extends EventEmitter {
     vadThreshold,
     vadPrefixMs,
     vadSilenceMs,
+    // S119b: agent mode only; undefined keeps AGENT_IDLE_TIMEOUT_MS.
+    agentIdleTimeoutMs,
     // S25 决策 6: only set when xAI is reached through relay-primary's forwarder; see `xaiRealtimeUrl`.
     realtimePort,
     socketFactory = (url, options) => new WebSocket(url, options),
@@ -167,7 +192,7 @@ export class XaiVoiceAgent extends EventEmitter {
     Object.assign(this, { apiKey, agentId, model, voice, greeting, transcriptionModel, transcriptionLanguage, realtimePort, socketFactory });
     // Omitted from the payload when undefined, which is what agent mode leaves it at.
     this.instructions = instructions ?? (agentId ? undefined : MODEL_INSTRUCTIONS);
-    this.turnDetection = turnDetection({ vadThreshold, vadPrefixMs, vadSilenceMs, agentMode: Boolean(agentId) });
+    this.turnDetection = turnDetection({ vadThreshold, vadPrefixMs, vadSilenceMs, agentMode: Boolean(agentId), agentIdleTimeoutMs });
     this.state = 'idle';
     this.sequence = -1;
     this.outputGeneration = 0;
@@ -221,6 +246,9 @@ export class XaiVoiceAgent extends EventEmitter {
           headers: { Authorization: `Bearer ${this.apiKey}`, ...(this.realtimePort === undefined ? {} : { Host: XAI_HOST }) },
           handshakeTimeout: 12_000,
           maxPayload: MAX_PROVIDER_MESSAGE_BYTES,
+          // S98: `ws` offers permessage-deflate by default. base64 PCM barely compresses, and zlib on
+          // every 100 ms append and every audio delta is CPU and latency on the provider thread.
+          perMessageDeflate: false,
         });
         this.socket = ws;
       } catch (error) {
@@ -306,6 +334,8 @@ export class XaiVoiceAgent extends EventEmitter {
       this.stop();
       return;
     }
+    // S98: the type only (provider-thread.mjs counts it into `run_closed.providerEvents`), never the payload.
+    this.emit('providerEvent', event?.type);
     if (event.type === 'session.updated') {
       // An acknowledged update ends the best-effort window: a later error is fatal again.
       if (this.state !== 'connecting') { this.forgetBestEffort(); return; }
@@ -378,7 +408,10 @@ export class XaiVoiceAgent extends EventEmitter {
       this.emit('transcript', payload);
     }
     if (event.type === 'conversation.item.input_audio_transcription.completed') {
-      this.emit('transcript', { text: String(event.transcript ?? '').slice(0, 16_384), final: true, speaker: 'caller' });
+      // S120a: xAI re-sends `completed` for one utterance as it revises it (one field call: five finals,
+      // one item_id). The item id lets the collector replace the held text instead of guessing by prefix.
+      const itemId = typeof event.item_id === 'string' && event.item_id ? event.item_id.slice(0, 128) : undefined;
+      this.emit('transcript', { text: String(event.transcript ?? '').slice(0, 16_384), final: true, speaker: 'caller', ...(itemId ? { itemId } : {}) });
     }
     if (event.type === 'conversation.item.input_audio_transcription.updated') {
       this.emit('transcript', { text: String(event.transcript ?? '').slice(0, 16_384), final: false, cumulative: true, speaker: 'caller' });
@@ -690,7 +723,7 @@ export function vadSettings(env = {}) {
  * fail startup inside `xaiConfig`, never silently disable the provider.
  */
 export const XAI_ENV_KEYS = Object.freeze(['XAI_API_KEY', 'XAI_AGENT_ID', 'XAI_REALTIME_MODEL', 'XAI_REALTIME_PORT', 'XAI_VOICE',
-  'XAI_GREETING', 'XAI_TRANSCRIPTION_MODEL', 'XAI_TRANSCRIPTION_LANGUAGE', 'VOICE_VAD_THRESHOLD', 'VOICE_VAD_PREFIX_MS', 'VOICE_VAD_SILENCE_MS']);
+  'XAI_GREETING', 'XAI_TRANSCRIPTION_MODEL', 'XAI_TRANSCRIPTION_LANGUAGE', 'XAI_AGENT_IDLE_TIMEOUT_MS', 'VOICE_VAD_THRESHOLD', 'VOICE_VAD_PREFIX_MS', 'VOICE_VAD_SILENCE_MS']);
 
 /**
  * S27 决策 16: the caller-language hint. Unset means the agent-mode default; a key that is present
@@ -720,6 +753,14 @@ export function xaiRealtimePort(env = {}) {
   return { realtimePort: checkedPort(Number.parseInt(raw, 10)) };
 }
 
+/** S119b: optional agent idle timeout; unset keeps the 15 s default, a malformed value fails startup. */
+export function xaiAgentIdleTimeout(env = {}) {
+  const raw = env.XAI_AGENT_IDLE_TIMEOUT_MS === undefined || env.XAI_AGENT_IDLE_TIMEOUT_MS === null ? '' : String(env.XAI_AGENT_IDLE_TIMEOUT_MS).trim();
+  if (raw === '') return {};
+  if (!/^\d{1,5}$/.test(raw)) throw new Error(IDLE_TIMEOUT_ERROR);
+  return { agentIdleTimeoutMs: checkedIdleTimeout(Number.parseInt(raw, 10)) };
+}
+
 export function xaiConfigured(env = {}) {
   return Boolean(env.XAI_API_KEY) && Boolean(env.XAI_AGENT_ID || env.XAI_REALTIME_MODEL);
 }
@@ -739,6 +780,7 @@ export function xaiConfig(env = {}) {
     ...xaiTranscriptionLanguage(env, { agentMode: Boolean(env.XAI_AGENT_ID) }),
     ...xaiRealtimePort(env),
     ...vadSettings(env),
+    ...(env.XAI_AGENT_ID ? xaiAgentIdleTimeout(env) : {}),
   };
   if (!config.apiKey) throw new Error('XAI_API_KEY is required');
   // S27 决策 14: read by the worker off `agent.config`, agent mode only (see AGENT_PREWARM_LEAD_MS).

@@ -144,6 +144,10 @@ export const DISCONNECT_GRACE_MS = 10_000;
 /** S73f: inbound audio RTP absent this long is a media gap (the gateway leg is down), not a silent caller. */
 export const INBOUND_RTP_GAP_MS = 2_000;
 
+/** S129: the cumulative `inbound-rtp` numbers `rxSummary()` reports; one absent from the stats is named in `missing`. */
+const RX_FIELDS = ['jitterBufferDelay', 'jitterBufferTargetDelay', 'jitterBufferEmittedCount', 'concealedSamples', 'removedSamplesForAcceleration',
+  'insertedSamplesForDeceleration', 'jitter', 'packetsLost', 'packetsReceived'];
+
 /** A headless WebRTC client-role peer; it never receives a Control user token. */
 export class ClientMediaPeer extends EventEmitter {
   constructor({ wrtc, pc, source, sourceTrack, sink, callId, mediaNodeId, mediaEpoch, signal, disconnectGraceMs = DISCONNECT_GRACE_MS, inboundRtpPollMs = 50,
@@ -159,18 +163,24 @@ export class ClientMediaPeer extends EventEmitter {
     // S73f: polling continues (every `inboundRtpWatchMs`) after that first packet. The bridge keeps
     // the room while the gateway leg rejoins (S73) but forwards nothing, so a packet count that stops
     // growing for `inboundRtpGapMs` is `mediaGap` ({ sinceMs }), and growth after it `mediaResumed` ({ gapMs }).
+    // S129: the same poll also caches the receive (jitter) buffer numbers and the selected pair's RTT for
+    // `rxSummary()` — read-only, no extra getStats call, and never in the way of the packet count above.
     this.inboundRtpTimer = null;
+    this.rx = null;
     if (typeof pc.getStats === 'function') {
       let packets = 0, lastPacketAtMs = 0, inGap = false;
       const poll = async () => {
         this.inboundRtpTimer = null;
-        let total = 0;
+        let total = 0, inbound = null, selectedPairId, pairs = null;
         try {
           (await pc.getStats()).forEach(report => {
-            if (report.type === 'inbound-rtp' && (report.kind ?? report.mediaType) === 'audio') total += report.packetsReceived ?? 0;
+            if (report.type === 'inbound-rtp' && (report.kind ?? report.mediaType) === 'audio') { total += report.packetsReceived ?? 0; inbound ??= report; }
+            else if (report.type === 'transport') selectedPairId ??= report.selectedCandidatePairId;
+            else if (report.type === 'candidate-pair') (pairs ??= []).push(report);
           });
         } catch {}
         if (this.closed) return;
+        try { this.recordRx(inbound, pairs?.find(pair => pair.id === selectedPairId) ?? pairs?.find(pair => pair.nominated && pair.state === 'succeeded')); } catch {}
         const now = Date.now();
         if (total > packets) {
           if (!lastPacketAtMs) this.emit('inboundRtp');
@@ -289,6 +299,51 @@ export class ClientMediaPeer extends EventEmitter {
   writePcm16k10ms(pcm) {
     if (this.closed) throw new Error('Media peer is closed');
     this.source.onData({ samples: pcmSamples(pcm), sampleRate: 16_000, bitsPerSample: 16, channelCount: 1, numberOfFrames: 160 });
+  }
+
+  /** S129: one poll's `inbound-rtp` audio report and the pair in use, folded into the per-call totals. */
+  recordRx(inbound, pair) {
+    if (!inbound) return;
+    const rx = this.rx ??= { last: {}, delay: 0, emitted: 0, windowMaxMs: null, jitterMax: null, rttLast: null, rttMax: null };
+    for (const name of RX_FIELDS) if (Number.isFinite(inbound[name])) rx.last[name] = inbound[name];
+    const { jitterBufferDelay: delay, jitterBufferEmittedCount: emitted, jitter } = inbound;
+    if (Number.isFinite(delay) && Number.isFinite(emitted)) {
+      // The counters are cumulative and restart when the SSRC changes (S73 rejoin): such a poll is skipped.
+      if (emitted > rx.emitted && delay >= rx.delay) rx.windowMaxMs = Math.max(rx.windowMaxMs ?? 0, (delay - rx.delay) / (emitted - rx.emitted) * 1_000);
+      rx.delay = delay; rx.emitted = emitted;
+    }
+    if (Number.isFinite(jitter)) rx.jitterMax = Math.max(rx.jitterMax ?? 0, jitter);
+    const rtt = pair?.currentRoundTripTime;
+    if (Number.isFinite(rtt)) { rx.rttLast = rtt; rx.rttMax = Math.max(rx.rttMax ?? 0, rtt); }
+  }
+
+  /**
+   * S129: what the receive buffer (libwebrtc NetEq) cost this call, for `run_closed`. Synchronous and from
+   * cached polls only, so it still answers after `close()`. Integers; null when no inbound audio RTP stats
+   * were ever seen. A number the stats never carried is left out and named once in `missing`.
+   */
+  rxSummary() {
+    const rx = this.rx;
+    if (!rx) return null;
+    const { last } = rx, out = {};
+    const put = (name, value) => { if (Number.isFinite(value)) out[name] = Math.round(value); };
+    if (last.jitterBufferEmittedCount > 0) {
+      put('jbMeanMs', last.jitterBufferDelay / last.jitterBufferEmittedCount * 1_000);
+      put('jbTargetMeanMs', last.jitterBufferTargetDelay / last.jitterBufferEmittedCount * 1_000);
+    }
+    put('jbWindowMaxMs', rx.windowMaxMs);
+    put('concealedSamples', last.concealedSamples);
+    put('acceleratedSamples', last.removedSamplesForAcceleration);
+    put('deceleratedSamples', last.insertedSamplesForDeceleration);
+    put('jitterMsMax', rx.jitterMax === null ? undefined : rx.jitterMax * 1_000);
+    put('packetsLost', last.packetsLost);
+    put('packetsReceived', last.packetsReceived);
+    put('rttMsLast', rx.rttLast === null ? undefined : rx.rttLast * 1_000);
+    put('rttMsMax', rx.rttMax === null ? undefined : rx.rttMax * 1_000);
+    const missing = RX_FIELDS.filter(name => !(name in last));
+    if (rx.rttLast === null) missing.push('currentRoundTripTime');
+    if (missing.length) out.missing = missing;
+    return out;
   }
 
   /**

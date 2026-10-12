@@ -98,7 +98,12 @@ export async function main(env = process.env) {
     if (!config) throw providerUnavailable();
     return new ThreadedVoiceAgent({ provider, config });
   };
-  const worker = new VoiceWorker({ control, wrtc, createAgent, defaultProvider: selected, maxCallSeconds: maxSeconds, mediaTransport: transport, heapRestartMb: Number(env.VOICE_HEAP_RESTART_MB) || 120, log: jsonLogger({ nodeId }) });
+  const log = jsonLogger({ nodeId });
+  // S98: the between-runs heap check can only collect before it decides to restart when node runs
+  // with --expose-gc (Dockerfile ENTRYPOINT / systemd ExecStart); without it that step is a no-op.
+  const gcExposed = typeof globalThis.gc === 'function';
+  log({ event: 'worker_starting', level: gcExposed ? 'info' : 'warn', gcExposed });
+  const worker = new VoiceWorker({ control, wrtc, createAgent, defaultProvider: selected, maxCallSeconds: maxSeconds, mediaTransport: transport, heapRestartMb: Number(env.VOICE_HEAP_RESTART_MB) || 120, log });
   const stop = () => { void worker.stop(); };
   process.once('SIGTERM', stop); process.once('SIGINT', stop);
   try { await worker.start(); } finally { process.off('SIGTERM', stop); process.off('SIGINT', stop); }
