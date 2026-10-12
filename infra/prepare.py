@@ -65,6 +65,9 @@ def prepare(args):
     env(out / 'voice.env', dict(VOICE_CONTROL_ORIGIN='http://127.0.0.1:16880',
         AI_INTERNAL_TOKEN_FILE='/run/ai-token', VOICE_NODE_ID='voice-primary',
         VOICE_INSTANCE_ID='voice-primary', VOICE_MEDIA_TRANSPORT='udp', VOICE_PROVIDER='xai', XAI_API_KEY='', XAI_AGENT_ID='', XAI_REALTIME_MODEL=''))
+    # Watch audio bridge: joins calls with the watch's own bearer token, so it holds no secrets.
+    env(out / 'watch-audio.env', dict(WATCH_AUDIO_PORT=16811, WATCH_AUDIO_HOST='127.0.0.1', CONTROL_ORIGIN='http://127.0.0.1:16880',
+        CONTROL_HOST=args.domain, WATCH_MEDIA_TRANSPORT='udp', WATCH_MEDIA_RELAY='false'))
     write(out / 'ai-token', ai + '\n')
     env(out / 'admin.env', dict(TEST_USERNAME='admin@example.com', TEST_PASSWORD=password, TEST_USER_ROLE='admin'))
     cert = f'/etc/letsencrypt/live/{args.domain}'
@@ -124,6 +127,17 @@ server {{
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_read_timeout 65s;
     }}
+    location = /ws/watch-audio {{
+        proxy_pass http://127.0.0.1:16811;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
     location = /healthz {{ proxy_pass http://127.0.0.1:16880/healthz; }}
     location = /media/probe {{ proxy_pass http://127.0.0.1:16881/probe; }}
     location = /webrtc-probe/offer {{ proxy_pass http://127.0.0.1:16881/webrtc-probe/offer; }}
@@ -150,6 +164,10 @@ server {{
         web=service('web', volumes=[f'{out}/nginx.conf:/etc/nginx/conf.d/default.conf:ro', certs,
                                    '/var/www/vodog-acme:/var/www/acme:ro'],
                     depends_on=dict(control=dict(condition='service_healthy'))),
+        # Same image as voice, no profile: starts on a fresh install. Host network to reach loopback Control;
+        # no ports entry, nginx proxies /ws/watch-audio to 127.0.0.1:16811.
+        **{'watch-audio': service('voice', env_file=['watch-audio.env'], command=['node', 'watch-audio-server.mjs'],
+                                  depends_on=dict(control=dict(condition='service_healthy')))},
         voice=service('voice', profiles=['voice'], env_file=['voice.env'],
                       volumes=[f'{out}/ai-token:/run/ai-token:ro'],
                       depends_on=dict(control=dict(condition='service_healthy'))),

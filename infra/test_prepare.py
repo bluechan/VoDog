@@ -47,7 +47,21 @@ class DeploymentTests(unittest.TestCase):
             compose=json.loads((out/'compose.json').read_text())
             self.assertEqual(compose['services']['voice']['profiles'], ['voice'])
             self.assertEqual(compose['services']['postgres']['ports'], ['127.0.0.1:5432:5432'])
-            self.assertIn('/webrtc-probe/offer', (out/'nginx.conf').read_text())
+            nginx=(out/'nginx.conf').read_text()
+            self.assertIn('/webrtc-probe/offer', nginx)
+            watch_route=nginx.split('location = /ws/watch-audio {',1)[1].split('}',1)[0]
+            for line in ('proxy_pass http://127.0.0.1:16811;', 'proxy_set_header Upgrade $http_upgrade;',
+                         'proxy_set_header Connection "upgrade";', 'proxy_read_timeout 3600s;'):
+                self.assertIn(line, watch_route)
+            watch=read_env(out/'watch-audio.env')
+            bridge=compose['services']['watch-audio']
+            self.assertEqual(bridge['command'], ['node','watch-audio-server.mjs'])
+            self.assertEqual(bridge['network_mode'], 'host')
+            self.assertFalse({'ports','profiles'} & bridge.keys())
+            self.assertEqual(watch['WATCH_AUDIO_PORT'], '16811')
+            self.assertEqual(watch['CONTROL_ORIGIN'], voice['VOICE_CONTROL_ORIGIN'])
+            self.assertEqual(watch['CONTROL_HOST'], 'app.example.com')
+            self.assertFalse({'DATABASE_URL','MEDIA_SECRET','TURN_SECRET','AI_INTERNAL_TOKEN'} & watch.keys())
             before=hashlib.sha256((out/'control.env').read_bytes()).digest()
             with self.assertRaises(FileExistsError):
                 prepare.prepare(args)

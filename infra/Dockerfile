@@ -33,11 +33,14 @@ ENTRYPOINT ["vodog-media"]
 FROM node:22-bookworm-slim AS voice
 WORKDIR /app
 COPY services/voice/package*.json ./
-RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+# Short per-fetch timeout with retries: one stalled tarball otherwise holds the build for ~30 min.
+RUN npm ci --omit=dev --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=5 \
+      --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=20000 && npm cache clean --force
 COPY services/voice/ ./
 RUN node --input-type=module -e "import('@roamhq/wrtc').then(m=>{if(!(m.default??m).nonstandard?.RTCAudioSource)process.exit(1)})"
 USER 10001:10001
-CMD ["node", "--max-old-space-size=160", "server.mjs"]
+# --expose-gc: the worker runs globalThis.gc() between calls before deciding a heap-limit restart.
+CMD ["node", "--expose-gc", "--max-old-space-size=160", "server.mjs"]
 
 FROM node:22-bookworm-slim AS web-build
 WORKDIR /app

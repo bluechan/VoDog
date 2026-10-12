@@ -56,6 +56,12 @@ by their entrypoints, and share loopback with the proxy/voice worker. PostgreSQL
 only on 127.0.0.1. Nginx exposes API paths and two signed media probe paths; `/internal/`
 and the media bridge's raw offer/close/recording endpoints are never publicly proxied.
 
+The `watch-audio` service (voice image, `node watch-audio-server.mjs`, `watch-audio.env`)
+starts by default and serves the Apple Watch audio leg. Nginx proxies
+`wss://<domain>/ws/watch-audio` (WebSocket upgrade, 1 h timeouts) to `127.0.0.1:16811`;
+the bridge calls Control at `http://127.0.0.1:16880` with the watch's own token and holds
+no secrets. The bridge binds `127.0.0.1` (`WATCH_AUDIO_HOST`) and is reached only through nginx.
+
 ## Features and worker contracts
 
 The fresh-host config enables Pixel archive upload/validation, command replay migration
