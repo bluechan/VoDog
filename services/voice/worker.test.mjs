@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -19,6 +19,13 @@ class Bridge extends EventEmitter {
   // real queue in pcm-pipeline.test.mjs; here only the options the worker hands it are recorded.
   async whenPlaybackDrained(options) { this.drained = (this.drained ?? 0) + 1; this.drainOptions = options; return true; }
 }
+// A test that fails before its own `worker.stop()` would leave the heartbeat and claim loops running,
+// and this file's process would never exit. Stop every worker a test created, bounded.
+const workers = new Set();
+afterEach(async () => {
+  const created = [...workers]; workers.clear();
+  await Promise.race([Promise.allSettled(created.map(worker => worker.stop())), delay(1_000)]);
+});
 function setup(overrides = {}) {
   const agent = new Agent(), peer = new Peer(), bridge = new Bridge(), calls = [], posts = [], logs = [];
   const control = {
@@ -33,6 +40,7 @@ function setup(overrides = {}) {
     // S27 决策 15: the production hangup tail is a real second of wall clock; tests that are not
     // about it opt out, and the one that is passes its own value.
     renewMs: 100, pollMs: 5, heartbeatMs: 100, idleMs: 10, aiEndTailMs: 0, heapRestartMb: 0, log: record => logs.push(record), ...overrides, ...(overrides.control ? { control } : {}) });
+  workers.add(worker);
   return { worker, agent, peer, bridge, control, calls, posts, logs };
 }
 async function until(predicate) { for (let i = 0; i < 100; i++) { if (predicate()) return; await delay(5); } assert.fail('Condition was not reached'); }
@@ -443,7 +451,8 @@ test('S27 决策 15: the hangup holds a tail after the queue drains so the far e
   s.agent.emit('notice', { kind: 'end_call' });
   await s.task;
   const elapsed = Date.now() - noticeAt;
-  assert.ok(elapsed >= 150, `hung up after ${elapsed} ms, before the 150 ms tail had elapsed`);
+  // 5 ms slack: a timer can fire about 1 ms early as measured by Date.now(); the tail itself is 150 ms.
+  assert.ok(elapsed >= 145, `hung up after ${elapsed} ms, before the 150 ms tail had elapsed`);
   assert.equal(s.logs.find(record => record.event === 'ai_ended_call')?.tailMs, 150);
   assert.deepEqual(s.calls, ['commit', 'offer', 'fail:ai_ended_call']);
 });
@@ -981,8 +990,10 @@ test('S98: one failed heartbeat neither ends the live run nor waits a full perio
 
 test('S98: a heartbeat down past the grace ends the live run as worker_heartbeat_failed, not worker_shutdown', async () => {
   const s = setup({ heartbeatMs: 10, controlRetryMs: 5, heartbeatGraceMs: 60, control: { read: async () => authority() } });
-  claimOnce(s); let beats = 0;
-  s.control.heartbeat = async () => { if (++beats > 1) throw new ControlError(503, 'REQUEST_FAILED'); };
+  // Fail only once the run is live: failing from the second beat raced the claim loop, which only
+  // claims while the heartbeat is healthy, and could leave no run to abandon.
+  claimOnce(s);
+  s.control.heartbeat = async () => { if (s.bridge.history.includes(true)) throw new ControlError(503, 'REQUEST_FAILED'); };
   const task = s.worker.start();
   await until(() => s.logs.some(entry => entry.event === 'run_closed'));
   await s.worker.stop(); await task;
@@ -999,13 +1010,14 @@ test('S98: the heartbeat grace is a timer, so a beat stuck in its 3 s timeout ca
   // One failure starts the streak; the next attempt is far away (it stands in for a request hanging
   // in its timeout). The run must still be abandoned when the grace runs out, not at the next failure.
   const s = setup({ heartbeatMs: 10, controlRetryMs: 10_000, heartbeatGraceMs: 60, control: { read: async () => authority() } });
-  claimOnce(s); let beats = 0, failedAt = 0;
-  s.control.heartbeat = async () => { if (++beats > 1) { failedAt = Date.now(); throw new TypeError('fetch failed'); } };
+  // The failing beat waits for the live run (see the previous test): otherwise it could race the claim.
+  claimOnce(s); let failures = 0, failedAt = 0;
+  s.control.heartbeat = async () => { if (s.bridge.history.includes(true)) { failures++; failedAt = Date.now(); throw new TypeError('fetch failed'); } };
   const task = s.worker.start();
   await until(() => s.logs.some(entry => entry.event === 'run_closed'));
   const abortedAt = Date.now();
   await s.worker.stop(); await task;
-  assert.equal(beats, 2, 'no further heartbeat was attempted');
+  assert.equal(failures, 1, 'no further heartbeat was attempted');
   assert.ok(abortedAt - failedAt < 1_000, `abandoned ${abortedAt - failedAt} ms after the only failure`);
   assert.equal(s.logs.find(entry => entry.event === 'run_closed').reason, 'worker_heartbeat_failed');
 });

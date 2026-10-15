@@ -816,6 +816,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
             "credentialSource": resolution.source ?? "none", "imei": imei,
             "gatewayId": String((resolution.credentials?.gatewayId ?? "").prefix(8)),
             "deviceEpoch": resolution.credentials?.deviceEpoch ?? 0, "moduleCopy": module != nil,
+            "moduleIgnored": resolution.moduleIgnored,
         ])
         applyCredentials(resolution.credentials)
     }
@@ -919,6 +920,15 @@ final class GatewayRuntime: ObservableObject, Identifiable {
         let notExecuted: (String) async -> Void = { reason in
             await finish("rejected", ["phase": "not_executed", "reason": reason], nil)
         }
+        // dial/send_sms/dtmf must not be repeated: run them only after `started` is durable.
+        let begin: (String?) async -> Bool = { [weak self] deviceCallId in
+            if ledger.begin(id: command.id, sequence: command.sequence, kind: command.kind, deviceCallId: deviceCallId) {
+                return true
+            }
+            self?.diag("gateway.ledger_write_failed", "error", command.callId, ["commandId": command.id, "kind": command.kind])
+            await notExecuted("journal_unavailable")
+            return false
+        }
         // Moving a module between Macs: the other Mac's ledger may hold this command as started.
         // A side-effecting command issued before this Mac bound the gateway is never executed here.
         let lifetimes: [String: TimeInterval] = ["dial": 30, "send_sms": 120, "dtmf": 20]
@@ -971,7 +981,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
             }
             let now = Self.nowMillis()
             let deviceCallId = GatewayRules.deviceCallId(locationID: state.modem.usbLocationID ?? 0, firstSeenMillis: now)
-            ledger.begin(id: command.id, sequence: command.sequence, kind: command.kind, deviceCallId: deviceCallId)
+            guard await begin(deviceCallId) else { return }
             pendingDial = (callId, deviceCallId, now)
             service.gatewayRemoteCall = true
             service.gatewayEarlyMedia = earlyMedia
@@ -1058,7 +1068,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
                 await notExecuted("no_call")
                 return
             }
-            ledger.begin(id: command.id, sequence: command.sequence, kind: command.kind)
+            guard await begin(nil) else { return }
             // One AT+VTS per digit, never retried: a repeat would select an IVR option twice.
             var sent = 0
             for digit in digits {
@@ -1089,7 +1099,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
             // ponytail: the module refuses SMS during a call; leave it pending so Control redelivers
             // it next beat (it expires after 2 min if the call outlasts that). Re-read: `call` predates the beat.
             guard appState?.gatewayModuleState(imei: imei)?.call.hasCall == false else { return }
-            ledger.begin(id: command.id, sequence: command.sequence, kind: command.kind)
+            guard await begin(nil) else { return }
             let parts = (try? SMSPDUEncoder.encode(destination: number, body: body))?.count ?? 0
             let sendStartedAt = Date()
             let result: SMSMessageSendResult = await withCheckedContinuation { continuation in

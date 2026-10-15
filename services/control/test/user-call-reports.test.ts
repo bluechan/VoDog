@@ -23,6 +23,9 @@ test('user call reports list every call in the window and enforce all calendar-w
   await admin.query(`CREATE DATABASE ${databaseName}`);
   const db = new Pool({connectionString: `postgresql:///${databaseName}`, max: 4});
   t.after(async () => {
+    // DROP … WITH (FORCE) terminates any pooled connection still closing; that is expected during
+    // teardown and must not surface as an uncaught pool error that fails the whole file.
+    db.on('error', () => {});
     await db.end();
     await admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
     await admin.end();

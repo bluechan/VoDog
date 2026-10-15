@@ -156,6 +156,15 @@ export class VoiceWorker {
       active.abort(fault('worker_heartbeat_failed'));
       return true;
     };
+    // A timer can fire about 1 ms early against Date.now(). Still inside the grace then means early,
+    // not recovered: re-arm for the remainder instead of leaving the abort to the next failed beat.
+    const armGrace = error => {
+      clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        if (!abandonRun(error) && heartbeatFailing && Date.now() - heartbeatOkAtMs <= this.heartbeatGraceMs) armGrace(error);
+      }, Math.max(0, heartbeatOkAtMs + this.heartbeatGraceMs + 1 - Date.now()));
+      graceTimer.unref?.();
+    };
     const heartbeat = (async () => { while (!signal.aborted) {
       let failed = false;
       try { await this.control.heartbeat(signal); clearTimeout(graceTimer); heartbeatReady = true; heartbeatFailing = false; heartbeatOkAtMs = Date.now(); this.controlHealth('heartbeat'); } catch (error) {
@@ -169,7 +178,7 @@ export class VoiceWorker {
         heartbeatFailing = true;
         // The grace runs on a timer, not until the next failure: a beat that times out takes 3 s to say
         // so, and the decision must still land inside Control's 15 s TTL.
-        if (!aborted) { clearTimeout(graceTimer); graceTimer = setTimeout(() => abandonRun(error), Math.max(0, heartbeatOkAtMs + this.heartbeatGraceMs + 1 - Date.now())); graceTimer.unref?.(); }
+        if (!aborted) armGrace(error);
       }
       try { await wait(failed ? this.controlRetryMs : this.heartbeatMs, signal); } catch { break; }
     } clearTimeout(graceTimer); })();

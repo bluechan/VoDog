@@ -1,0 +1,154 @@
+name: Build and test
+# Compile and unit-test every component. Source checks only: no signing, devices,
+# deployment or real calls. Apple jobs use ad-hoc simulator signing, never a real identity.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/build-and-test]
+permissions:
+  contents: read
+concurrency:
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  services:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vodog
+          POSTGRES_PASSWORD: ci-only-throwaway
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U vodog"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PGURL: postgresql://vodog:ci-only-throwaway@localhost:5432
+      # Some control tests create scratch databases through `postgresql:///postgres`.
+      PGHOST: localhost
+      PGUSER: vodog
+      PGPASSWORD: ci-only-throwaway
+    steps:
+      - uses: actions/checkout@v4
+      - name: ffmpeg (recording transcode tests; the control image installs it too)
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/media/go.mod
+          cache-dependency-path: services/*/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Media (Go)
+        working-directory: services/media
+        run: go test -race ./...
+      - name: Recording archive validator (Go)
+        working-directory: services/recording-archive-validator
+        run: go test ./...
+      - name: Voice
+        working-directory: services/voice
+        timeout-minutes: 10  # a hung test fails fast instead of consuming the job timeout
+        run: npm ci && npm test
+      - name: Web
+        working-directory: apps/web
+        run: npm ci && npm test && npm run build
+      - name: Control build
+        working-directory: services/control
+        run: npm ci && npm run build
+      - name: Control tests (disposable databases)
+        working-directory: services/control
+        run: |
+          for db in vodog_control_test vodog_replay_test vodog_replay_migration_test; do
+            psql "$PGURL/postgres" -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
+          done
+          TEST_DATABASE_URL="$PGURL/vodog_control_test" \
+          REPLAY_TEST_DATABASE_URL="$PGURL/vodog_replay_test" \
+          REPLAY_MIGRATION_TEST_DATABASE_URL="$PGURL/vodog_replay_migration_test" \
+          npm test
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Client and gateway (default gates)
+        working-directory: apps/android
+        run: >-
+          ./gradlew :client:testDebugUnitTest :client:assembleDebug
+          :gateway:testDebugUnitTest :gateway:assembleDebug
+          --no-daemon --max-workers=2
+
+  macos:
+    # The Apple sources need Xcode 27 (Swift 6.4); Xcode 26.x fails to compile them.
+    # `xcode-27` is a preview runner image; move to the GA macOS 27 image when it ships.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # run_gateway_media_tests.sh builds services/recording-archive-validator when Go is present.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/recording-archive-validator/go.mod
+          cache: false
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.app/Contents/Developer
+          xcodebuild -version && swift --version
+      - name: Swift build
+        working-directory: apps/macos
+        run: swift build --disable-sandbox
+      - name: Self-tests
+        working-directory: apps/macos
+        run: scripts/run_tests.sh
+      - name: Gateway control self-tests
+        working-directory: apps/macos
+        run: scripts/run_gateway_control_tests.sh
+      - name: Gateway media self-tests
+        working-directory: apps/macos
+        run: scripts/run_gateway_media_tests.sh
+
+  ios-watch:
+    # The Apple sources need Xcode 27 (Swift 6.4); Xcode 26.x fails to compile them.
+    # `xcode-27` is a preview runner image; move to the GA macOS 27 image when it ships.
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      SIGNING: DEVELOPMENT_TEAM= CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=-
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.app/Contents/Developer
+          xcodebuild -version && swift --version
+      - run: brew install xcodegen
+      - name: Generate project
+        working-directory: apps/ios
+        run: xcodegen generate
+      - name: Pick an iPhone simulator
+        run: |
+          id=$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries
+            | sort_by(.key) | reverse | .[] | select(.key | test("iOS")) | .value[]
+            | select(.name | startswith("iPhone"))][0].udid')
+          test -n "$id" && test "$id" != null
+          echo "SIM_ID=$id" >> "$GITHUB_ENV"
+      - name: iOS build and unit tests (embeds the watch app)
+        working-directory: apps/ios
+        run: |
+          xcodebuild -project VoDog.xcodeproj -scheme VoDog \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            -derivedDataPath ../../build/ios-derived \
+            $SIGNING test -only-testing:VoDogTests
+      - name: watchOS build
+        working-directory: apps/ios
+        run: |
+          xcodebuild -project VoDog.xcodeproj -scheme VoDogWatch \
+            -destination "generic/platform=watchOS Simulator" \
+            -derivedDataPath ../../build/watch-derived \
+            $SIGNING build

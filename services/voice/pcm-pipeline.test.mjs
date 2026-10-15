@@ -219,7 +219,8 @@ test('S27 决策 14: a hangup with no audio at all ends at the floor plus the qu
   const startedAt = Date.now();
   assert.equal(await bridge.whenPlaybackDrained({ timeoutMs: 5_000, pollMs: 2, minMs: 100, quietMs: 60 }), true);
   const elapsed = Date.now() - startedAt;
-  assert.ok(elapsed >= 160 && elapsed < 1_000, `ended after ${elapsed} ms, expected about minMs + quietMs`);
+  // 5 ms slack below minMs + quietMs: timers can fire about 1 ms early as measured by Date.now().
+  assert.ok(elapsed >= 155 && elapsed < 1_000, `ended after ${elapsed} ms, expected about minMs + quietMs`);
 });
 
 test('S27 决策 14: an unplayable sub-frame remainder is drained, and a completed turn still empties the queue', async () => {

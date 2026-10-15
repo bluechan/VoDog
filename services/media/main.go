@@ -1088,7 +1088,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &bridge{rejoinWindow: rejoinWindow, rooms: map[string]*room{}, verifier: GrantVerifier{Secret: []byte(secret)}, secret: secret, recordDir: dir, turnSecret: os.Getenv("TURN_SECRET"), turnUDPURL: turnUDPURL, nodeID: nodeID, dataChannelLifetimeMS: reliability.packetLifetimeMS, dataChannelRetransmits: reliability.maxRetransmits, dataChannelCopies: reliability.copies, dataChannelCopyInterval: reliability.copyInterval(), sctpTuning: tuning, rrLossFloorPct: lossFloor, testDropEveryN: testDropEveryN}
+	// The bridge is relay-only; without a TURN secret config() would fall back to ICE policy "all".
+	turnSecret := os.Getenv("TURN_SECRET")
+	if len(turnSecret) < 32 {
+		log.Fatal("TURN_SECRET must contain at least 32 bytes")
+	}
+	s := &bridge{rejoinWindow: rejoinWindow, rooms: map[string]*room{}, verifier: GrantVerifier{Secret: []byte(secret)}, secret: secret, recordDir: dir, turnSecret: turnSecret, turnUDPURL: turnUDPURL, nodeID: nodeID, dataChannelLifetimeMS: reliability.packetLifetimeMS, dataChannelRetransmits: reliability.maxRetransmits, dataChannelCopies: reliability.copies, dataChannelCopyInterval: reliability.copyInterval(), sctpTuning: tuning, rrLossFloorPct: lossFloor, testDropEveryN: testDropEveryN}
 	mux := http.NewServeMux()
 	probe, err := NewMediaProbeHandler(MediaProbeHandlerOptions{Secret: []byte(secret), NodeID: nodeID, AllowedOrigins: splitConfiguredOrigins(os.Getenv("MEDIA_PROBE_ALLOWED_ORIGINS"))})
 	if err != nil {
@@ -1097,7 +1102,7 @@ func main() {
 	mux.Handle("/probe", probe)
 	qualityProbe, err := NewWebRTCProbeHandler(WebRTCProbeHandlerOptions{
 		Secret: []byte(secret), NodeID: nodeID, AllowedOrigins: splitConfiguredOrigins(os.Getenv("MEDIA_PROBE_ALLOWED_ORIGINS")),
-		TurnSecret: os.Getenv("TURN_SECRET"), TurnUDPURL: turnUDPURL, SCTPTuning: tuning,
+		TurnSecret: turnSecret, TurnUDPURL: turnUDPURL, SCTPTuning: tuning,
 	})
 	if err != nil {
 		log.Fatal(err)

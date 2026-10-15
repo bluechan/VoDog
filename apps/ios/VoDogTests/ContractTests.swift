@@ -4,6 +4,11 @@ import Security
 import XCTest
 @testable import VoDog
 
+/// "Promptly" in these tests: generous for a loaded CI simulator (0.5 s once took 1.4 s), and still far
+/// below the 5 s budgets and never-completing operations the assertions guard against.
+private let promptTimeout: TimeInterval = 2.5
+private let promptDuration: Duration = .milliseconds(2_500)
+
 final class ContractTests: XCTestCase {
     func testRelayQualityFrameIsExactBoundedCCQ1Binary() throws {
         let frame = MediaQualityProbeFrame.encode(sequence: 169, sentUs: 0x0102030405060708)
@@ -55,8 +60,8 @@ final class ContractTests: XCTestCase {
             }
         )
         XCTAssertEqual(result, "timeout")
-        await fulfillment(of: [cancelled], timeout: 0.5)
-        XCTAssertLessThan(started.duration(to: ContinuousClock().now), .milliseconds(500))
+        await fulfillment(of: [cancelled], timeout: promptTimeout)
+        XCTAssertLessThan(started.duration(to: ContinuousClock().now), promptDuration)
     }
 
     @MainActor
@@ -106,7 +111,7 @@ final class ContractTests: XCTestCase {
                 registered.fulfill()
             }
         }
-        await fulfillment(of: [registered], timeout: 0.5)
+        await fulfillment(of: [registered], timeout: promptTimeout)
         task.cancel()
         do { _ = try await task.value; XCTFail("Expected cancellation") }
         catch is CancellationError {}
@@ -159,8 +164,8 @@ final class ContractTests: XCTestCase {
         let collector = Task { await MediaQualityProbeTaskCollector.collect([node]) }
         collector.cancel()
         _ = await collector.value
-        await fulfillment(of: [closeStarted, operationExited], timeout: 0.5)
-        XCTAssertLessThan(started.duration(to: ContinuousClock().now), .milliseconds(500))
+        await fulfillment(of: [closeStarted, operationExited], timeout: promptTimeout)
+        XCTAssertLessThan(started.duration(to: ContinuousClock().now), promptDuration)
     }
 
     func testRelayQualityNetworkChangeCancelsEveryNodeAttempt() async {
@@ -184,7 +189,7 @@ final class ContractTests: XCTestCase {
             tasks: nodes, expected: "network-1", source: generation
         )
         generation.value = "network-2"
-        await fulfillment(of: [closed], timeout: 0.5)
+        await fulfillment(of: [closed], timeout: promptTimeout)
         monitor.cancel()
         for node in nodes { _ = await node.value }
     }
@@ -209,13 +214,13 @@ final class ContractTests: XCTestCase {
         configuration.protocolClasses = [HangingURLProtocol.self]
         let session = URLSession(configuration: configuration)
         let task = Task { try await session.data(from: URL(string: "https://probe.example.com/webrtc-probe/offer")!) }
-        await fulfillment(of: [started], timeout: 0.5)
+        await fulfillment(of: [started], timeout: promptTimeout)
         task.cancel()
         do { _ = try await task.value; XCTFail("Expected cancellation") }
         catch is CancellationError {}
         catch let error as URLError { XCTAssertEqual(error.code, .cancelled) }
         catch { XCTFail("Unexpected error: \(error)") }
-        await fulfillment(of: [stopped], timeout: 0.5)
+        await fulfillment(of: [stopped], timeout: promptTimeout)
         session.invalidateAndCancel()
     }
 
@@ -365,7 +370,7 @@ final class ContractTests: XCTestCase {
             user: .init(id: "old-user", username: "old@example.com", role: "user")
         ))
         let logout = Task { @MainActor in await store.logout() }
-        await fulfillment(of: [requestStarted], timeout: 0.5)
+        await fulfillment(of: [requestStarted], timeout: promptTimeout)
         try store.acceptLogin(.init(
             token: "new", refreshToken: "new-refresh", expiresAt: nil,
             user: .init(id: "new-user", username: "new@example.com", role: "user")
@@ -408,7 +413,7 @@ final class ContractTests: XCTestCase {
         let request = Task { @MainActor in
             let _: EmptyResponse = try await store.request("protected", requiredSessionIdentity: oldIdentity)
         }
-        await fulfillment(of: [requestStarted], timeout: 0.5)
+        await fulfillment(of: [requestStarted], timeout: promptTimeout)
         try store.acceptLogin(.init(
             token: "new", refreshToken: "new-refresh", expiresAt: nil,
             user: .init(id: "new-user", username: "new@example.com", role: "user")
@@ -478,7 +483,7 @@ final class ContractTests: XCTestCase {
         let first = Task { @MainActor in
             try await manager.prepare(session: store, requiredSessionIdentity: identity)
         }
-        await fulfillment(of: [requestStarted], timeout: 0.5)
+        await fulfillment(of: [requestStarted], timeout: promptTimeout)
         let second = Task { @MainActor in
             try await manager.prepare(session: store, requiredSessionIdentity: identity)
         }
@@ -489,7 +494,7 @@ final class ContractTests: XCTestCase {
         do { _ = try await first.value; XCTFail("Expected first waiter cancellation") }
         catch is CancellationError {}
         catch { XCTFail("Unexpected error: \(error)") }
-        XCTAssertLessThan(firstCancel.duration(to: ContinuousClock().now), .milliseconds(500))
+        XCTAssertLessThan(firstCancel.duration(to: ContinuousClock().now), promptDuration)
         try? await Task.sleep(for: .milliseconds(30))
         XCTAssertEqual(DeferredURLProtocol.stopCount.value, 0)
         let secondCancel = ContinuousClock().now
@@ -497,8 +502,8 @@ final class ContractTests: XCTestCase {
         do { _ = try await second.value; XCTFail("Expected second waiter cancellation") }
         catch is CancellationError {}
         catch { XCTFail("Unexpected error: \(error)") }
-        XCTAssertLessThan(secondCancel.duration(to: ContinuousClock().now), .milliseconds(500))
-        await fulfillment(of: [requestStopped], timeout: 0.5)
+        XCTAssertLessThan(secondCancel.duration(to: ContinuousClock().now), promptDuration)
+        await fulfillment(of: [requestStopped], timeout: promptTimeout)
         XCTAssertEqual(DeferredURLProtocol.stopCount.value, 1)
         networkSession.invalidateAndCancel()
     }
@@ -932,7 +937,8 @@ final class ContractTests: XCTestCase {
             artifact: .init(name: "remote_original.ogg", bytes: Int64(data.count), sha256: digest),
             source: .mediaNode, callID: "00000000-0000-4000-8000-000000000001", session: session
         )
-        for _ in 0..<200 {
+        // Up to 10 s: a loaded CI simulator once needed more than the earlier 2 s budget.
+        for _ in 0..<1_000 {
             if case .failed = controller.state { break }
             try await Task.sleep(for: .milliseconds(10))
         }

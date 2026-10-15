@@ -236,13 +236,16 @@ final class GatewayCommandLedger {
         file.commands.first { $0.id == id }
     }
 
-    func begin(id: String, sequence: Int, kind: String, deviceCallId: String? = nil, now: Date = Date()) {
-        guard entry(id) == nil else { return }
+    /// True only when a new `started` row is durably on disk; a side effect must not run otherwise,
+    /// or a crash would lose the marker and a redelivery could repeat it.
+    @discardableResult
+    func begin(id: String, sequence: Int, kind: String, deviceCallId: String? = nil, now: Date = Date()) -> Bool {
+        guard entry(id) == nil else { return false }
         file.commands.append(GatewayCommandEntry(
             id: id, sequence: sequence, kind: kind, state: .started, ack: nil,
             updatedAt: now, deviceCallId: deviceCallId
         ))
-        save()
+        return save()
     }
 
     /// Records the final ACK body; `begin` is implied for commands rejected before execution.
@@ -290,9 +293,11 @@ final class GatewayCommandLedger {
         }
     }
 
-    private func save() {
+    @discardableResult
+    private func save() -> Bool {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = try? JSONEncoder.gateway.encode(file) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder.gateway.encode(file) else { return false }
+        return (try? data.write(to: url, options: .atomic)) != nil
     }
 }
 
@@ -394,16 +399,25 @@ struct GatewayCredentialResolution: Equatable {
     var saveToKeychain = false
     var deleteLegacy = false
     var pushToModule = false
+    /// The module held a copy that failed validation or named another server; it was not used.
+    var moduleIgnored = false
 
     /// `stored` is this Mac's copy for the module, `module` the copy read from the module itself
     /// (nil when it has none). The pre-IMEI `legacy` item is only claimed by a module that has
     /// neither. The module copy wins for a different gateway (the hardware moved), a higher epoch
     /// (re-paired elsewhere), or the same epoch with another token; otherwise this Mac's copy wins
     /// and is written back to the module.
+    /// Anyone with module root ADB can write the module copy, so it must name a valid HTTPS server
+    /// and can never move a Mac that already holds credentials to a different server.
     static func resolve(stored: GatewayCredentials?, legacy: GatewayCredentials?,
-                        module: GatewayCredentials?) -> GatewayCredentialResolution {
-        let local = stored ?? (module == nil ? legacy : nil)
-        let claimsLegacy = stored == nil && module == nil && legacy != nil
+                        module rawModule: GatewayCredentials?) -> GatewayCredentialResolution {
+        let local = stored ?? (rawModule == nil ? legacy : nil)
+        let claimsLegacy = stored == nil && rawModule == nil && legacy != nil
+        var module = rawModule.flatMap { copy in
+            VoDogServer.validatedURL(copy.baseURL.absoluteString) != nil && !copy.deviceToken.isEmpty &&
+                !copy.gatewayId.isEmpty ? copy : nil
+        }
+        if let copy = module, let local, server(copy.baseURL) != server(local.baseURL) { module = nil }
         let chosen: GatewayCredentials?
         let source: String?
         switch (local, module) {
@@ -423,8 +437,14 @@ struct GatewayCredentialResolution: Equatable {
             credentials: chosen, source: source,
             saveToKeychain: chosen != nil && chosen != stored,
             deleteLegacy: claimsLegacy,
-            pushToModule: chosen != nil && chosen != module
+            pushToModule: chosen != nil && chosen != rawModule,
+            moduleIgnored: rawModule != nil && module == nil
         )
+    }
+
+    private static func server(_ url: URL) -> String {
+        let scheme = url.scheme?.lowercased() ?? ""
+        return scheme + "://" + (url.host?.lowercased() ?? "") + ":" + String(url.port ?? (scheme == "https" ? 443 : 80))
     }
 }
 

@@ -36,6 +36,10 @@ A default gateway build deliberately leaves physical-call capabilities gated. A 
 
 This command does not authorize installation or calls. Verify the resulting APK's actual gates, application ID, certificate, and server compatibility. Configure `vodogApiBaseUrl` with your HTTPS `/api/v1` URL for real use; example endpoints cannot serve calls. Release signing and Firebase configuration are private per-deployment inputs. A debug APK is not a signed distribution release.
 
+## Apple toolchain
+
+The iOS, watchOS and macOS sources require **Xcode 27** (Swift 6.4). Xcode 26.x, including 26.6, fails to compile them. CI uses GitHub's `xcode-27` runner image with Xcode 27.0.
+
 ## iOS
 
 The exported XcodeGen project is `VoDog`, with iOS 17 as its source deployment target. Select an installed simulator; `IOS_SIMULATOR` below is a local shell variable, not an application setting.

@@ -51,6 +51,16 @@ do {
 do {
     let ledger = GatewayCommandLedger(url: ledgerURL, generation: 4)
     check(ledger.entries.isEmpty && ledger.reportedSequence == 0, "new generation starts a fresh ledger")
+    check(ledger.begin(id: "d", sequence: 1, kind: "dial"), "durable begin reports success")
+    check(!ledger.begin(id: "d", sequence: 1, kind: "dial"), "a repeated begin is not a fresh start")
+}
+do {
+    // Parent path is a regular file, so the ledger can never be written.
+    let blocker = directory.appendingPathComponent("not-a-directory")
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    check(FileManager.default.createFile(atPath: blocker.path, contents: Data()), "create blocker file")
+    let ledger = GatewayCommandLedger(url: blocker.appendingPathComponent("commands.json"), generation: 1)
+    check(!ledger.begin(id: "dial", sequence: 1, kind: "dial"), "unwritable ledger refuses to start a side effect")
 }
 
 // Outbox: FIFO head, backoff, dedupe by context, persistence.
@@ -263,6 +273,23 @@ do {
     let moveToNewMac = R.resolve(stored: nil, legacy: nil, module: a4)
     check(moveToNewMac.credentials == a4 && moveToNewMac.source == "module" && moveToNewMac.saveToKeychain,
           "a new Mac imports the module copy without pairing")
+
+    let elsewhere = URL(string: "https://other.example")!
+    let b1Elsewhere = GatewayCredentials(baseURL: elsewhere, deviceToken: "tB1", gatewayId: "gB", deviceEpoch: 1)
+    let redirected = R.resolve(stored: a4, legacy: nil, module: b1Elsewhere)
+    check(redirected.credentials == a4 && redirected.source == "keychain" && redirected.pushToModule &&
+          redirected.moduleIgnored, "a module copy naming another server never replaces this Mac's credentials")
+    let samePort = GatewayCredentials(baseURL: URL(string: "https://VODOG.example:443/")!, deviceToken: "tA5",
+                                      gatewayId: "gA", deviceEpoch: 5)
+    check(R.resolve(stored: a4, legacy: nil, module: samePort).credentials == samePort,
+          "the same server spelled differently still syncs")
+    let plainHTTP = GatewayCredentials(baseURL: URL(string: "http://vodog.example")!, deviceToken: "tA5",
+                                       gatewayId: "gA", deviceEpoch: 5)
+    let rejected = R.resolve(stored: nil, legacy: a3, module: plainHTTP)
+    check(rejected.credentials == nil && !rejected.saveToKeychain && !rejected.deleteLegacy && rejected.moduleIgnored,
+          "an invalid module copy is not imported and does not release the legacy item")
+    let emptyToken = GatewayCredentials(baseURL: base, deviceToken: "", gatewayId: "gA", deviceEpoch: 9)
+    check(R.resolve(stored: a4, legacy: nil, module: emptyToken).credentials == a4, "an empty module token is ignored")
 }
 
 // Transport failure categories and settings-card messages.

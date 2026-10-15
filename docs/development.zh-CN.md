@@ -36,6 +36,10 @@ Control 测试需要三个**相互独立、可销毁**的 PostgreSQL 数据库�
 
 命令不代表获得安装或拨号授权。核对 APK 实际功能门、application ID、证书和服务端兼容性。真实使用时通过 `vodogApiBaseUrl` 配置自己的 HTTPS `/api/v1` 地址；示例端点不能提供服务。正式签名与 Firebase 配置属于私密部署输入，debug APK 不等于发行包。
 
+## Apple 工具链
+
+iOS、watchOS 和 macOS 源码需要 **Xcode 27**（Swift 6.4）编译；Xcode 26.x（含 26.6）无法编译。CI 使用 GitHub 的 `xcode-27` 构建机镜像（Xcode 27.0）。
+
 ## iOS
 
 导出项目使用 XcodeGen，名称 `VoDog`，源码最低目标为 iOS 17。选择本机已安装的模拟器；下列 `IOS_SIMULATOR` 是 shell 变量，不是应用设置。

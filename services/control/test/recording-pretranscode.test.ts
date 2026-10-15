@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,13 @@ import { pretranscodePixelRecording } from "../src/app.js";
 import { errorReason, throttled } from "../src/diag.js";
 import { PushWorker } from "../src/push-worker.js";
 import type { Db } from "../src/db.js";
+
+// The code under test sleeps on unref()'d timers so they never hold a server open. Nothing else
+// keeps this file's event loop alive while a test waits on one, so the runner would cancel the
+// test as unresolved; hold the loop open for the duration of each test.
+let keepAlive: ReturnType<typeof setInterval> | undefined;
+beforeEach(() => { keepAlive = setInterval(() => {}, 60_000); });
+afterEach(() => { clearInterval(keepAlive); });
 
 function fakeDb(failNonDiag = false) {
   const diags: { event: string; fields: any; callId: unknown; level: unknown }[] = [];

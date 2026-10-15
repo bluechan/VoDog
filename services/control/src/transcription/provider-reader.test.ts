@@ -1,12 +1,19 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {Readable} from 'node:stream';
-import test from 'node:test';
+import test, { afterEach, beforeEach } from 'node:test';
 import type {RecordingManifest, RecordingSource, RecordingTrack} from '../recording-store.js';
 import {createGeminiTranscriptionProvider, createOpenAICompatibleTranscriptionProvider, subtitleSegments} from './provider.js';
 import {retryAfterPolicy, TranscriptionProviderHttpError} from './provider-error.js';
 import {RegistryRecordingReader, TranscriptRecordingReaderError} from './reader.js';
 import {freezeRecordingManifest, type TrackReadRequest} from './worker.js';
+
+// The code under test sleeps on unref()'d timers so they never hold a server open. Nothing else
+// keeps this file's event loop alive while a test waits on one, so the runner would cancel the
+// test as unresolved; hold the loop open for the duration of each test.
+let keepAlive: ReturnType<typeof setInterval> | undefined;
+beforeEach(() => { keepAlive = setInterval(() => {}, 60_000); });
+afterEach(() => { clearInterval(keepAlive); });
 
 const callId = '00000000-0000-4000-8000-000000000001';
 const ownerId = '00000000-0000-4000-8000-000000000002';

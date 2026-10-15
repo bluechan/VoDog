@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { afterEach, beforeEach } from 'node:test';
 import {createOpenAICompatibleTranscriptClassifier} from './classifier.js';
+
+// The code under test sleeps on unref()'d timers so they never hold a server open. Nothing else
+// keeps this file's event loop alive while a test waits on one, so the runner would cancel the
+// test as unresolved; hold the loop open for the duration of each test.
+let keepAlive: ReturnType<typeof setInterval> | undefined;
+beforeEach(() => { keepAlive = setInterval(() => {}, 60_000); });
+afterEach(() => { clearInterval(keepAlive); });
 
 const input = (text = '客户询问空调安装时间。') => ({
   callId: '00000000-0000-4000-8000-000000000001',
