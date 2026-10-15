@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
@@ -77,7 +77,10 @@ async function main() {
     await delay(500);
     assert.ok(pcmFrames>=20,`decoded caller PCM frames=${pcmFrames}`);
     assert.ok(upPackets>=20,`encoded AI Opus packets=${upPackets}`);
-    const close=await fetch(`${baseUrl}/close/${callId}`,{method:'POST',headers:{Authorization:`Bearer ${secret}`,'X-Media-Epoch':'1'} });assert.equal(close.status,204);
+    // Signed like Control's close (services/control/src/signed-request.ts); the secret is never sent.
+    const closePath=`/close/${callId}`,closeTs=String(Math.floor(Date.now()/1000)),closeNonce=randomBytes(18).toString('base64url');
+    const closeSig=createHmac('sha256',secret).update(`POST\n${closePath}\n${closeTs}\n${closeNonce}\n`).digest('base64url');
+    const close=await fetch(`${baseUrl}${closePath}`,{method:'POST',headers:{'X-CC-Timestamp':closeTs,'X-CC-Nonce':closeNonce,'X-CC-Signature':closeSig,'X-Media-Epoch':'1'} });assert.equal(close.status,204);
     const manifest=JSON.parse(await readFile(join(recordDir,callId,'manifest.json'),'utf8'));assert.equal(manifest.complete,true);assert.equal(manifest.nodeId,'voice-test');assert.equal(manifest.mediaEpoch,1);
     return {ok:true,decodedPcmFrames:pcmFrames,encodedOpusPackets:upPackets,manifestComplete:manifest.complete};
   } finally {

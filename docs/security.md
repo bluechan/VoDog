@@ -16,6 +16,8 @@ Self-hosting gives you control over storage and configuration; it does not make 
 
 Inventory contacts, phone numbers, SMS bodies, recordings, transcripts, AI prompts, credentials, device metadata, diagnostics, exports, and backups. Choose access controls and retention for each. Keep operator reports, physical-device evidence, and raw logs outside the public repository.
 
+Two identifiers are deliberately not anonymized. SIM identity is a portable, unsalted SHA-256 of the ICCID digits, so it stays the same when a SIM moves between gateways; Control stores a further unsalted hash in `sims.protected_iccid_hash`, so anyone with a database copy can recover ICCIDs by brute force. Gateway diagnostics (`diag_events`) carry full phone numbers but never SMS bodies (S69). Treat database dumps and backups as containing ICCIDs and phone numbers, and keep diagnostics retention short.
+
 VoDog call deletion coordinates supported server records and archive paths. It does not automatically erase every downloaded MP3, independent BCR recording, local macOS recording, log, or backup. Verify what is removed, what is retained, and when retention jobs run. Never purge command journals or identity fences as part of content cleanup.
 
 Before enabling recording or external AI processing, arrange appropriate notice and consent for your use, and review applicable requirements and provider policies. This documentation makes no jurisdiction-specific legal claim. Give operators an accurate description of where data is processed.

@@ -991,6 +991,7 @@
 "格式版本不受支持" = "Format version is not supported";
 "检测到 usbnet=%lld。一键初始化只处理已验证的 usbnet=0 → 1。" = "Detected usbnet=%lld. One-click initialization supports only the verified usbnet=0 → 1 conversion.";
 "检测到旧版 qdc507_afe 声卡仍在内核中；为避免热切换语音驱动，请重启模块后再试。" = "The legacy qdc507_afe sound card is still loaded in the kernel. Restart the module before trying again to avoid hot-switching the voice driver.";
+"检测到未经本应用校验的语音驱动已在内核中；为避免热切换语音驱动，请重启模块后再试。" = "A voice driver that this app did not verify is already loaded in the kernel. Restart the module before trying again to avoid hot-switching the voice driver.";
 "检测到模块中已有通话；为安全起见未自动接管麦克风，请先挂断。" = "A call is already active on the module. To avoid taking over the microphone, end the call first.";
 "模块 ADB 没有 root 控制权限。" = "Module ADB does not have root access.";
 "模块 ADB 要求认证，无法自动控制通话组件。" = "Module ADB requires authentication and cannot control the call components automatically.";

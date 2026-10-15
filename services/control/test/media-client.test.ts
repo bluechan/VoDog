@@ -61,3 +61,25 @@ test('only connection-level fetch failures count as retryable',()=>{
  assert.equal(isConnectionError(new DOMException('timed out','TimeoutError')),false);
  assert.equal(isConnectionError(new MediaBridgeError(502)),false);
 });
+
+test('close is signed like a recording request and never sends the media secret', async()=>{
+ const key='x'.repeat(40),turn='t'.repeat(40),id='11111111-1111-1111-1111-111111111111';
+ const seen:{authorization?:string;canonicalOk:boolean;epoch?:string;bodyHasKey:boolean}[]=[];
+ const server=createServer((req,res)=>{
+  const timestamp=String(req.headers['x-cc-timestamp']),nonce=String(req.headers['x-cc-nonce']);
+  const expected=createHmac('sha256',key).update(`POST\n${req.url}\n${timestamp}\n${nonce}\n`).digest('base64url');
+  seen.push({authorization:req.headers.authorization,canonicalOk:req.headers['x-cc-signature']===expected,
+   epoch:String(req.headers['x-media-epoch']),bodyHasKey:JSON.stringify(req.headers).includes(key)});
+  res.writeHead(204).end();
+ });
+ await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+ const address=server.address();assert.ok(address&&typeof address==='object');
+ try {
+  await new MediaBridgeClient(key,turn,{controlBaseUrl:`http://127.0.0.1:${address.port}`}).close(id,4);
+  assert.equal(seen.length,1);
+  assert.equal(seen[0].authorization,undefined,'no bearer secret');
+  assert.equal(seen[0].canonicalOk,true,'signature over POST, path, timestamp, nonce and an empty Range');
+  assert.equal(seen[0].epoch,'4');
+  assert.equal(seen[0].bodyHasKey,false,'the media secret never appears in the request');
+ } finally {await new Promise<void>((resolve,reject)=>server.close(e=>e?reject(e):resolve()));}
+});

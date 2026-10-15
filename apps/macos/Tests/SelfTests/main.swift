@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Security
 
 enum SelfTestFailure: Error {
     case failed(String)
@@ -3513,6 +3514,15 @@ do {
     } catch VoWiFiControlError.unsafeConfiguration {
         // Expected.
     }
+
+    // Helper XPC: the audit-token requirement names the app and pins the leaf certificate's SHA-1.
+    let pinned = VoDogCodeSigningPolicy.leafPinnedRequirement(
+        identifier: VoDogCodeSigningPolicy.appIdentifier, leafCertificate: Data("leaf".utf8))
+    try expect(pinned == "identifier \"org.vodog.macos\" and certificate leaf = H\"98798241748efaccb230386437b7873a478f5bd4\"",
+               "unexpected helper code signing requirement: \(pinned)")
+    var parsed: SecRequirement?
+    try expect(SecRequirementCreateWithString(pinned as CFString, [], &parsed) == errSecSuccess && parsed != nil,
+               "the helper code signing requirement does not parse")
 
     print("VoDog self-tests passed (calls, PDU/UDH, SOCKS5, VoWiFi, buffering, storage, merge).")
 } catch {

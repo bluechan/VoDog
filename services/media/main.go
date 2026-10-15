@@ -543,6 +543,36 @@ func (s *bridge) config() webrtc.Configuration {
 
 const secondaryTurnUDPURL = "turn:relay-secondary.example.com:16801?transport=udp"
 
+// closeHandler serves Control's `POST /close/{callId}`. Control signs it like a recording request
+// (recordingCanonicalString), so the media secret never crosses the wire. The legacy
+// `Authorization: Bearer <MEDIA_SECRET>` form is still accepted, and logged, so a Control that has not
+// been updated yet can close rooms; drop it once every Control sends signed closes.
+func (s *bridge) closeHandler(w http.ResponseWriter, r *http.Request) {
+	authorized := false
+	if r.Method == "POST" {
+		if r.Header.Get("X-CC-Signature") != "" {
+			authorized = s.authorizeRecordingRequest(r)
+		} else if hmac.Equal([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.secret)) {
+			authorized = true
+			log.Printf("media.close_legacy_bearer call=%s", strings.TrimPrefix(r.URL.Path, "/close/"))
+		}
+	}
+	if !authorized {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	epoch, err := strconv.ParseInt(r.Header.Get("X-Media-Epoch"), 10, 64)
+	if err != nil || epoch < 1 {
+		http.Error(w, "invalid media epoch", 400)
+		return
+	}
+	if !s.closeRoomAtEpoch(strings.TrimPrefix(r.URL.Path, "/close/"), epoch, "control_close") {
+		http.Error(w, "media epoch mismatch", 409)
+		return
+	}
+	w.WriteHeader(204)
+}
+
 func configuredMediaTurnUDPURL(nodeID, raw string) (string, error) {
 	if raw == "" {
 		if nodeID == "relay-secondary" {
@@ -1109,22 +1139,7 @@ func main() {
 	}
 	mux.Handle(webRTCProbePath, qualityProbe)
 	mux.HandleFunc("/offer", s.offer)
-	mux.HandleFunc("/close/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || !hmac.Equal([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.secret)) {
-			http.Error(w, "unauthorized", 401)
-			return
-		}
-		epoch, err := strconv.ParseInt(r.Header.Get("X-Media-Epoch"), 10, 64)
-		if err != nil || epoch < 1 {
-			http.Error(w, "invalid media epoch", 400)
-			return
-		}
-		if !s.closeRoomAtEpoch(strings.TrimPrefix(r.URL.Path, "/close/"), epoch, "control_close") {
-			http.Error(w, "media epoch mismatch", 409)
-			return
-		}
-		w.WriteHeader(204)
-	})
+	mux.HandleFunc("/close/", s.closeHandler)
 	// Serves the signed GET reads and the S29 §2.4 `DELETE /internal/recordings/{callId}`.
 	mux.Handle("/internal/recordings/", s.recordingHandler())
 	mux.Handle("GET /internal/recordings/{callId}/finalized/{mediaEpoch}/{manifestSHA}/timeline", s.recordingBackupTimelineHandler())

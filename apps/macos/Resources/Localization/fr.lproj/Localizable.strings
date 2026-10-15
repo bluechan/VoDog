@@ -980,6 +980,7 @@
 "格式版本不受支持" = "Version de format non prise en charge";
 "检测到 usbnet=%lld。一键初始化只处理已验证的 usbnet=0 → 1。" = "usbnet=%lld détecté. L’initialisation en un clic ne traite que la conversion validée usbnet=0 → 1.";
 "检测到旧版 qdc507_afe 声卡仍在内核中；为避免热切换语音驱动，请重启模块后再试。" = "L’ancienne carte audio qdc507_afe est toujours chargée dans le noyau. Pour éviter de changer le pilote vocal à chaud, redémarrez le module, puis réessayez.";
+"检测到未经本应用校验的语音驱动已在内核中；为避免热切换语音驱动，请重启模块后再试。" = "Un pilote vocal non vérifié par cette app est déjà chargé dans le noyau. Pour éviter de changer le pilote vocal à chaud, redémarrez le module, puis réessayez.";
 "检测到模块中已有通话；为安全起见未自动接管麦克风，请先挂断。" = "Un appel est déjà actif sur le module. Par sécurité, le micro n’a pas été pris en charge automatiquement ; raccrochez d’abord.";
 "模块 ADB 没有 root 控制权限。" = "ADB ne dispose pas des privilèges root sur le module.";
 "模块 ADB 要求认证，无法自动控制通话组件。" = "ADB exige une authentification sur le module. Impossible de contrôler automatiquement les composants d’appel.";

@@ -107,12 +107,16 @@ private final class NetworkHelperListenerDelegate: NSObject, NSXPCListenerDelega
         _ listener: NSXPCListener,
         shouldAcceptNewConnection connection: NSXPCConnection
     ) -> Bool {
-        guard ClientValidator.isAllowed(connection) else {
+        guard ClientValidator.isAllowed(connection),
+              let requirement = ClientValidator.codeSigningRequirement else {
             NSLog("VoDogNetworkHelper rejected XPC client pid=%d uid=%d",
                   connection.processIdentifier,
                   connection.effectiveUserIdentifier)
             return false
         }
+        // `isAllowed` inspects the peer by PID, which a fast exit-and-respawn could race. XPC checks this
+        // requirement against the peer's audit token on every message, so a swapped process is refused.
+        connection.setCodeSigningRequirement(requirement)
         connection.exportedInterface = NSXPCInterface(with: VoDogNetworkHelperProtocol.self)
         connection.exportedObject = service
         connection.resume()
@@ -131,6 +135,11 @@ private enum ClientValidator {
         }
         return VoDogCodeSigningPolicy.leafCertificateData(for: helperCode)
     }()
+
+    /// The app's identifier plus the helper's own leaf certificate; nil when the helper is not signed.
+    static let codeSigningRequirement: String? = helperLeafCertificateData.map {
+        VoDogCodeSigningPolicy.leafPinnedRequirement(identifier: VoDogCodeSigningPolicy.appIdentifier, leafCertificate: $0)
+    }
 
     static func isAllowed(_ connection: NSXPCConnection) -> Bool {
         let pid = connection.processIdentifier

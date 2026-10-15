@@ -45,6 +45,7 @@ swiftc \
   "$ROOT/Sources/VoDog/ADBProtocol.swift" \
   "$ROOT/Sources/VoDog/ModuleVoicePayload.swift" \
   "$ROOT/Sources/VoDogNetworkIPC/VoDogNetworkIPC.swift" \
+  "$ROOT/Sources/VoDogNetworkIPC/CodeSigningPolicy.swift" \
   "$ROOT/Sources/VoDogNetworkHelper/NetworkHelperState.swift" \
   "$ROOT/Sources/VoDog/Models.swift" \
   "$ROOT/Sources/VoDog/QADBKeyDeriver.swift" \

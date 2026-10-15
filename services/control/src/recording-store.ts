@@ -1,10 +1,11 @@
 import { constants } from 'node:fs';
 import { lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { validatedControlBaseUrl } from './media-client.js';
+import { signedMediaRequestHeaders } from './signed-request.js';
 
 export const recordingTracks = ['remote_original', 'caller_original'] as const;
 export type RecordingTrack = typeof recordingTracks[number];
@@ -192,19 +193,11 @@ export class RecordingStore {
   }
 }
 
-/**
- * The signed contract shared with `services/media` `recordingCanonicalString` and
- * `infra/retention.py` `recording_delete_canonical`: `{METHOD}\n{path}\n{timestamp}\n{nonce}\n{Range}`.
- * The method is part of the canonical string, so a GET signature can never authorize a DELETE; the
- * Range line is always present and is empty for every request that carries no Range header.
- */
+/** Recording reads and deletes use the shared media request signature; see `signed-request.ts`. */
 export function recordingRequestHeaders(secret:string,method:'GET'|'DELETE',path:string,range=''){
-  const timestamp=Math.floor(Date.now()/1000).toString(),nonce=randomBytes(18).toString('base64url');
-  const canonical=`${method}\n${path}\n${timestamp}\n${nonce}\n${range}`;
-  return {'X-CC-Timestamp':timestamp,'X-CC-Nonce':nonce,'X-CC-Signature':createHmac('sha256',secret).update(canonical).digest('base64url'),...(range?{Range:range}:{})};
+  return signedMediaRequestHeaders(secret,method,path,range);
 }
 
-/** Reads immutable recordings from one configured media node over its internal API. */
 export class RemoteRecordingStore implements RecordingSource {
   private readonly baseUrl:string;
   constructor(baseUrl:string,private readonly secret:string,private readonly nodeId:string,private readonly mediaEpoch:number){

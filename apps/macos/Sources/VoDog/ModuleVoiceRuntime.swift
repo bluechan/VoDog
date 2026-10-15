@@ -220,7 +220,12 @@ final class ModuleVoiceRuntime {
                         "grep -q '^\(module.name) ' /proc/modules",
                         timeout: 8
                     )
-                    if present.status == 0 { continue }
+                    if present.status == 0 {
+                        guard try residentModulesAreOurs() else {
+                            throw RuntimeError.moduleCommand(L10n.tr("检测到未经本应用校验的语音驱动已在内核中；为避免热切换语音驱动，请重启模块后再试。"))
+                        }
+                        continue
+                    }
                     guard present.status == 1 else {
                         throw RuntimeError.moduleCommand(
                             present.output.isEmpty
@@ -247,6 +252,12 @@ final class ModuleVoiceRuntime {
                     }
                     modulesLoadedHere.append(module)
                     try removeRemoteComponent(module.file)
+                }
+                if !modulesLoadedHere.isEmpty { try recordModulesLoaded() }
+            } else {
+                // Already resident: only drivers this app verified and loaded during this boot count.
+                guard try residentModulesAreOurs() else {
+                    throw RuntimeError.moduleCommand(L10n.tr("检测到未经本应用校验的语音驱动已在内核中；为避免热切换语音驱动，请重启模块后再试。"))
                 }
             }
             try removeRemoteKernelModuleFiles()
@@ -536,6 +547,33 @@ final class ModuleVoiceRuntime {
                         : result.output)
             )
         }
+    }
+
+    /// Written after this app loads the hash-verified kernel modules: `<boot_id> <runtimeVersion>`. The kernel
+    /// cannot say which bytes a resident module came from (these modules carry no srcversion), so resident
+    /// modules are trusted only with a marker from this boot and this runtime. Anything else was loaded by
+    /// another tool or an older runtime. /tmp is cleared on module reboot; the boot id guards it anyway.
+    private var loadedModulesMarker: String { "\(remoteDirectory)/modules-loaded" }
+
+    private var markerLine: String? {
+        let version = manifest.runtimeVersion
+        guard !version.isEmpty, version.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }) else {
+            return nil
+        }
+        return "$(cat /proc/sys/kernel/random/boot_id) \(version)"
+    }
+
+    private func residentModulesAreOurs() throws -> Bool {
+        guard let markerLine else { return false }
+        return try controller.shellChecked(
+            "test \"$(cat '\(loadedModulesMarker)' 2>/dev/null)\" = \"\(markerLine)\"",
+            timeout: 8
+        ).status == 0
+    }
+
+    private func recordModulesLoaded() throws {
+        guard let markerLine else { throw RuntimeError.invalidManifest(L10n.tr("资源包在初始化后发生变化")) }
+        try checked("echo \"\(markerLine)\" > '\(loadedModulesMarker)' && chmod 600 '\(loadedModulesMarker)'")
     }
 
     private func soundDevicesReady() throws -> Bool {

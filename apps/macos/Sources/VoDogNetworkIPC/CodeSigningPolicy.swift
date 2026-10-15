@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 
@@ -15,6 +16,13 @@ public enum VoDogCodeSigningPolicy {
             return nil
         }
         return requirement
+    }
+
+    /// Code requirement text naming `identifier` and pinning the exact leaf certificate (its SHA-1, the
+    /// form the requirement language uses), for `NSXPCConnection.setCodeSigningRequirement`.
+    public static func leafPinnedRequirement(identifier: String, leafCertificate: Data) -> String {
+        let hash = Insecure.SHA1.hash(data: leafCertificate).map { String(format: "%02x", $0) }.joined()
+        return "identifier \"\(identifier)\" and certificate leaf = H\"\(hash)\""
     }
 
     public static func currentProcessCode() -> SecCode? {

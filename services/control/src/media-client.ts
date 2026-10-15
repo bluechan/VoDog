@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
+import { signedMediaRequestHeaders } from './signed-request.js';
 
 export type MediaTransport = 'udp' | 'tls';
 export type MediaBridgeClientOptions = { controlBaseUrl?: string; turnUdpUrl?: string; turnTlsUrl?: string };
@@ -47,7 +48,9 @@ export class MediaBridgeClient {
   async close(callId:string, mediaEpoch = 1) {
     assertCallId(callId);
     if (!Number.isSafeInteger(mediaEpoch) || mediaEpoch < 1) throw new Error('Invalid media epoch');
-    const response=await fetch(`${this.controlBaseUrl}/close/${callId}`,{method:'POST',headers:{Authorization:'Bearer '+this.secret,'X-Media-Epoch':String(mediaEpoch)},signal:AbortSignal.timeout(5000),redirect:'error'});
+    // Signed like recording requests: the media secret itself never crosses the wire, which matters on the
+    // plain-HTTP Tailscale hop `validatedControlBaseUrl` allows.
+    const response=await fetch(`${this.controlBaseUrl}/close/${callId}`,{method:'POST',headers:{...signedMediaRequestHeaders(this.secret,'POST',`/close/${callId}`),'X-Media-Epoch':String(mediaEpoch)},signal:AbortSignal.timeout(5000),redirect:'error'});
     if(!response.ok)throw new MediaBridgeError(response.status);
   }
 }
