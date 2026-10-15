@@ -1,0 +1,21 @@
+name: Sync upstream
+# Keep this fork's main in step with its upstream every day at 07:00 Asia/Shanghai (23:00 UTC),
+# using GitHub's "sync fork" API. A conflict, or an upstream change to workflow files (which
+# this token may not write), fails the run, and GitHub emails the owner; resolve it by hand.
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    if: github.event.repository.fork
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Merge upstream into main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main \
+            --jq '"\(.merge_type): \(.message)"' | tee -a "$GITHUB_STEP_SUMMARY"
