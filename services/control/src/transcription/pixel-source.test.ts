@@ -8,6 +8,7 @@ import {createGeminiTranscriptionProvider} from './provider.js';
 import {maxTranscriptionRetryDelayMs,TranscriptionProviderHttpError} from './provider-error.js';
 import {validTranscriptionAudio} from './audio-format.js';
 import type {PixelRecordingDescriptor} from '../recording-archive.js';
+import {dropScratchDatabase} from '../../test/scratch-database.js';
 
 const callId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',owner='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const sha=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
@@ -160,7 +161,7 @@ test('verified Pixel discovery waits for upload, then persists one source job ac
   const {PostgresTranscriptJobRepository}=await import('./repository.js');const {TranscriptionRuntime}=await import('./runtime.js');
   const admin=new pg.Pool({connectionString:'postgresql:///postgres',max:1});
   const name=`vodog_pixel_transcript_${process.pid}_${Date.now()}`;let localDb:InstanceType<typeof pg.Pool>|undefined;
-  t.after(async()=>{await localDb?.end();await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);await admin.end();});
+  t.after(async()=>{await localDb?.end();await dropScratchDatabase(admin,name);await admin.end();});
   await admin.query(`CREATE DATABASE ${name}`);localDb=new pg.Pool({connectionString:`postgresql:///${name}`});
   await localDb.query(await readFile(new URL('../schema.sql',import.meta.url),'utf8'));
   await localDb.query(await readFile(new URL('./schema.sql',import.meta.url),'utf8'));

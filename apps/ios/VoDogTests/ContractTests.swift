@@ -144,6 +144,7 @@ final class ContractTests: XCTestCase {
     }
 
     func testRelayQualityCollectorPropagatesLogoutCancellationToNodeAttempt() async {
+        let operationStarted = expectation(description: "node operation waiting on its SDK callback")
         let closeStarted = expectation(description: "node transport close initiated")
         let operationExited = expectation(description: "node operation released")
         let node = Task {
@@ -154,12 +155,16 @@ final class ContractTests: XCTestCase {
                 operation: {
                     defer { operationExited.fulfill() }
                     do {
-                        let _: Void = try await MediaQualityProbeCallbackBridge.wait { _ in }
+                        let _: Void = try await MediaQualityProbeCallbackBridge.wait { _ in operationStarted.fulfill() }
                     } catch {}
                     return "cancelled"
                 }
             )
         }
+        // Logout must reach an attempt already in flight. Cancelling before the node task has started its
+        // operation is a different, also valid path: `race` then never starts the operation at all, so
+        // "released" would never be fulfilled. That race made this test fail intermittently.
+        await fulfillment(of: [operationStarted], timeout: promptTimeout)
         let started = ContinuousClock().now
         let collector = Task { await MediaQualityProbeTaskCollector.collect([node]) }
         collector.cancel()

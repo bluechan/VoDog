@@ -86,7 +86,7 @@ import {
   opaqueToken,
   requestFingerprint,
   tokenHash,
-  verifyPassword,
+  verifyPasswordOrDecoy,
 } from "./security.js";
 import {AuthAttemptLimiter, emitCrowdsecAuthFail} from "./auth-attempts.js";
 import {verifyTurnstileToken} from "./turnstile.js";
@@ -610,9 +610,10 @@ export async function buildApp(
       `SELECT id,email username,password_hash,role FROM users WHERE email=$1`,
       [username],
     );
-    const valid =
-      q.rowCount === 1 &&
-      (await verifyPassword(b.password, q.rows[0].password_hash));
+    const valid = await verifyPasswordOrDecoy(
+      b.password,
+      q.rowCount === 1 ? q.rows[0].password_hash : undefined,
+    );
     if (!valid) {
       recordAuthFailure(req.ip, username, "password");
       fail(401, "INVALID_CREDENTIALS", "Invalid username or password");

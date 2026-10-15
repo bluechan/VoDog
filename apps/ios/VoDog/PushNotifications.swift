@@ -558,8 +558,10 @@ final class IncomingCallManager {
         _ call: CallRecord, callID: String, session: SessionStore, sessionIdentity: UUID
     ) -> Bool {
         // S105: a same-session claim replay after the watch answered names the watch; it holds the audio, so the
-        // phone neither starts media nor sends end (failAnswer would hang up the watch's call).
-        if let device = call.answeredByDevice, device != UIDevice.current.name {
+        // phone neither starts media nor sends end (failAnswer would hang up the watch's call). Another phone is a
+        // different session (ALREADY_CLAIMED), so the platform is the test, not the device name: since iOS 16
+        // `UIDevice.current.name` is the generic "iPhone" without the user-assigned-device-name entitlement.
+        if call.answeredByPlatform == "watchos" {
             Diag.shared.log("call.answer.failed", ["reason": "answered_by_other_device"], callId: callID)
             stopReconciling(callID: callID)
             CallCoordinator.shared.endCall(id: callID, reason: .answeredElsewhere)

@@ -33,6 +33,8 @@ export function emitCrowdsecAuthFail(
 }
 
 export class AuthAttemptLimiter {
+  private lastSweep = Number.NEGATIVE_INFINITY;
+
   constructor(
     private readonly attempts = new Map<string, {count: number; reset: number}>(),
     private readonly now = () => Date.now(),
@@ -45,14 +47,16 @@ export class AuthAttemptLimiter {
   }
 
   blocked(ip: string | undefined, username: string): boolean {
-    const bucket = this.attempts.get(this.key(ip, username));
     const now = this.now();
+    this.sweep(now);
+    const bucket = this.attempts.get(this.key(ip, username));
     return !!bucket && bucket.reset > now && bucket.count >= this.limit;
   }
 
   recordFailure(ip: string | undefined, username: string): number {
     const key = this.key(ip, username);
     const now = this.now();
+    this.sweep(now);
     const current = this.attempts.get(key);
     const bucket = current && current.reset > now ? current : {count: 0, reset: now + this.windowMs};
     bucket.count++;
@@ -62,5 +66,12 @@ export class AuthAttemptLimiter {
 
   clear(ip: string | undefined, username: string): void {
     this.attempts.delete(this.key(ip, username));
+  }
+
+  /** Drops expired buckets at most once per window, so failed attempts cannot grow the map forever. */
+  private sweep(now: number): void {
+    if (now - this.lastSweep < this.windowMs) return;
+    this.lastSweep = now;
+    for (const [key, bucket] of this.attempts) if (bucket.reset <= now) this.attempts.delete(key);
   }
 }

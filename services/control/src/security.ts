@@ -21,5 +21,17 @@ export async function verifyPassword(password: string, encoded: string): Promise
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+// An unknown username (or an account without a usable password hash) is checked against this decoy,
+// so a miss costs the same scrypt work as a wrong password and response time does not reveal accounts.
+let decoyHash: Promise<string> | undefined;
+const isScryptHash = (encoded: string) => encoded.startsWith('scrypt$') && encoded.split('$').length === 6;
+
+export async function verifyPasswordOrDecoy(password: string, encoded: string | null | undefined): Promise<boolean> {
+  if (encoded && isScryptHash(encoded)) return verifyPassword(password, encoded);
+  decoyHash ??= hashPassword(opaqueToken());
+  await verifyPassword(password, await decoyHash);
+  return false;
+}
+
 export const requestFingerprint = (value: unknown) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');

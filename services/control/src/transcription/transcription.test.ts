@@ -12,6 +12,7 @@ import {canonicalWav} from './wav-chunks.js';
 import {mixTracks} from './mix.js';
 import {attributeSegments} from './attribution.js';
 import type {PixelRecordingDescriptor} from '../recording-archive.js';
+import {dropScratchDatabase} from '../../test/scratch-database.js';
 
 const {Pool} = pg;
 const databaseName = `vodog_transcription_test_${process.pid}_${Date.now()}`;
@@ -29,7 +30,7 @@ test('PostgreSQL transcription repository, worker, and owner routes', async (t) 
   db = new Pool({connectionString: `postgresql:///${databaseName}`, max: 6});
   t.after(async () => {
     await db.end();
-    await admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    await dropScratchDatabase(admin, databaseName);
     await admin.end();
   });
   await db.query(await readFile(new URL('../schema.sql', import.meta.url), 'utf8'));

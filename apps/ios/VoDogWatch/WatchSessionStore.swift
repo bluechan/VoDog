@@ -76,6 +76,8 @@ final class WatchSessionStore {
     private var endedCallIds: Set<String> = []
 
     private static let snapshotKey = "s104-watch-snapshot-v1"
+    /// The token last written to `WatchTokenKeychain`, so `persist()` touches the Keychain only on change.
+    @ObservationIgnored private var persistedToken: String?
 
     private init() {
         if let id = defaults.string(forKey: "s104-watch-installation-id") {
@@ -84,8 +86,21 @@ final class WatchSessionStore {
             installationId = UUID().uuidString.lowercased()
             defaults.set(installationId, forKey: "s104-watch-installation-id")
         }
+        var migratedLegacyToken = false
         if let data = defaults.data(forKey: Self.snapshotKey), let saved = try? JSONDecoder().decode(Snapshot.self, from: data) {
-            context = saved.context; restSims = saved.sims; badges = saved.badges ?? WatchBadges()
+            var restored = saved.context
+            // Snapshots written before the token moved to the Keychain still carry it in plaintext.
+            if let legacy = restored?.session?.accessToken, !legacy.isEmpty {
+                WatchTokenKeychain.save(legacy); migratedLegacyToken = true
+            }
+            if restored?.session != nil {
+                if let token = WatchTokenKeychain.load(), !token.isEmpty {
+                    restored?.session?.accessToken = token; persistedToken = token
+                } else {
+                    restored?.session = nil // no stored token: wait for the iPhone's next context
+                }
+            }
+            context = restored; restSims = saved.sims; badges = saved.badges ?? WatchBadges()
             calls = saved.calls ?? []; sms = saved.sms ?? []; contacts = saved.contacts ?? []
             snapshotAt = saved.snapshotAt
             // A non-empty persisted snapshot shows at once, no spinner.
@@ -93,6 +108,7 @@ final class WatchSessionStore {
             if !sms.isEmpty { loadStates[.sms] = .loaded }
             if !contacts.isEmpty { loadStates[.contacts] = .loaded }
         }
+        if migratedLegacyToken { persist() } // rewrite the snapshot without the plaintext token
     }
 
     // MARK: Derived state
@@ -613,7 +629,15 @@ final class WatchSessionStore {
 
     private func persist() {
         guard !preview else { return }
-        let snapshot = Snapshot(context: context, sims: restSims, badges: badges, calls: Array(calls.prefix(100)),
+        // The access token goes to the Keychain; the defaults snapshot keeps the session without it.
+        var stored = context
+        if let token = stored?.session?.accessToken {
+            if token != persistedToken, WatchTokenKeychain.save(token) { persistedToken = token }
+            stored?.session?.accessToken = ""
+        } else if persistedToken != nil {
+            WatchTokenKeychain.delete(); persistedToken = nil
+        }
+        let snapshot = Snapshot(context: stored, sims: restSims, badges: badges, calls: Array(calls.prefix(100)),
                                 sms: Array(sms.prefix(300)), contacts: contacts, snapshotAt: snapshotAt)
         if let data = try? JSONEncoder().encode(snapshot) { defaults.set(data, forKey: Self.snapshotKey) }
     }

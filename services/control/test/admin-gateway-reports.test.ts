@@ -5,6 +5,7 @@ import test from 'node:test';
 import Fastify, {type FastifyRequest} from 'fastify';
 import pg from 'pg';
 import {registerAdminGatewayReportRoutes} from '../src/admin-gateway-reports.js';
+import {dropScratchDatabase} from './scratch-database.js';
 
 const {Pool} = pg;
 const {reportWindow} = await import('../../voice/report-window.mjs');
@@ -20,7 +21,7 @@ test('admin gateway AI report route', async (t) => {
   const db = new Pool({connectionString: `postgresql:///${databaseName}`, max: 5});
   t.after(async () => {
     await db.end();
-    await adminDb.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    await dropScratchDatabase(adminDb, databaseName);
     await adminDb.end();
   });
   await db.query(await readFile(new URL('../src/schema.sql', import.meta.url), 'utf8'));

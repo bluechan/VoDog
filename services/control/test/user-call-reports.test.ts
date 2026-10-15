@@ -9,6 +9,7 @@ import {reportDayWindow, reportWindow} from '../../voice/report-window.mjs';
 import {PostgresTranscriptJobRepository} from '../src/transcription/repository.js';
 import {registerTranscriptionRoutes} from '../src/transcription/routes.js';
 import {TranscriptionWorker} from '../src/transcription/worker.js';
+import {dropScratchDatabase} from './scratch-database.js';
 
 const {Pool} = pg;
 const databaseName = `vodog_user_reports_${process.pid}_${Date.now()}`;
@@ -23,11 +24,8 @@ test('user call reports list every call in the window and enforce all calendar-w
   await admin.query(`CREATE DATABASE ${databaseName}`);
   const db = new Pool({connectionString: `postgresql:///${databaseName}`, max: 4});
   t.after(async () => {
-    // DROP … WITH (FORCE) terminates any pooled connection still closing; that is expected during
-    // teardown and must not surface as an uncaught pool error that fails the whole file.
-    db.on('error', () => {});
     await db.end();
-    await admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
+    await dropScratchDatabase(admin, databaseName);
     await admin.end();
   });
   await db.query(await readFile(new URL('../src/schema.sql', import.meta.url), 'utf8'));

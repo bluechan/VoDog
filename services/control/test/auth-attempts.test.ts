@@ -42,3 +42,15 @@ test('emitCrowdsecAuthFail writes the parseable line', () => {
   assert.match(chunks[0], /type=passkey/);
   assert.equal(chunks[0].includes('a@b.test'), false);
 });
+
+test('auth limiter drops expired buckets, so failures cannot grow it forever', () => {
+  let now = 1_000;
+  const attempts = new Map<string, {count: number; reset: number}>();
+  const limiter = new AuthAttemptLimiter(attempts, () => now);
+  for (let i = 0; i < 50; i++) limiter.recordFailure('192.0.2.1', `user${i}@example.test`);
+  assert.equal(attempts.size, 50);
+  now += 15 * 60_000 + 1;
+  limiter.recordFailure('192.0.2.2', 'late@example.test');
+  assert.equal(attempts.size, 1, 'every expired bucket is gone once a window has passed');
+  assert.equal(limiter.blocked('192.0.2.1', 'user0@example.test'), false);
+});
