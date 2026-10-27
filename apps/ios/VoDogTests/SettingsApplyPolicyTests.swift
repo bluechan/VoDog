@@ -177,3 +177,33 @@ final class SettingsApplyPolicyTests: XCTestCase {
         )
     }
 }
+
+
+/// S138 决策 3：设置页状态形状与文字。● 在线 / 已就绪，○ 离线 / 待命中 / 暂不可用，◐ 正在注册 / 待应用。
+final class S138SettingsStatusTests: XCTestCase {
+    func testGatewayShapes() {
+        XCTAssertEqual(SettingsStatusPolicy.gateway(GatewayPower(gatewayId: "g", online: true)), .online)
+        XCTAssertEqual(SettingsStatusPolicy.gateway(GatewayPower(gatewayId: "g", standbyOnline: true)), .offline)
+        XCTAssertEqual(SettingsStatusPolicy.gateway(GatewayPower(gatewayId: "g")), .offline)
+    }
+
+    func testPushSummary() {
+        XCTAssertEqual(SettingsStatusPolicy.push(registered: true, failed: true).word, "已就绪")
+        XCTAssertEqual(SettingsStatusPolicy.push(registered: true, failed: false).shape, .online)
+        XCTAssertEqual(SettingsStatusPolicy.push(registered: false, failed: true).word, "暂不可用")
+        XCTAssertEqual(SettingsStatusPolicy.push(registered: false, failed: false).shape, .pending)
+        XCTAssertEqual(SettingsStatusPolicy.push(registered: false, failed: false).word, "正在注册")
+    }
+
+    func testSIMStatusWord() {
+        let pending = SettingsStatusPolicy.simStatus(.online, text: "在线", settingsPending: true)
+        XCTAssertEqual(pending.shape, .pending)
+        XCTAssertEqual(pending.word, "待应用")
+        let offline = SettingsStatusPolicy.simStatus(.offline, text: "号码设备离线", settingsPending: true)
+        XCTAssertEqual(offline.word, "离线")
+        XCTAssertEqual(offline.spoken, "号码设备离线")
+        let network = SettingsStatusPolicy.simStatus(nil, text: "设备未联网", settingsPending: false)
+        XCTAssertNil(network.shape)
+        XCTAssertEqual(network.word, "设备未联网")
+    }
+}

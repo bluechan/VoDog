@@ -112,7 +112,6 @@
 		B4D7C5D2B3294AFC2DD61ED3 /* PasskeyService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1DDFCD279E41DFF7955EB8B /* PasskeyService.swift */; };
 		B4E70FBBA80F5C6A4CC9A832 /* WatchOpusCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81B4FD4CD7F90C7F953493D4 /* WatchOpusCodec.swift */; };
 		B803E05CA7791C916B3709FD /* WalkthroughDisplayPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B5CC58D969E4E540C8FF348 /* WalkthroughDisplayPolicyTests.swift */; };
-		B83C2E1C4CB3F884C2CE1FBB /* PagerBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5BAEF5B80DBDDF96F077050 /* PagerBar.swift */; };
 		B87C110E345F20442D4F3F2B /* LoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B26A5FBC38BD9781241E76FE /* LoginView.swift */; };
 		BAD3DAF13EEBBAF5DD9DE784 /* ExpandedUIState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F441021FF8ACA2CA94D10A85 /* ExpandedUIState.swift */; };
 		C0043DA8BEE9ACB3506ED0EB /* WatchCallKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 735F1FDF8C10C38A7A214CDA /* WatchCallKit.swift */; };
@@ -309,7 +308,6 @@
 		D406F60C2CDEA72CCFABEBE4 /* SharedPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedPresentation.swift; sourceTree = "<group>"; };
 		D47C6D7CE4BC64F69AB327E3 /* OwnerBusyPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwnerBusyPolicy.swift; sourceTree = "<group>"; };
 		D5A39494320CB5134F2441C1 /* Diag.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diag.swift; sourceTree = "<group>"; };
-		D5BAEF5B80DBDDF96F077050 /* PagerBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PagerBar.swift; sourceTree = "<group>"; };
 		D65908E43E7EEFFDD5ED75FB /* WatchComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchComponents.swift; sourceTree = "<group>"; };
 		D7675F7C53ED00ACE703C606 /* OutboundCallIdempotencyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboundCallIdempotencyStore.swift; sourceTree = "<group>"; };
 		D815A3E94605E6CABE9EF3B5 /* S30ClientPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = S30ClientPolicyTests.swift; sourceTree = "<group>"; };
@@ -465,7 +463,6 @@
 				AAAD60384A7D50703AC76FDE /* OpusOfferPolicy.swift */,
 				D7675F7C53ED00ACE703C606 /* OutboundCallIdempotencyStore.swift */,
 				D47C6D7CE4BC64F69AB327E3 /* OwnerBusyPolicy.swift */,
-				D5BAEF5B80DBDDF96F077050 /* PagerBar.swift */,
 				A896B4B0E068DEF006B4FDDE /* PasskeyDisplayPolicy.swift */,
 				B1DDFCD279E41DFF7955EB8B /* PasskeyService.swift */,
 				5169CC9C09AF276244C8F580 /* PhoneAudioRoutePolicy.swift */,
@@ -845,7 +842,6 @@
 				8A3E35577819AB758C270B82 /* OpusOfferPolicy.swift in Sources */,
 				6179AF49A2CC1E91E96EA052 /* OutboundCallIdempotencyStore.swift in Sources */,
 				89F0E61F11F7491CE5935455 /* OwnerBusyPolicy.swift in Sources */,
-				B83C2E1C4CB3F884C2CE1FBB /* PagerBar.swift in Sources */,
 				5744C2A1226453730EB34752 /* PasskeyDisplayPolicy.swift in Sources */,
 				B4D7C5D2B3294AFC2DD61ED3 /* PasskeyService.swift in Sources */,
 				1572EF7DCE5C63A346E515D4 /* PhoneAudioRoutePolicy.swift in Sources */,

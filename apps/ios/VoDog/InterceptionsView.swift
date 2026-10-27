@@ -11,9 +11,9 @@ struct InterceptionsView: View {
     var embedded = false
     /// 设置页只需要账号级屏蔽名单。它复用这里的加载、失败保留和解除确认，不复制第二套删除逻辑。
     var blocklistOnly = false
-    /// S26: the host owns the page and the 类型 filter, because switching segments throws this view's own
-    /// `@State` away — a page kept here would snap back to 1 every time 记录 came back to 拦截记录.
-    var paging: RecordsPagingStore?
+    /// S26: the host owns the 类型 filter, because switching segments throws this view's own `@State` away.
+    /// The standalone (pushed) presentation has no host and never shows the filter.
+    @Binding var kind: InterceptionKindFilter
     @Environment(SessionStore.self) private var session
     @Environment(UIAvailabilityState.self) private var availability
     @Environment(AppNavigation.self) private var navigation
@@ -31,19 +31,17 @@ struct InterceptionsView: View {
     @State private var interceptionsLoadGeneration = 0
     @State private var loaded = false
     @State private var error: String?
-    @State private var snapshotCaption: String?
+    /// S133: 拦截记录 scrolls instead of paging — page 1 is the head, the next page follows the rows loaded.
+    @State private var reachedEnd = false
+    @State private var loadingMore = false
     @State private var card: ContactCardTarget?
     @State private var dataSessionIdentity: UUID?
-    /// The fallback for the standalone (pushed) presentation, which has no host to keep state for it.
-    @State private var ownPaging = RecordsPagingStore()
 
-    private var store: RecordsPagingStore { paging ?? ownPaging }
-
-    init(embedded: Bool = false, blocklistOnly: Bool = false, paging: RecordsPagingStore? = nil,
+    init(embedded: Bool = false, blocklistOnly: Bool = false, kind: Binding<InterceptionKindFilter> = .constant(.all),
          cachedBlocklist: [BlocklistItem]? = nil, cachedSessionIdentity: UUID? = nil) {
         self.embedded = embedded
         self.blocklistOnly = blocklistOnly
-        self.paging = paging
+        _kind = kind
         if let cachedBlocklist, let cachedSessionIdentity {
             _blockedNumbers = State(initialValue: cachedBlocklist)
             _blocklistLoaded = State(initialValue: true)
@@ -62,8 +60,7 @@ struct InterceptionsView: View {
     }
 
     private var content: some View {
-        @Bindable var store = store
-        return List {
+        List {
             Group {
             if availability.reason != nil { Section { NetworkAvailabilityNotice() } }
             if blocklistOnly {
@@ -135,27 +132,21 @@ struct InterceptionsView: View {
             }
             if !blocklistOnly {
                 Section {
-                    Picker("类型", selection: $store.kind) {
+                    Picker("类型", selection: $kind) {
                         ForEach(InterceptionKindFilter.allCases) { Text($0.title).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     .accessibilityIdentifier("interceptions.kind")
                 } footer: {
-                    Text("类型仅筛选本页已加载的记录，不改变全部号码范围。")
+                    Text("类型仅筛选已加载的记录，不改变全部号码范围。")
                 }
                 Section {
-                    if let snapshotCaption, RecordSearchPolicy.showsSnapshotCaption(
-                        query: "", page: store.page, stale: error != nil || !availability.canMutate
-                    ) {
-                        Text(snapshotCaption).font(.caption).foregroundStyle(.secondary)
-                        if error != nil || !availability.canMutate {
-                            Text("当前显示缓存内容；请求：第 \(store.page) 页 · 每页 \(store.pageSize) 条")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
+                    if loaded, error != nil || !availability.canMutate {
+                        Text("当前显示缓存内容：已加载 \(items.count) 条拦截记录").font(.caption).foregroundStyle(.secondary)
                     }
                     if !loaded {
                         HStack(spacing: 8) { ProgressView(); Text("正在读取拦截记录…") }
-                    } else if visibleItems.isEmpty {
+                    } else if visibleItems.isEmpty, reachedEnd {
                         ContentUnavailableView {
                             Label("暂无拦截记录", systemImage: "hand.raised.slash")
                         } description: {
@@ -166,6 +157,14 @@ struct InterceptionsView: View {
                         Button { card = ContactCardTarget(interception: item) } label: { row(item) }
                             .buttonStyle(.plain)
                             .accessibilityIdentifier("interceptions.row")
+                            .onAppear {
+                                // The filtered rows, not `items`: they are what the user is scrolling through.
+                                if RecordsScrollPolicy.isNearEnd(item.id, in: visibleItems) { Task { await loadMore() } }
+                            }
+                    }
+                    if loadingMore {
+                        HStack(spacing: 8) { ProgressView(); Text("正在读取更早的拦截记录…") }
+                            .accessibilityIdentifier("interceptions.loadingMore")
                     }
                     if let error {
                         Label(error, systemImage: "exclamationmark.triangle")
@@ -179,7 +178,14 @@ struct InterceptionsView: View {
         }
         .signalList()
         .keyboardDoneToolbar()
-        .refreshable { await loadAll() }
+        // S133: 下拉刷新 goes back to the head; the appended rows are dropped before the request.
+        .refreshable {
+            if items.count > RecordsScrollPolicy.chunk {
+                items = Array(items.prefix(RecordsScrollPolicy.chunk)); reachedEnd = false
+            }
+            await loadAll()
+        }
+        .onChange(of: kind) { Task { await fillIfSparse() } }
         .onChange(of: scope) {
             // The other list's rows must not linger under this segment while its GET is in flight.
             blocklistLoadGeneration += 1
@@ -190,9 +196,8 @@ struct InterceptionsView: View {
             guard let identity = session.sessionIdentity else { return }
             Task { await loadBlocklist(requiredIdentity: identity) }
         }
-        // S26: the page is part of the identity of what is being read, so turning one re-runs the load; the
-        // 类型 filter is not, because the server has no such parameter and it stays a filter over the page.
-        .task(id: RecordsRequestKey(page: store.page, pageSize: store.pageSize)) { await loadAll() }
+        // The 类型 filter never re-runs the load: the server has no such parameter, it filters what is loaded.
+        .task { await loadAll() }
         .task(id: "\(session.sessionIdentity?.uuidString ?? "none"):\(navigation.tab):\(scenePhase)") {
             guard (blocklistOnly ? navigation.tab == .settings : navigation.tab == .records),
                   scenePhase == .active else { return }
@@ -203,9 +208,6 @@ struct InterceptionsView: View {
                 do { try await Task.sleep(for: ForegroundRefreshPolicy.interval) } catch { return }
                 await loadAll()
             }
-        }
-        .safeAreaInset(edge: .bottom) {
-            if !blocklistOnly { PagerBar(store: store).disabled(!availability.canMutate || error != nil) }
         }
         .sheet(item: $card) { target in
             ContactCardView(target: target) { await loadAll() }
@@ -234,7 +236,7 @@ struct InterceptionsView: View {
     }
 
     private var visibleItems: [Interception] {
-        InterceptionKindFilter.apply(store.kind, to: items)
+        InterceptionKindFilter.apply(kind, to: items)
     }
 
     @ViewBuilder private func row(_ item: Interception) -> some View {
@@ -282,47 +284,86 @@ struct InterceptionsView: View {
             .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
+    /// The head (page 1), merged over the rows already loaded so the poll never throws a scrolled user back.
     private func load(requiredIdentity identity: UUID) async {
-        let requestedPage = store.page
-        let requestedPageSize = store.pageSize
         interceptionsLoadGeneration += 1
         let generation = interceptionsLoadGeneration
         do {
             let response: PagedEnvelope<Interception> = try await session.request(
                 "blocklist/interceptions",
                 requiredSessionIdentity: identity,
-                queryItems: RecordSearchPolicy.interceptionsQuery(page: requestedPage, pageSize: requestedPageSize)
+                queryItems: RecordSearchPolicy.interceptionsQuery(page: 1)
             )
-            guard !Task.isCancelled, generation == interceptionsLoadGeneration, session.isCurrentSession(identity),
-                  store.page == requestedPage, store.pageSize == requestedPageSize else { return }
-            // Rows first: `apply` may lower the page and re-key the `.task`, cancelling this one.
-            items = response.items
-            snapshotCaption = response.supported
-                ? "已加载：第 \(response.page ?? requestedPage) 页 · 每页 \(response.pageSize ?? requestedPageSize) 条"
-                : "已加载：全部拦截记录（未分页）"
-            store.apply(
-                page: response.page, total: response.total, totalPages: response.totalPages,
-                requestedPage: requestedPage
+            guard !Task.isCancelled, generation == interceptionsLoadGeneration,
+                  session.isCurrentSession(identity) else { return }
+            items = RecordsScrollPolicy.afterHead(response.items, loaded: items)
+            reachedEnd = RecordsScrollPolicy.reachedEnd(
+                loadedCount: items.count, total: response.supported ? response.total : nil,
+                answered: response.items.count
             )
             error = nil
             loaded = true
         } catch APIError.server(404, _, _) {
-            guard !Task.isCancelled, generation == interceptionsLoadGeneration, session.isCurrentSession(identity),
-                  store.page == requestedPage, store.pageSize == requestedPageSize else { return }
+            guard !Task.isCancelled, generation == interceptionsLoadGeneration,
+                  session.isCurrentSession(identity) else { return }
             items = []
-            snapshotCaption = nil
-            store.clearPaging()
+            reachedEnd = true
             error = nil
             loaded = true
         } catch SessionLifecycleError.staleSession {
             return
         } catch {
-            guard !Task.isCancelled, generation == interceptionsLoadGeneration, session.isCurrentSession(identity),
-                  store.page == requestedPage, store.pageSize == requestedPageSize else { return }
-            if items.isEmpty { store.clearPaging() }
+            guard !Task.isCancelled, generation == interceptionsLoadGeneration,
+                  session.isCurrentSession(identity) else { return }
             self.error = error.localizedDescription
             loaded = true
         }
+    }
+
+    /// S133: the next 50 rows. One call at a time; a chunk is appended only if the list still ends on the row
+    /// the page was computed against. The 类型 filter can leave almost nothing on screen while the server has
+    /// more, so it keeps going while the filtered list is short — and stops the moment a chunk adds nothing,
+    /// leaving the retry to the next row appearing or the next head.
+    private func loadMore() async {
+        guard !blocklistOnly, loaded, availability.canMutate, !loadingMore,
+              let identity = session.sessionIdentity, dataSessionIdentity == identity else { return }
+        loadingMore = true
+        defer { loadingMore = false }
+        var grew = true
+        while grew, !reachedEnd {
+            let last = items.last?.id
+            do {
+                let response: PagedEnvelope<Interception> = try await session.request(
+                    "blocklist/interceptions",
+                    requiredSessionIdentity: identity,
+                    queryItems: RecordSearchPolicy.interceptionsQuery(
+                        page: RecordsScrollPolicy.nextPage(loadedCount: items.count)
+                    )
+                )
+                guard session.isCurrentSession(identity), dataSessionIdentity == identity,
+                      items.last?.id == last else { return }
+                let merged = RecordsScrollPolicy.afterChunk(response.items, loaded: items)
+                grew = merged.count > items.count
+                items = merged
+                reachedEnd = RecordsScrollPolicy.reachedEnd(
+                    loadedCount: items.count, total: response.supported ? response.total : nil,
+                    answered: response.items.count
+                )
+                error = nil
+            } catch SessionLifecycleError.staleSession {
+                return
+            } catch {
+                guard session.isCurrentSession(identity), dataSessionIdentity == identity else { return }
+                self.error = error.localizedDescription
+                return
+            }
+            guard visibleItems.count < CallsScrollPolicy.prefetchDistance else { return }
+        }
+    }
+
+    /// With too few filtered rows no row near the end ever appears, so the list has to ask by itself.
+    private func fillIfSparse() async {
+        if visibleItems.count < CallsScrollPolicy.prefetchDistance { await loadMore() }
     }
 
     private func loadAll() async {
@@ -336,6 +377,8 @@ struct InterceptionsView: View {
         }
         if !blocklistOnly { await load(requiredIdentity: identity) }
         await loadBlocklist(requiredIdentity: identity)
+        // After the blocklist: a rare 类型 can take several requests and must not hold it up.
+        await fillIfSparse()
     }
 
     private func loadBlocklist(requiredIdentity identity: UUID) async {
@@ -396,7 +439,7 @@ struct InterceptionsView: View {
         interceptionsLoadGeneration += 1
         dataSessionIdentity = nil
         items = []
-        snapshotCaption = nil
+        reachedEnd = false
         blockedNumbers = []
         blocklistLoaded = false
         blocklistError = nil
@@ -405,7 +448,6 @@ struct InterceptionsView: View {
         loaded = false
         error = nil
         card = nil
-        store.clearPaging()
     }
 }
 

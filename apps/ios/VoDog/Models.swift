@@ -8,7 +8,7 @@ struct ItemEnvelope<T: Codable & Sendable>: Codable, Sendable { let items: [T] }
 /// S26: the paged form of `ItemEnvelope`. `GET calls`, `GET reports/calls` and `GET blocklist/interceptions`
 /// answer `{items, page, pageSize, total, totalPages}` when a `page` is asked for; a Control that predates the
 /// contract answers the bare `{items}` it always did. Every paging field is therefore optional and
-/// `supported` — "this server really counted the pages" — is the single fact the pager is shown by.
+/// `supported` — "this server really counted the pages" — is what tells a paged answer from the whole list.
 struct PagedEnvelope<T: Decodable & Sendable>: Decodable, Sendable {
     let items: [T]
     let page: Int?
@@ -166,7 +166,7 @@ struct CallRecord: Codable, Identifiable, Sendable {
     /// Whether an AI run currently owns this ringing call. Nil on an older server, which means "not AI".
     var aiHandling: Bool?
     var aiTriggerAt: String?
-    /// S38 决策：忙线冲突的处置结果 `rejected` | `ai_answered`。pre-S38 Control 不发这个字段。
+    /// S38 决策：忙线冲突的处置结果 `rejected` | `ai_answered`；S136 加 `screened_ai`。pre-S38 Control 不发这个字段。
     var conflictDisposition: String?
     /// S38：这通来电是被谁拦下的 `phone` | `gateway` | `control`。只有 `failureReason == "number_blocked"` 的行才有。
     var blockedSource: String?
@@ -193,7 +193,7 @@ struct CallRecord: Codable, Identifiable, Sendable {
     }
     /// 列表行的状态列：未接来电优先于原始状态；S72 忙线自动拒接单列「忙线未接」。
     var rowStateTitle: String {
-        guard isMissedIncoming else { return callStateTitle(state) }
+        guard isMissedIncoming else { return callStateTitle(state, failureReason: failureReason) }
         return failureReason == "busy_auto_rejected" ? "忙线未接" : "未接来电"
     }
     /// S72：内部通话行首写「内部通话 A → B」，否则 nil（调用方照旧显示号码）。
@@ -213,6 +213,8 @@ struct CallRecord: Codable, Identifiable, Sendable {
     var s38BadgeTitle: String? {
         // 拦截排在最前：被拦下的来电根本没有接通过，`originatingPlatform` 之类的字段说什么都不作数。
         if failureReason == "number_blocked" { return Interception.sourceTitle(blockedSource) ?? "已拦截" }
+        // S136：筛查应用拦下、号码在联系人里、Control 直接交给 AI 的来电。
+        if conflictDisposition == "screened_ai" { return "拦截转 AI 接听" }
         if conflictDisposition == "rejected" || failureReason == "busy_auto_rejected" { return "忙线自动拒接" }
         if conflictDisposition == "ai_answered" { return "忙线 AI 代接" }
         return originatingPlatform == "pixel" ? GatewayKind(gatewayKind).directDialTitle : nil
@@ -641,8 +643,10 @@ enum RecordingSource: String, CaseIterable, Sendable {
     }
     /// 设备上直拨的通话没有服务器录音，只有设备原始归档（`source=pixel`），默认直接打开它。
     /// S94b: 机主本机接入的通话，服务器录音不含机主声音，同样默认设备归档。
-    static func defaultSource(originatingPlatform: String?, ownerJoinedLocal: Bool = false) -> RecordingSource {
-        originatingPlatform == "pixel" || ownerJoinedLocal ? .pixel : .mediaNode
+    /// S134b: 在 Pixel 本机接听的来电（`answeredByPlatform == "device"`）只有设备被动录音，同样默认设备归档。
+    static func defaultSource(originatingPlatform: String?, ownerJoinedLocal: Bool = false,
+                              answeredByPlatform: String? = nil) -> RecordingSource {
+        originatingPlatform == "pixel" || ownerJoinedLocal || answeredByPlatform == "device" ? .pixel : .mediaNode
     }
 }
 
@@ -1508,9 +1512,12 @@ struct VoiceProviderList: Codable, Sendable, Equatable {
     let items: [VoiceProvider]
     let selected: String?
     let configVersion: Int
+    /// S137: nil = a Control that predates the switch, so the toggle stays hidden.
+    let contactInstantAi: Bool?
 
-    init(items: [VoiceProvider] = [], selected: String? = nil, configVersion: Int = 1) {
+    init(items: [VoiceProvider] = [], selected: String? = nil, configVersion: Int = 1, contactInstantAi: Bool? = nil) {
         self.items = items; self.selected = selected; self.configVersion = configVersion
+        self.contactInstantAi = contactInstantAi
     }
 
     init(from decoder: Decoder) throws {
@@ -1518,7 +1525,13 @@ struct VoiceProviderList: Codable, Sendable, Equatable {
         items = try c.decodeIfPresent([VoiceProvider].self, forKey: .items) ?? []
         selected = try c.decodeIfPresent(String.self, forKey: .selected)
         configVersion = try c.decodeIfPresent(Int.self, forKey: .configVersion) ?? 1
+        contactInstantAi = try c.decodeIfPresent(Bool.self, forKey: .contactInstantAi)
     }
+}
+
+/// S137 `PUT /ai/contact-instant-ai`; the response is a `VoiceProviderList`.
+struct ContactInstantAiBody: Encodable, Sendable {
+    let enabled: Bool
 }
 
 struct VoiceProviderBody: Codable, Sendable, Equatable {

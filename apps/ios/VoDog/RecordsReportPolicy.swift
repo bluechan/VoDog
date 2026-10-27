@@ -182,54 +182,53 @@ enum CallDurationLabel {
 enum RecordSearchPolicy {
     static let debounce: Duration = ContactLookupPolicy.debounce
     static let searchPrompt = "搜索姓名或号码"
-    /// `GET /calls` caps `limit` at 100; `GET /reports/calls` at 200.
-    static let callsLimit = 100
-    static let reportLimit = 200
-    /// `GET /blocklist/interceptions` caps `limit` at 100 too.
-    static let interceptionsLimit = 100
 
     static func trimmed(_ query: String) -> String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 「已加载：…」 only when it tells the user something the screen does not: an active search, a page after the
-    /// first, or a cached snapshot kept on screen while offline or after a failed refresh (S46). Web and Android
-    /// show no caption on the default first page.
-    static func showsSnapshotCaption(query: String, page: Int, stale: Bool) -> Bool {
-        stale || page > 1 || !trimmed(query).isEmpty
+    /// 「已加载：…」 only when it tells the user something the screen does not: an active search, or a cached
+    /// snapshot kept on screen while offline or after a failed refresh (S46). Web and Android show no caption
+    /// on the default list.
+    static func showsSnapshotCaption(query: String, stale: Bool) -> Bool {
+        stale || !trimmed(query).isEmpty
     }
 
-    /// S26: `page` is what switches the route into its paged form, so `limit` is dropped whenever one is sent —
-    /// the two would otherwise state two different window sizes for the same request. Without a `page` the
-    /// query is the S22 one plus `includeBlocked`, which is what a Control that predates paging still answers.
+    /// S133: 全部通话 walks the route's keyset path — `limit` rows from the top, or the rows older than `cursor`
+    /// (the last loaded row's `startedAt` exactly as the server sent it, plus its id). `page`/`pageSize` are
+    /// never sent here: the server answers 400 to `page` combined with `before`.
     /// S38: 全部通话要连拦截掉的来电一起显示，`/calls` 默认把 `failure_reason='number_blocked'` 的行藏起来，
-    /// 所以每一条列表请求（搜索、分页、按线路筛）都带上 `includeBlocked=true`。
-    static func callsQuery(
-        query: String, simId: String? = nil, page: Int? = nil, pageSize: Int? = nil
-    ) -> [URLQueryItem] {
-        var items: [URLQueryItem] = []
+    /// 所以每一条列表请求（搜索、下一批、按线路筛）都带上 `includeBlocked=true`。
+    static func callsQuery(query: String, simId: String? = nil, cursor: SMSPageCursor? = nil) -> [URLQueryItem] {
+        var items = [
+            URLQueryItem(name: "limit", value: String(CallsScrollPolicy.chunk)),
+            URLQueryItem(name: "includeBlocked", value: "true"),
+        ]
         let text = trimmed(query)
         if !text.isEmpty { items.append(URLQueryItem(name: "query", value: text)) }
         if let simId, !trimmed(simId).isEmpty {
             items.append(URLQueryItem(name: "simId", value: trimmed(simId)))
         }
-        items.append(URLQueryItem(name: "includeBlocked", value: "true"))
-        items.append(contentsOf: pageItems(page: page, pageSize: pageSize, limit: callsLimit))
+        if let cursor {
+            items += [
+                URLQueryItem(name: "before", value: cursor.before),
+                URLQueryItem(name: "beforeId", value: cursor.beforeId),
+            ]
+        }
         return items
     }
 
     /// `from`/`to` are owner-local calendar days and take precedence over the legacy `period` parameter, which
-    /// is no longer sent.
+    /// is no longer sent. S133: always one 50-row page — `page` 1 is the head.
     static func reportQuery(
-        from: String, to: String, timeZone: String, query: String,
-        page: Int? = nil, pageSize: Int? = nil, simId: String? = nil
+        from: String, to: String, timeZone: String, query: String, page: Int, simId: String? = nil
     ) -> [URLQueryItem] {
         var items = [
             URLQueryItem(name: "timeZone", value: timeZone),
             URLQueryItem(name: "from", value: from),
             URLQueryItem(name: "to", value: to),
         ]
-        items.append(contentsOf: pageItems(page: page, pageSize: pageSize, limit: reportLimit))
+        items.append(contentsOf: pageItems(page))
         let text = trimmed(query)
         if !text.isEmpty { items.append(URLQueryItem(name: "query", value: text)) }
         if let simId, !trimmed(simId).isEmpty {
@@ -238,20 +237,13 @@ enum RecordSearchPolicy {
         return items
     }
 
-    /// 拦截记录 has no search and no SIM filter — only the page. Without one it keeps the S21 `limit=100`.
-    static func interceptionsQuery(page: Int? = nil, pageSize: Int? = nil) -> [URLQueryItem] {
-        pageItems(page: page, pageSize: pageSize, limit: interceptionsLimit)
-    }
+    /// 拦截记录 has no search and no SIM filter — only the page.
+    static func interceptionsQuery(page: Int) -> [URLQueryItem] { pageItems(page) }
 
-    /// Either `page`+`pageSize` or the legacy `limit`, never both.
-    private static func pageItems(page: Int?, pageSize: Int?, limit: Int) -> [URLQueryItem] {
-        guard let page else { return [URLQueryItem(name: "limit", value: String(limit))] }
-        return [
-            URLQueryItem(name: "page", value: String(RecordsPagingPolicy.clampPage(page, totalPages: nil))),
-            URLQueryItem(
-                name: "pageSize",
-                value: String(RecordsPagingPolicy.normalizedPageSize(pageSize ?? RecordsPagingPolicy.defaultPageSize))
-            ),
+    private static func pageItems(_ page: Int) -> [URLQueryItem] {
+        [
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "pageSize", value: String(RecordsScrollPolicy.chunk)),
         ]
     }
 }

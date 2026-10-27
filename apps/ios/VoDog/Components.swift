@@ -230,6 +230,9 @@ struct SIMStrip: View {
             }.padding(.horizontal)
         }
         .accessibilityIdentifier("sim.strip")
+        // S133: the badge's -2 pt offset reaches above the scroll view, which would clip it flat. The padding
+        // stays outside: a scroll view touching the navigation bar switches the bar to its scrolled-under look.
+        .scrollClipDisabled()
         .scrollIndicators(.hidden).padding(.vertical, 4)
     }
 }
@@ -289,10 +292,13 @@ enum SIMStripDisplayPolicy {
 
 struct SIMIdentityDetail: View {
     let sim: SIMChannel
+    /// S138: the settings row appends 「 · 人工接听」 to the number line; other callers show the number alone.
+    var phoneSuffix: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(sim.phoneLabel ?? "号码尚未核实").font(.subheadline)
+            Text([sim.phoneLabel ?? "号码尚未核实", phoneSuffix].compactMap { $0 }.joined(separator: " · "))
+                .font(.subheadline)
             // S95b §C: the screen shows the gateway's name; the full id (S91: tells same-named gateways apart)
             // stays in the spoken label.
             Text("设备：\(simGatewayIdentity(sim, shortened: true))")
@@ -635,3 +641,34 @@ extension View {
             .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 18))
     }
 }
+
+#if DEBUG
+/// S133 preview: the SIM strip with unread badges, placed as on 电话 / 短信 (first child under the navigation bar).
+private struct SIMStripBadgePreviewHost: View {
+    @State private var selected: String? = "sim-1"
+    private let sims: [SIMChannel] = (1...3).compactMap { index in
+        let json = """
+        {"id":"sim-\(index)","label":"线路 \(index)","phoneLabel":"202555010\(index)","slotIndex":\(index - 1),\
+        "online":true,"telephonyReady":true,"mediaReady":true,"smsReady":true,"present":true}
+        """
+        return try? JSONDecoder().decode(SIMChannel.self, from: Data(json.utf8))
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                SIMStrip(sims: sims, selectedID: $selected, badges: ["sim-1": 3, "sim-2": 128, "sim-3": 12])
+                ScrollView { Color.clear.frame(height: 400) }
+            }
+            .background(Signal.bg)
+            .navigationTitle("电话")
+            .toolbarTitleDisplayMode(.inlineLarge)
+        }
+        .environment(UIAvailabilityState())
+    }
+}
+
+#Preview("SIM 条未读角标") {
+    SIMStripBadgePreviewHost()
+}
+#endif

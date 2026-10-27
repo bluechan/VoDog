@@ -41,6 +41,34 @@ enum SettingsPermissionPolicy {
     }
 }
 
+/// S138 决策 3: which status shape (● online / ○ offline / ◐ pending) and word each settings row shows.
+/// Shapes are decorative; the word always carries the meaning.
+enum SettingsStatusPolicy {
+    struct Status: Equatable {
+        let shape: LineStatus?
+        let word: String
+        /// What VoiceOver reads when the short word drops detail (离线 ← 号码设备离线).
+        let spoken: String
+    }
+
+    /// 在线 → ●; 待命中 and 离线 → hollow ○ (a parked gateway is not a fault).
+    static func gateway(_ item: GatewayPower) -> LineStatus { item.online ? .online : .offline }
+
+    /// 已就绪 once the server holds this install's registration; 暂不可用 after a failed sync; else 正在注册.
+    static func push(registered: Bool, failed: Bool) -> (shape: LineStatus, word: String) {
+        if registered { return (.online, "已就绪") }
+        if failed { return (.offline, "暂不可用") }
+        return (.pending, "正在注册")
+    }
+
+    /// The SIM row's trailing word: 在线 / 离线 / 待应用; network states (设备未联网 …) pass through unchanged.
+    static func simStatus(_ shape: LineStatus?, text: String, settingsPending: Bool) -> Status {
+        if settingsPending, shape == .online { return Status(shape: .pending, word: "待应用", spoken: "在线，待应用") }
+        if text == "号码设备离线" { return Status(shape: shape, word: "离线", spoken: text) }
+        return Status(shape: shape, word: text, spoken: text)
+    }
+}
+
 struct SettingsView: View {
     @Environment(SessionStore.self) private var session
     @Environment(UIAvailabilityState.self) private var availability
@@ -80,6 +108,8 @@ struct SettingsView: View {
     @State private var voiceProviderConflict: ProviderConflictState?
     @State private var voiceProviderConflictReloading = false
     @State private var voiceProviderBusy: String?
+    @State private var contactInstantAi: Bool?
+    @State private var contactInstantAiBusy = false
     @State private var voiceProviderLoadGeneration = 0
     @State private var settingsLoadGeneration = 0
     @State private var blockedNumbers: [BlocklistItem] = []
@@ -99,7 +129,7 @@ struct SettingsView: View {
     @AppStorage(BadgePreferences.smsKey) private var badgeSMS = true
 
     private var appearanceSection: some View {
-        Section("外观") {
+        Section {
             Picker("显示模式", selection: Binding(
                 get: { AppAppearance(storedValue: appearanceRawValue) },
                 set: { appearanceRawValue = $0.rawValue }
@@ -108,21 +138,29 @@ struct SettingsView: View {
                     Text(appearance.label).tag(appearance)
                 }
             }
-            .pickerStyle(.navigationLink)
+            .pickerStyle(.segmented)
+            .labelsHidden()
             .accessibilityIdentifier("settings.appearance")
+        } header: {
+            Text("外观")
+        } footer: {
+            Text("只保存在这台手机，离线也可以切换。")
         }
     }
 
     /// S67 decision 4: only the app-icon badge; in-app badges always show.
     private var badgeSection: some View {
         Section {
-            Toggle("App 图标角标", isOn: $badgeEnabled).accessibilityIdentifier("settings.badge.enabled")
-            Toggle("通话", isOn: $badgeCalls).disabled(!badgeEnabled).accessibilityIdentifier("settings.badge.calls")
-            Toggle("短信", isOn: $badgeSMS).disabled(!badgeEnabled).accessibilityIdentifier("settings.badge.sms")
+            Toggle(isOn: $badgeEnabled) { settingsToggleLabel("App 图标角标", detail: "关闭后图标不显示数字，应用内角标不受影响") }
+                .tint(Signal.call).accessibilityIdentifier("settings.badge.enabled")
+            Toggle(isOn: $badgeCalls) { settingsToggleLabel("通话", detail: "未接与 AI 代接的来电") }
+                .tint(Signal.call).disabled(!badgeEnabled).accessibilityIdentifier("settings.badge.calls")
+            Toggle(isOn: $badgeSMS) { settingsToggleLabel("短信", detail: "未读短信") }
+                .tint(Signal.call).disabled(!badgeEnabled).accessibilityIdentifier("settings.badge.sms")
         } header: {
-            Text("角标")
+            Text("通知与角标")
         } footer: {
-            Text("图标数字 = 待查看通话 + 未读短信。应用内的通话、短信与 SIM 角标始终显示。")
+            Text("图标数字 = 待查看通话 + 未读短信。")
         }
         .onChange(of: badgeEnabled) { _, on in
             badgePreferencesChanged()
@@ -140,6 +178,13 @@ struct SettingsView: View {
         .onChange(of: badgeSMS) { _, _ in badgePreferencesChanged() }
     }
 
+    private func settingsToggleLabel(_ title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(detail).font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
     private func badgePreferencesChanged() {
         BadgeStore.shared.applyIcon()
         Task { await PushRegistrationManager.shared.sync() }
@@ -155,18 +200,16 @@ struct SettingsView: View {
         NavigationStack {
             List {
                 Group {
+                // S138 决策 1: the same section order and names as Android.
                 appearanceSection
-                badgeSection
                 if availability.reason != nil { Section { NetworkAvailabilityNotice() } }
-                accountSection
-                simSection
                 voiceProviderSection
-                blocklistSection
-                passkeySection
+                simSection
                 gatewayPowerSection
+                privacySection
+                badgeSection
                 deviceConnectionSection
-                callNetworkSection
-                refreshSection
+                accountSection
                 logoutSection
                 loadErrorSection
                 }
@@ -271,7 +314,7 @@ struct SettingsView: View {
                 simRow(sim)
             }
         } header: {
-            Text("SIM 与接听模式")
+            Text("SIM 卡")
         } footer: {
             Text("显示名称和号码标注只用于辨认线路，不会更换 SIM 的稳定身份或中断通话。")
         }
@@ -281,28 +324,29 @@ struct SettingsView: View {
         NavigationLink {
             SIMSettingsView(sim: sim) { await load() }
         } label: {
-            // S95: line square + name, status shape + words, answer-mode summary; unconfirmed settings in warn.
+            // S138: swatch + name + AI badge | status shape + word; then 号码 · 人工接听, gateway, pending in warn.
+            let settingsPending = sim.settings.map { ($0.appliedVersion ?? -1) < $0.version } ?? false
+            let simStatus = availability.simStatus(sim)
+            let status = SettingsStatusPolicy.simStatus(
+                LineStatus(sim: sim, availability: availability), text: simStatus, settingsPending: settingsPending
+            )
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     SimSwatch(color: SIMPalette.color(for: sim, in: sims))
                     Text(simDisplayName(sim)).font(.body.weight(.semibold)).foregroundStyle(Signal.ink)
+                    // S95b §A: AI modes as the full badge; 人工接听 stays text on the number line.
+                    if let badge = AiBadge(sim: sim, full: true) { badge }
                     Spacer(minLength: 4)
-                    if let status = LineStatus(sim: sim, availability: availability) { SimStatusShape(status: status) }
-                    Text(availability.simStatus(sim)).font(.footnote).foregroundStyle(Signal.ink2)
-                }
-                // S95b §A: AI modes as the full badge (wraps under the name, never squeezes it); 人工接听 stays text.
-                if let badge = AiBadge(sim: sim, full: true) { badge } else {
-                    Text(modeTitle(sim.settings?.mode)).font(.subheadline).foregroundStyle(Signal.ink2)
-                }
-                if let settings = sim.settings, (settings.appliedVersion ?? -1) < settings.version {
-                    HStack(spacing: 6) {
-                        SimStatusShape(status: .pending)
-                        Text(SettingsApplyPolicy.subtitle(appliedVersion: settings.appliedVersion, version: settings.version))
-                    }
-                    .font(.footnote).foregroundStyle(Signal.warn)
+                    if let shape = status.shape { SimStatusShape(status: shape) }
+                    Text(status.word).font(.footnote)
+                        .foregroundStyle(status.shape == .pending ? Signal.warn : Signal.ink2)
+                        .accessibilityLabel(status.spoken)
                 }
                 // Same identity block the compose sheet shows, instead of a second phrasing of it.
-                SIMIdentityDetail(sim: sim)
+                SIMIdentityDetail(sim: sim, phoneSuffix: AiBadge(sim: sim) == nil ? modeTitle(sim.settings?.mode) : nil)
+                if settingsPending {
+                    Text("已保存，等待设备应用").font(.footnote).foregroundStyle(Signal.warn)
+                }
             }
         }
     }
@@ -312,17 +356,24 @@ struct SettingsView: View {
         return "SIM \((sim.slotIndex ?? 0) + 1)"
     }
 
-    private var blocklistSection: some View {
-        Section("已屏蔽号码") {
+    /// S138 决策 1: 已屏蔽号码 and 通行密钥 share one 隐私与安全 card.
+    private var privacySection: some View {
+        Section("隐私与安全") {
             NavigationLink {
                 InterceptionsView(blocklistOnly: true)
             } label: {
-                LabeledContent("管理已屏蔽号码") {
-                    if !blocklistLoaded {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text(BlocklistSummaryPolicy.summary(call: blockedNumbers.count, sms: blockedSMSNumbers.count))
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("已屏蔽号码")
+                        if !blocklistLoaded {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(BlocklistSummaryPolicy.summary(call: blockedNumbers.count, sms: blockedSMSNumbers.count))
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
+                } icon: {
+                    Image(systemName: "nosign").foregroundStyle(Signal.ink2)
                 }
             }
             .accessibilityIdentifier("settings.blocklist")
@@ -334,18 +385,15 @@ struct SettingsView: View {
                     blocklistRefreshError, identifier: "settings.blocklistError"
                 ) { await loadBlocklist() }
             }
-        }
-    }
-
-    private var passkeySection: some View {
-        Section("通行密钥") {
-            Text("使用系统通行密钥安全登录，无需输入密码。")
-                .font(.footnote).foregroundStyle(.secondary)
-            Button { Task { await registerPasskey() } } label: {
-                Label("添加通行密钥", systemImage: "person.badge.key")
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("通行密钥")
+                    Text("使用系统通行密钥安全登录，无需输入密码。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "key").foregroundStyle(Signal.ink2)
             }
-            .disabled(!availability.canMutate)
-            .accessibilityIdentifier("passkey.register")
             if !passkeysLoaded {
                 HStack(spacing: 8) { ProgressView(); Text("正在读取通行密钥…") }
                     .foregroundStyle(.secondary)
@@ -353,6 +401,11 @@ struct SettingsView: View {
                 Text("尚未添加通行密钥").foregroundStyle(.secondary)
             }
             ForEach(passkeys) { item in passkeyRow(item).disabled(!availability.canMutate) }
+            Button { Task { await registerPasskey() } } label: {
+                Label("添加通行密钥", systemImage: "plus")
+            }
+            .disabled(!availability.canMutate)
+            .accessibilityIdentifier("passkey.register")
             if let passkeyRefreshError {
                 settingsRefreshError(
                     passkeyRefreshError, identifier: "settings.passkeyRefreshError"
@@ -377,18 +430,18 @@ struct SettingsView: View {
     }
 
     private var deviceConnectionSection: some View {
-        Section("设备与连接") {
+        Section {
             if !permissionsLoaded {
                 HStack(spacing: 8) { ProgressView(); Text("正在读取系统权限…") }
                     .foregroundStyle(.secondary)
             }
-            LabeledContent("来电通知", value: SettingsPermissionPolicy.status(notificationPermission))
+            permissionRow("来电通知", state: notificationPermission)
                 .accessibilityIdentifier("settings.notificationPermission")
             if let action = SettingsPermissionPolicy.action(.notifications, state: notificationPermission) {
                 Button(action) { Task { await resolveNotificationPermission() } }
                     .accessibilityIdentifier("settings.notificationPermissionAction")
             }
-            LabeledContent("通话麦克风", value: SettingsPermissionPolicy.status(microphonePermission))
+            permissionRow("通话麦克风", state: microphonePermission)
                 .accessibilityIdentifier("settings.microphonePermission")
             if let action = SettingsPermissionPolicy.action(.microphone, state: microphonePermission) {
                 Button(action) { Task { await resolveMicrophonePermission() } }
@@ -399,48 +452,68 @@ struct SettingsView: View {
                     .accessibilityIdentifier("settings.permissionError")
                     .reportsError(permissionActionError, screen: "settings", site: "permission")
             }
-            Label(push.tokenStatus, systemImage: "bell.badge")
-                .accessibilityIdentifier("push-token-status")
-            Label(
-                "服务端推送注册：\(push.serverStatus)",
-                systemImage: push.serverRegistrationSucceeded ? "checkmark.icloud" : "icloud.slash"
-            )
-            .accessibilityIdentifier("push-server-status")
-            Text(push.lastIncomingStatus).font(.footnote).foregroundStyle(.secondary)
-                .accessibilityIdentifier("push-incoming-status")
-            Label("通话和短信状态以服务器记录为准。", systemImage: "arrow.triangle.2.circlepath")
-                .foregroundStyle(.secondary)
-            Text("号码设备离线时，请在对应网关设备上重新开启 VoDog。").font(.footnote)
-        }
-    }
-
-    private var callNetworkSection: some View {
-        Section("通话网络") {
-            LabeledContent("连接策略", value: "自动")
-            Text("本机优先使用标准连接；受限网络下会自动改用兼容连接。")
+            // S138: push token + server registration fold into one row; the detailed lines stay underneath.
+            VStack(alignment: .leading, spacing: 4) {
+                let pushStatus = SettingsStatusPolicy.push(
+                    registered: push.serverRegistrationSucceeded, failed: push.lastSyncError != nil
+                )
+                LabeledContent("后台来电推送") { statusValue(pushStatus.shape, pushStatus.word) }
+                Group {
+                    Label(push.tokenStatus, systemImage: "bell.badge")
+                        .accessibilityIdentifier("push-token-status")
+                    Label(
+                        "服务端推送注册：\(push.serverStatus)",
+                        systemImage: push.serverRegistrationSucceeded ? "checkmark.icloud" : "icloud.slash"
+                    )
+                    .accessibilityIdentifier("push-server-status")
+                    Text(push.lastIncomingStatus)
+                        .accessibilityIdentifier("push-incoming-status")
+                }
                 .font(.footnote).foregroundStyle(.secondary)
-                .accessibilityIdentifier("settings.callNetworkPolicy")
-        }
-    }
-
-    private var refreshSection: some View {
-        Section {
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                LabeledContent("通话网络", value: "自动")
+                Text("标准连接失败后自动改用兼容连接")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("settings.callNetworkPolicy")
+            }
             Button {
                 Task { await refreshApplicationStatus() }
             } label: {
                 HStack(spacing: 8) {
                     if refreshingApplicationStatus { ProgressView().controlSize(.small) }
-                    Label("刷新应用状态", systemImage: "arrow.clockwise")
+                    Text("刷新应用状态")
                 }
             }
             .disabled(refreshingApplicationStatus)
             .accessibilityIdentifier("settings.refreshAll")
+        } header: {
+            Text("设备与连接")
+        } footer: {
+            Text("通话和短信状态以服务器记录为准。号码设备离线时，请在对应网关设备上重新开启。")
+        }
+    }
+
+    /// 已允许 carries the ● shape; every other state keeps its plain words (the action button follows).
+    private func permissionRow(_ title: String, state: SettingsPermissionState) -> some View {
+        LabeledContent(title) {
+            statusValue(state == .allowed ? .online : nil, SettingsPermissionPolicy.status(state))
+        }
+    }
+
+    /// Shape + word; the shape is decorative (accessibility-hidden), the word carries the meaning.
+    private func statusValue(_ shape: LineStatus?, _ word: String) -> some View {
+        HStack(spacing: 6) {
+            if let shape { SimStatusShape(status: shape) }
+            Text(word)
         }
     }
 
     private var logoutSection: some View {
         Section {
-            Button("退出登录", role: .destructive) { Task { await session.logout() } }
+            Button(role: .destructive) { Task { await session.logout() } } label: {
+                Text("退出登录").frame(maxWidth: .infinity)
+            }
         }
     }
 
@@ -502,9 +575,31 @@ struct SettingsView: View {
                         .reportsError(voiceProviderRefreshError, screen: "settings", site: "voice_provider_refresh")
                 }
             } header: {
-                Text("AI 语音服务")
+                Text("AI 代接")
             } footer: {
                 Text(VoiceProviderPolicy.footerText)
+            }
+            // S138: the S137 switch is its own card under the provider list.
+            if let contactInstantAi {
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: Binding(
+                            get: { contactInstantAi },
+                            set: { desired in Task { await setContactInstantAi(desired) } }
+                        )) {
+                            HStack(spacing: 8) {
+                                Text("通讯录用户启用AI即接")
+                                if contactInstantAiBusy { ProgressView() }
+                            }
+                        }
+                        .disabled(!availability.canMutate || voiceProviderBusy != nil || contactInstantAiBusy)
+                        .frame(minHeight: 44)
+                        .tint(Signal.call)
+                        .accessibilityIdentifier("voiceProvider.contactInstantAi")
+                        Text("关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
             }
         }
     }
@@ -518,9 +613,9 @@ struct SettingsView: View {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(VoiceProviderPolicy.displayLabel(item))
-                    Label(VoiceProviderPolicy.statusTitle(item), systemImage: VoiceProviderPolicy.statusSymbol(item))
+                    statusValue(reason == nil ? .online : .pending, VoiceProviderPolicy.statusTitle(item))
                         .font(.caption)
-                        .foregroundStyle(reason == nil ? Signal.call : Signal.warn)
+                        .foregroundStyle(reason == nil ? Signal.ink2 : Signal.warn)
                     // The reason a row cannot be chosen is the row's own subtitle, not a banner somewhere else.
                     if let reason { Text(reason).font(.caption2).foregroundStyle(.secondary) }
                 }
@@ -537,7 +632,8 @@ struct SettingsView: View {
         // Plain, so the row reads like the rest of 设置 instead of a tinted action.
         .buttonStyle(.plain)
         // One request at a time: two quick taps would otherwise race and leave the wrong 勾.
-        .disabled(!availability.canMutate || reason != nil || voiceProviderBusy != nil || voiceProviderConflict != nil)
+        .disabled(!availability.canMutate || reason != nil || voiceProviderBusy != nil || contactInstantAiBusy
+                  || voiceProviderConflict != nil)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier("voiceProvider.row")
     }
@@ -560,6 +656,8 @@ struct SettingsView: View {
             voiceProviders = response.items
             voiceProviderSelected = response.selected
             voiceProviderConfigVersion = response.configVersion
+            // A load racing the S137 PUT must not undo its optimistic flip; the PUT response settles it.
+            if !contactInstantAiBusy { contactInstantAi = response.contactInstantAi }
             voiceProviderUnavailable = false
             voiceProviderRefreshError = nil
             if acceptingConflict { voiceProviderConflict = nil }
@@ -572,6 +670,7 @@ struct SettingsView: View {
                   session.sessionIdentity == identity, voiceProviderBusy == nil else { return false }
             if case APIError.server(404, _, _) = error {
                 voiceProviders = []
+                contactInstantAi = nil
                 voiceProviderUnavailable = true
                 voiceProviderRefreshError = nil
             } else {
@@ -605,6 +704,7 @@ struct SettingsView: View {
             voiceProviders = response.items
             voiceProviderSelected = response.selected
             voiceProviderConfigVersion = response.configVersion
+            if !contactInstantAiBusy { contactInstantAi = response.contactInstantAi }
             voiceProviderOperationError = nil
         } catch SessionLifecycleError.staleSession {
             return
@@ -624,6 +724,35 @@ struct SettingsView: View {
         }
     }
 
+    /// S137: the switch flips immediately and snaps back to the server value on any failure.
+    func setContactInstantAi(_ enabled: Bool) async {
+        guard availability.canMutate, voiceProviderBusy == nil, !contactInstantAiBusy,
+              let previous = contactInstantAi, previous != enabled,
+              let identity = session.sessionIdentity else { return }
+        voiceProviderLoadGeneration += 1
+        contactInstantAiBusy = true
+        voiceProviderOperationError = nil
+        contactInstantAi = enabled
+        defer { if session.isCurrentSession(identity) { contactInstantAiBusy = false } }
+        do {
+            let response: VoiceProviderList = try await session.request(
+                "ai/contact-instant-ai", method: "PUT", body: ContactInstantAiBody(enabled: enabled),
+                timeoutInterval: 15, requiredSessionIdentity: identity
+            )
+            guard session.isCurrentSession(identity) else { return }
+            voiceProviders = response.items
+            voiceProviderSelected = response.selected
+            voiceProviderConfigVersion = response.configVersion
+            contactInstantAi = response.contactInstantAi
+        } catch SessionLifecycleError.staleSession {
+            return
+        } catch {
+            guard session.isCurrentSession(identity) else { return }
+            contactInstantAi = previous
+            voiceProviderOperationError = VoiceProviderPolicy.message(for: error)
+        }
+    }
+
     /// Polling may already have observed a newer server selection, but it cannot silently turn a stale write into
     /// a retry. This explicit read is the acknowledgement boundary that advances the version the next tap uses.
     private func acknowledgeProviderConflict() async {
@@ -633,44 +762,59 @@ struct SettingsView: View {
         await loadVoiceProviders(acceptingConflict: true)
     }
 
+    /// S138: one card per gateway; the section header rides on the first card and the footer on the last.
     @ViewBuilder private var gatewayPowerSection: some View {
         if !powerUnavailable {
-            Section {
-                if !gatewaysLoaded {
-                    HStack(spacing: 8) { ProgressView(); Text("正在读取网关状态…").foregroundStyle(.secondary) }
-                } else if gateways.isEmpty, powerError == nil {
-                    Text("没有可管理的网关").foregroundStyle(.secondary)
+            if !gatewaysLoaded || gateways.isEmpty {
+                Section {
+                    if !gatewaysLoaded {
+                        HStack(spacing: 8) { ProgressView(); Text("正在读取网关状态…").foregroundStyle(.secondary) }
+                    } else if powerError == nil {
+                        Text("没有可管理的网关").foregroundStyle(.secondary)
+                    }
+                    gatewayPowerError
+                } header: {
+                    Text("网关设备")
+                } footer: {
+                    Text(Self.gatewayPowerFooter)
                 }
-                ForEach(gateways) { gatewayPowerRow($0) }
-                if let powerError {
-                    Text(powerError).font(.footnote).foregroundStyle(Color.callerDanger)
-                        .accessibilityIdentifier("gatewayPower.error")
-                        .reportsError(powerError, screen: "settings", site: "gateway_power")
+            } else {
+                ForEach(Array(gateways.enumerated()), id: \.element.id) { index, item in
+                    let last = index == gateways.count - 1
+                    Section {
+                        gatewayPowerRow(item)
+                        if last { gatewayPowerError }
+                    } header: {
+                        if index == 0 { Text("网关设备") }
+                    } footer: {
+                        if last { Text(Self.gatewayPowerFooter) }
+                    }
                 }
-            } header: {
-                Text("网关设备")
-            } footer: {
-                Text("远程开启需要先在网关设备上打开「允许远程开启（待命）」。通话进行中不会被远程关闭。")
             }
         }
     }
 
-    /// §D: name, 状态, whether the phone allows remote power, and the 网关总控 switch. The switch is disabled
-    /// with the reason spelled out whenever the server would refuse, so the user is never told "失败" for a
-    /// condition that was already visible.
+    private static let gatewayPowerFooter = "远程开启需要先在网关设备上打开「允许远程开启（待命）」。通话进行中不会被远程关闭。"
+
+    @ViewBuilder private var gatewayPowerError: some View {
+        if let powerError {
+            Text(powerError).font(.footnote).foregroundStyle(Color.callerDanger)
+                .accessibilityIdentifier("gatewayPower.error")
+                .reportsError(powerError, screen: "settings", site: "gateway_power")
+        }
+    }
+
+    /// §D: name + status shape, then the 网关总控 switch with whether the phone allows remote power, heartbeat and
+    /// the reason the switch is disabled, so the user is never told "失败" for a condition that was already visible.
     @ViewBuilder private func gatewayPowerRow(_ item: GatewayPower) -> some View {
         let disabledReason = GatewayPowerPolicy.toggleDisabledReason(item)
-        VStack(alignment: .leading, spacing: 6) {
+        HStack(spacing: 8) {
             Text(GatewayPowerPolicy.displayName(item)).font(.body.weight(.semibold))
-            Label(GatewayPowerPolicy.statusTitle(item), systemImage: GatewayPowerPolicy.statusSymbol(item))
-                .font(.caption)
-                .foregroundStyle(item.online || item.standbyOnline ? Color.secondary : Color.callerDanger)
-            Text(GatewayPowerPolicy.remotePowerTitle(item))
-                .font(.caption)
-                .foregroundStyle(item.remotePowerAllowed ? Color.secondary : Signal.warn)
-            Text(GatewayPowerPolicy.heartbeatTitle(item) { displayDate($0) })
-                .font(.caption2).foregroundStyle(.secondary)
-                .accessibilityIdentifier("gatewayPower.heartbeat")
+            Spacer(minLength: 4)
+            statusValue(SettingsStatusPolicy.gateway(item), GatewayPowerPolicy.statusTitle(item))
+                .font(.footnote).foregroundStyle(Signal.ink2)
+        }
+        VStack(alignment: .leading, spacing: 4) {
             Toggle(isOn: Binding(
                 get: { GatewayPowerPolicy.isOn(item) },
                 set: { desired in
@@ -683,14 +827,19 @@ struct SettingsView: View {
             )) {
                 HStack(spacing: 8) {
                     Text("网关总控")
-                        .foregroundStyle(GatewayPowerPolicy.isOn(item) ? Color.callerDanger : Color.primary)
                     if powerBusy.contains(item.gatewayId) { ProgressView() }
                 }
             }
             .disabled(!availability.canChangeGatewayPower(item) || powerBusy.contains(item.gatewayId))
             .frame(minHeight: 44)
-            .tint(Color.callerDanger)
+            .tint(Signal.call)
             .accessibilityIdentifier("gatewayPower.toggle")
+            Text(GatewayPowerPolicy.remotePowerTitle(item))
+                .font(.caption)
+                .foregroundStyle(item.remotePowerAllowed ? Color.secondary : Signal.warn)
+            Text(GatewayPowerPolicy.heartbeatTitle(item) { displayDate($0) })
+                .font(.caption2).foregroundStyle(.secondary)
+                .accessibilityIdentifier("gatewayPower.heartbeat")
             if let disabledReason {
                 Text(disabledReason).font(.caption2).foregroundStyle(.secondary)
             }
@@ -951,6 +1100,8 @@ struct SettingsView: View {
         voiceProviderConflict = nil
         voiceProviderConflictReloading = false
         voiceProviderBusy = nil
+        contactInstantAi = nil
+        contactInstantAiBusy = false
         passkeys = []
         passkeysLoaded = false
         passkeyRefreshError = nil
@@ -1214,8 +1365,18 @@ struct SIMSettingsView: View {
                 )
                 .frame(minHeight: 44)
                 if notesDraftIsDirty {
-                    Text("未保存设置").font(.caption).foregroundStyle(Color.callerDanger)
-                        .accessibilityIdentifier("simSettings.notesUnsaved")
+                    HStack {
+                        Text("未保存设置").font(.caption).foregroundStyle(Color.callerDanger)
+                            .accessibilityIdentifier("simSettings.notesUnsaved")
+                        Spacer()
+                        Button("放弃修改") {
+                            labelText = notesBaseLabel
+                            phoneLabelText = notesBasePhoneLabel
+                        }
+                        .font(.caption).buttonStyle(.borderless)
+                        .disabled(controlsBusy)
+                        .accessibilityIdentifier("simSettings.notesDiscard")
+                    }
                 }
                 if notesConflict {
                     Label(SIMDraftConcurrencyPolicy.notesConflictMessage, systemImage: "arrow.triangle.2.circlepath")
@@ -1232,17 +1393,30 @@ struct SIMSettingsView: View {
             } footer: {
                 Text("仅修改显示名称，不会更换 SIM 身份或中断通话。")
             }
-            Section {
-                Picker("模式", selection: $mode) {
-                    ForEach(ReceptionMode.allCases) { candidate in
-                        Text(candidate.title).tag(candidate).disabled(settings?.isAvailable(candidate) != true)
+            if settingsDraftIsDirty {
+                Section {
+                    HStack {
+                        Text("未保存设置").font(.caption).foregroundStyle(Color.callerDanger)
+                            .accessibilityIdentifier("simSettings.modeUnsaved")
+                        Spacer()
+                        // S138 决策 6: back to the values 草稿基于版本 was read with; local only, a conflict stays.
+                        Button("放弃修改") {
+                            mode = ReceptionMode(rawValue: settingsBaseMode) ?? .normal
+                            timeout = Double(settingsBaseTimeout)
+                        }
+                        .font(.caption).buttonStyle(.borderless)
+                        .disabled(controlsBusy)
+                        .accessibilityIdentifier("settings.sim.discard")
                     }
                 }
-                .disabled(!availability.canMutate || controlsBusy)
-                if let reason = settings?.aiUnavailableReason, !reason.isEmpty {
+            }
+            Section {
+                ForEach([ReceptionMode.normal, .timeoutAI, .ai]) { modeCard($0) }
+                if settings?.aiUnavailableReason?.isEmpty == false,
+                   settings?.isAvailable(.ai) == true, settings?.isAvailable(.timeoutAI) == true,
+                   let reason = settings?.aiUnavailableReason {
+                    // Every AI card is usable, so no card carries the server's note; keep it visible here.
                     Label(reason, systemImage: "info.circle").font(.footnote).foregroundStyle(.secondary)
-                } else if settings?.isAvailable(.ai) != true || settings?.isAvailable(.timeoutAI) != true {
-                    Label("当前号码暂不支持 AI 接听模式。", systemImage: "info.circle").font(.footnote).foregroundStyle(.secondary)
                 }
                 if settingsConflict {
                     Label(SIMDraftConcurrencyPolicy.settingsConflictMessage, systemImage: "arrow.triangle.2.circlepath")
@@ -1254,18 +1428,10 @@ struct SIMSettingsView: View {
                     .disabled(!availability.canMutate || controlsBusy)
                     .accessibilityIdentifier("simSettings.reloadSettingsConflict")
                 }
-            } header: { Text("接听模式") }
-            if mode == .timeoutAI {
-                Section("超时") {
-                    Slider(value: $timeout, in: 10...120, step: 5).disabled(!availability.canMutate || controlsBusy)
-                    LabeledContent("等待时间", value: "\(Int(timeout)) 秒")
-                }
-            }
-            if settingsDraftIsDirty {
-                Section {
-                    Text("未保存设置").font(.caption).foregroundStyle(Color.callerDanger)
-                        .accessibilityIdentifier("simSettings.modeUnsaved")
-                }
+            } header: {
+                Text("接听方式")
+            } footer: {
+                Text("三种方式是同一项设置；保存后由网关设备确认应用才生效。")
             }
             Section("应用状态") {
                 if showsCachedSettings {
@@ -1320,6 +1486,65 @@ struct SIMSettingsView: View {
         .onDisappear { applyTask?.cancel(); applyTask = nil }
     }
 
+    /// S138 决策 5: one selectable card per mode — still the one `mode` + `timeoutSeconds` draft and save button.
+    /// The slider lives outside the select button so drags reach it.
+    @ViewBuilder private func modeCard(_ candidate: ReceptionMode) -> some View {
+        let selected = mode == candidate
+        let available = settings?.isAvailable(candidate) == true
+        let (title, detail): (String, String) = switch candidate {
+        case .normal: ("我自己接", "来电在你的设备上响铃，由你接听。")
+        case .timeoutAI: ("先响铃，无人接听再交给 AI", "等待 \(Int(timeout)) 秒无人接听，由 AI 代接。")
+        case .ai: ("AI 立即代接", "来电立即由 AI 接听。")
+        }
+        let unavailableReason: String? = available || candidate == .normal ? nil
+            : (settings?.aiUnavailableReason.flatMap { $0.isEmpty ? nil : $0 } ?? "当前号码暂不支持 AI 接听模式。")
+        VStack(alignment: .leading, spacing: 12) {
+            Button { mode = candidate } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3).foregroundStyle(selected ? Signal.brand : Signal.ink3)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title).font(.body.weight(.semibold)).foregroundStyle(Signal.ink)
+                        Text(detail).font(.footnote).foregroundStyle(Signal.ink2)
+                        if let unavailableReason {
+                            Label(unavailableReason, systemImage: "info.circle")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!availability.canMutate || controlsBusy || !available)
+            .accessibilityLabel([title, detail, unavailableReason].compactMap { $0 }.joined(separator: "，"))
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .accessibilityIdentifier("settings.sim.mode.\(candidate.rawValue)")
+            if selected, candidate == .timeoutAI {
+                Divider()
+                LabeledContent("等待时间") {
+                    Text("\(Int(timeout)) 秒").font(.body.weight(.semibold)).foregroundStyle(Signal.brand)
+                }
+                Slider(value: $timeout, in: 10...120, step: 5).disabled(!availability.canMutate || controlsBusy)
+                HStack {
+                    Text("10 秒"); Spacer(); Text("步长 5 秒"); Spacer(); Text("120 秒")
+                }
+                .font(.caption2).foregroundStyle(Signal.ink3).accessibilityHidden(true)
+            }
+        }
+        .padding(14)
+        .opacity(available ? 1 : 0.5)
+        .background(selected ? Signal.brandSoft : Signal.surface, in: RoundedRectangle(cornerRadius: Signal.Radius.card))
+        .overlay {
+            if selected {
+                RoundedRectangle(cornerRadius: Signal.Radius.card).strokeBorder(Signal.brand, lineWidth: 1.5)
+            }
+        }
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+        .listRowSeparator(.hidden)
+    }
+
     /// 正在应用中… while the gateway has not answered yet, 应用成功 the moment it confirms this exact version,
     /// and the original orange sentence once the window closes without an ack.
     @ViewBuilder private var applyStatusLine: some View {
@@ -1334,9 +1559,14 @@ struct SIMSettingsView: View {
             }
             .accessibilityIdentifier("simSettings.applyStatus")
         case .success:
-            Label(status.text, systemImage: "checkmark.circle.fill")
-                .font(.footnote).foregroundStyle(Signal.call)
-                .accessibilityIdentifier("simSettings.applyStatus")
+            // S138 决策 3: ● + 应用成功; the shape is decorative, the word carries the meaning.
+            HStack(spacing: 6) {
+                SimStatusShape(status: .online)
+                Text(status.text)
+            }
+            .font(.footnote).foregroundStyle(Signal.call)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("simSettings.applyStatus")
         case .warning:
             Text(status.text).font(.footnote).foregroundStyle(Signal.warn)
                 .accessibilityIdentifier("simSettings.applyStatus")
