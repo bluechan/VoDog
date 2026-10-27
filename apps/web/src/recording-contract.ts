@@ -1,6 +1,6 @@
 export type RecordingSource = 'media_node' | 'pixel';
-/** S94b：手机直拨或本机接入的通话，默认打开设备原始归档；本机接入时服务器录音不含机主声音。 */
-export const preferPixelSource=(c:{originatingPlatform?:string|null;ownerJoinedLocal?:boolean})=>c.originatingPlatform==='pixel'||c.ownerJoinedLocal===true;
+/** S94b：手机直拨或本机接入的通话，默认打开设备原始归档；本机接入时服务器录音不含机主声音。S134b：网关本机接听的来电同样只有设备归档。 */
+export const preferPixelSource=(c:{originatingPlatform?:string|null;ownerJoinedLocal?:boolean;answeredByPlatform?:string|null})=>c.originatingPlatform==='pixel'||c.ownerJoinedLocal===true||c.answeredByPlatform==='device';
 export const serverRecordingLabel=(ownerJoinedLocal?:boolean)=>ownerJoinedLocal?'服务器录音（不含本机接入）':'服务器录音';
 export type OriginalRecordingTrack = 'remote_original' | 'caller_original';
 export type DerivedRecordingTrack = 'caller_playout';

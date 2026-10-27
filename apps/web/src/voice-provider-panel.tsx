@@ -1,6 +1,8 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {useReportedError} from './ui-error';
 import {
+  CONTACT_INSTANT_AI_HINT,
+  CONTACT_INSTANT_AI_TITLE,
   VOICE_PROVIDER_FOOTER,
   voiceProviderDisabledReason,
   voiceProviderErrorMessage,
@@ -32,6 +34,9 @@ function errorStatus(error: unknown): number {
   return typeof status === 'number' ? status : 0;
 }
 
+/** Sentinel `pending` value for the S137 toggle; provider ids never start with a space. */
+const CONTACT_INSTANT_AI_PENDING = ' contact-instant-ai';
+
 export function VoiceProviderPanel({
   busy,
   run,
@@ -50,6 +55,7 @@ export function VoiceProviderPanel({
   const [configVersion, setConfigVersion] = useState(1);
   const [error, setError] = useState('');
   const [unsupported, setUnsupported] = useState(false);
+  const [contactInstantAi, setContactInstantAi] = useState<boolean | null>(null);
   const [pending, setPending] = useState('');
   const [operationConflict, setOperationConflict] = useState<{attempted: string} | null>(null);
   useReportedError('设置', 'voice-provider.load', error);
@@ -62,6 +68,13 @@ export function VoiceProviderPanel({
   const mounted = useRef(true);
   requestRef.current = request;
 
+  function apply(list: ReturnType<typeof voiceProviderList>) {
+    setItems(list.items);
+    setSelected(list.selected);
+    setConfigVersion(list.configVersion);
+    setContactInstantAi(list.contactInstantAi);
+  }
+
   function load():Promise<boolean> {
     if (!mounted.current || pendingRef.current) return Promise.resolve(false);
     if (readInFlight.current) return readInFlight.current;
@@ -71,10 +84,7 @@ export function VoiceProviderPanel({
       try {
         const result = await scopedRequest<VoiceProviderListDto>('/ai/voice-providers');
         if (!mounted.current || captured !== readEpoch.current) return false;
-        const list = voiceProviderList(result);
-        setItems(list.items);
-        setSelected(list.selected);
-        setConfigVersion(list.configVersion);
+        apply(voiceProviderList(result));
         setUnsupported(false);
         setError('');
         return true;
@@ -140,10 +150,7 @@ export function VoiceProviderPanel({
           'PUT',
         );
         if (!mounted.current || captured !== mutationEpoch.current) return;
-        const list = voiceProviderList(result);
-        setItems(list.items);
-        setSelected(list.selected);
-        setConfigVersion(list.configVersion);
+        apply(voiceProviderList(result));
       } catch (caught) {
         if (!mounted.current || captured !== mutationEpoch.current) return;
         const code = errorCode(caught);
@@ -156,6 +163,35 @@ export function VoiceProviderPanel({
           setSelected(previous);
           setError(voiceProviderErrorMessage(code, caught instanceof Error ? caught.message : ''));
         }
+      } finally {
+        if (mounted.current && captured === mutationEpoch.current) {
+          pendingRef.current = false;
+          setPending('');
+        }
+      }
+    });
+  }
+
+  /** S137: same single-flight discipline as `choose` — optimistic flip inside `run`, server value wins, revert on failure. */
+  function toggleContactInstantAi() {
+    if (pending || contactInstantAi === null) return;
+    const previous = contactInstantAi;
+    setError('');
+    void run(async () => {
+      const captured = ++mutationEpoch.current;
+      readEpoch.current++;
+      readInFlight.current = null;
+      setPending(CONTACT_INSTANT_AI_PENDING);
+      pendingRef.current = true;
+      setContactInstantAi(!previous);
+      try {
+        const result = await requestRef.current<VoiceProviderListDto>('/ai/contact-instant-ai', {enabled: !previous}, 'PUT');
+        if (!mounted.current || captured !== mutationEpoch.current) return;
+        apply(voiceProviderList(result));
+      } catch (caught) {
+        if (!mounted.current || captured !== mutationEpoch.current) return;
+        setContactInstantAi(previous);
+        setError(caught instanceof Error && caught.message ? caught.message : '修改通讯录 AI 即接失败，请稍后重试。');
       } finally {
         if (mounted.current && captured === mutationEpoch.current) {
           pendingRef.current = false;
@@ -224,6 +260,21 @@ export function VoiceProviderPanel({
         </fieldset>
       )}
       <p className="note">{VOICE_PROVIDER_FOOTER}</p>
+      {contactInstantAi !== null && (
+        <div className="gw-power">
+          <div><b>{CONTACT_INSTANT_AI_TITLE}</b><small id="contact-instant-ai-hint">{CONTACT_INSTANT_AI_HINT}</small></div>
+          <button
+            type="button"
+            className="gw-switch"
+            role="switch"
+            aria-checked={contactInstantAi}
+            aria-label={CONTACT_INSTANT_AI_TITLE}
+            aria-describedby="contact-instant-ai-hint"
+            disabled={busy || Boolean(pending)}
+            onClick={toggleContactInstantAi}
+          />
+        </div>
+      )}
     </>
   );
 }
