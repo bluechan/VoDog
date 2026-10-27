@@ -3,50 +3,18 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// S139 设置: the eight S138 panes, each built from the existing cards.
 struct VoDogSettingsView: View {
-    private enum Category: String, CaseIterable {
-        case general = "通用"
-        case communications = "蜂窝与通信"
-        case permissions = "通知与权限"
-
-        var title: String { L10n.tr(rawValue) }
-
-        var systemImage: String {
-            switch self {
-            case .general: return "gearshape"
-            case .communications: return "antenna.radiowaves.left.and.right"
-            case .permissions: return "bell.badge"
-            }
-        }
-
-        var detail: String {
-            switch self {
-            case .general: return L10n.tr("启动、外观与菜单栏行为")
-            case .communications: return L10n.tr("查看模块状态并管理通话与短信处理")
-            case .permissions: return L10n.tr("检查 VoDog 的系统访问权限")
-            }
-        }
-
-        var sidebarDetail: String {
-            switch self {
-            case .general: return L10n.tr("外观、语言与启动")
-            case .communications: return L10n.tr("声音、通话与短信")
-            case .permissions: return L10n.tr("通知与系统访问权限")
-            }
-        }
-    }
-
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var contacts = SystemContactStore.shared
     @ObservedObject private var alertSounds = AlertSoundService.shared
     @ObservedObject private var languageController = AppLanguageController.shared
     @Binding private var sidebarWidth: CGFloat
+    @Binding private var pane: SettingsPane
     private let focusFirstItemRequest: Bool
     private let didHandleFocusFirstItemRequest: () -> Void
     @AppStorage(AppAppearanceMode.defaultsKey) private var appearanceModeRawValue =
         AppAppearanceMode.system.rawValue
-    @State private var selectedCategory: Category = .general
-    @State private var didResolveInitialCategory = false
     @State private var isConfirmingVerificationAutoDelete = false
     @State private var soundImportError: String?
     @State private var microphoneAuthorizationStatus =
@@ -55,10 +23,12 @@ struct VoDogSettingsView: View {
 
     init(
         sidebarWidth: Binding<CGFloat> = .constant(CommunicationUI.sidebarWidth),
+        pane: Binding<SettingsPane>,
         focusFirstItemRequest: Bool = false,
         didHandleFocusFirstItemRequest: @escaping () -> Void = {}
     ) {
         _sidebarWidth = sidebarWidth
+        _pane = pane
         self.focusFirstItemRequest = focusFirstItemRequest
         self.didHandleFocusFirstItemRequest = didHandleFocusFirstItemRequest
     }
@@ -67,7 +37,10 @@ struct VoDogSettingsView: View {
         ResizableCommunicationSplit(sidebarWidth: $sidebarWidth) {
             settingsSidebar
         } detail: {
-            settingsContent
+            SettingsDetailHost(account: appState.voDog, pane: pane) {
+                settingsHeader
+                settingsCards
+            }
         }
         .frame(
             minWidth: 560,
@@ -76,9 +49,9 @@ struct VoDogSettingsView: View {
         )
         .onAppear {
             refreshSettingsState()
-            resolveInitialSettingsCategoryIfNeeded()
             handleFocusFirstItemRequest()
         }
+        .onChange(of: pane) { _, current in refreshState(for: current) }
         .onChange(of: focusFirstItemRequest) { _, requested in
             if requested { handleFocusFirstItemRequest() }
         }
@@ -111,19 +84,16 @@ struct VoDogSettingsView: View {
     private var settingsSidebar: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 12) {
                     Text(L10n.tr("设置"))
                         .font(.title2.bold())
                         .padding(.horizontal, 14)
 
-                    settingsSidebarGroup(
-                        L10n.tr("偏好设置"),
-                        categories: [.general, .communications]
-                    )
-                    settingsSidebarGroup(
-                        L10n.tr("系统"),
-                        categories: [.permissions]
-                    )
+                    VStack(spacing: 2) {
+                        ForEach(SettingsPane.allCases) { item in
+                            settingsSidebarRow(item)
+                        }
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 16)
@@ -143,41 +113,23 @@ struct VoDogSettingsView: View {
         .communicationSidebarColumnStyle()
     }
 
-    private func settingsSidebarGroup(
-        _ title: String,
-        categories: [Category]
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(title)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-
-            VStack(spacing: 2) {
-                ForEach(categories, id: \.self) { category in
-                    settingsSidebarRow(category)
-                }
-            }
-        }
-    }
-
-    private func settingsSidebarRow(_ category: Category) -> some View {
-        let isSelected = selectedCategory == category
+    private func settingsSidebarRow(_ item: SettingsPane) -> some View {
+        let isSelected = pane == item
 
         return Button {
-            selectSettingsCategory(category)
+            pane = item
         } label: {
             HStack(spacing: 11) {
-                Image(systemName: category.systemImage)
+                Image(systemName: item.systemImage)
                     .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                     .frame(width: 24)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(category.title)
+                    Text(item.title)
                         .font(.body.weight(isSelected ? .semibold : .regular))
                         .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
-                    Text(category.sidebarDetail)
+                    Text(item.detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -185,9 +137,10 @@ struct VoDogSettingsView: View {
 
                 Spacer(minLength: 4)
 
-                if category == .permissions, allSettingsPermissionsAllowed {
+                if item == .device, allSettingsPermissionsAllowed {
                     Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(Signal.call)
+                        .accessibilityLabel(L10n.tr("已允许"))
                 }
 
                 Image(systemName: "chevron.right")
@@ -195,7 +148,7 @@ struct VoDogSettingsView: View {
                     .foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 12)
-            .frame(minHeight: 58)
+            .frame(minHeight: 52)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -209,22 +162,20 @@ struct VoDogSettingsView: View {
                     }
             }
         }
+        .accessibilityLabel(item.title)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    private func selectSettingsCategory(_ category: Category) {
-        didResolveInitialCategory = true
-        selectedCategory = category
-        if category == .communications {
-            appState.refresh()
-        } else if category == .permissions {
-            refreshSystemPermissionState()
+    private func refreshState(for item: SettingsPane) {
+        switch item {
+        case .gateways: appState.refresh()
+        case .notifications, .device: refreshSystemPermissionState()
+        default: break
         }
     }
 
     private func handleFocusFirstItemRequest() {
         guard focusFirstItemRequest else { return }
-        resolveInitialSettingsCategoryIfNeeded()
         didHandleFocusFirstItemRequest()
         listFocused = false
         DispatchQueue.main.async {
@@ -232,34 +183,11 @@ struct VoDogSettingsView: View {
         }
     }
 
-    private func resolveInitialSettingsCategoryIfNeeded() {
-        guard !didResolveInitialCategory else { return }
-        selectedCategory = .general
-        didResolveInitialCategory = true
-    }
-
-    private var settingsContent: some View {
-        ScrollView {
-            AdaptiveGlassContainer(spacing: 16) {
-                VStack(alignment: .leading, spacing: 20) {
-                    settingsHeader
-                    settingsCards
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(22)
-        }
-        .scrollContentBackground(.hidden)
-        .background(Color.clear)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .communicationDetailColumnStyle()
-    }
-
     private var settingsHeader: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(selectedCategory.title)
+            Text(pane.title)
                 .font(.largeTitle.bold())
-            Text(selectedCategory.detail)
+            Text(pane.detail)
                 .font(.body)
                 .foregroundStyle(.secondary)
         }
@@ -268,53 +196,143 @@ struct VoDogSettingsView: View {
 
     @ViewBuilder
     private var settingsCards: some View {
-        switch selectedCategory {
-        case .general:
-            generalSettings
-        case .communications:
-            communicationSettings
-        case .permissions:
-            permissionSettings
+        let account = appState.voDog
+        VStack(spacing: 16) {
+            switch pane {
+            case .appearance:
+                appearanceSettings
+            case .aiAnswer:
+                SettingsLoginGate(account: account, pane: $pane) {
+                    VoDogVoiceProviderCard(account: account)
+                }
+            case .sims:
+                SettingsLoginGate(account: account, pane: $pane) {
+                    VoDogNumbersView(account: account)
+                }
+            case .gateways:
+                SettingsLoginGate(account: account, pane: $pane, showsLoginCard: false) {
+                    VoDogGatewayPowerCard(account: account)
+                }
+                GatewaySettingsSection(gateway: appState.gateway)
+            case .privacy:
+                SettingsLoginGate(account: account, pane: $pane) {
+                    VoDogBlockedNumbersView(account: account)
+                        .frame(height: 380)
+                        .padding(.vertical, 12)
+                        .adaptiveGlassSurface(cornerRadius: 18, treatment: .regular)
+                    VoDogPasskeysCard(account: account)
+                }
+                // Local-only (this Mac's own SIMs), so it stays usable while signed out.
+                verificationAutoDeleteSettings
+            case .notifications:
+                notificationSettings
+            case .device:
+                deviceSettings
+            case .account:
+                VoDogAccountView(account: account)
+            }
         }
     }
 
-    private var generalSettings: some View {
+    private var appearanceSettings: some View {
+        settingsSection(title: L10n.tr("外观与语言")) {
+            VStack(spacing: 0) {
+                settingRow(
+                    title: L10n.tr("主题模式")
+                ) {
+                    Picker("主题模式", selection: appearanceModeBinding) {
+                        ForEach(AppAppearanceMode.allCases) { mode in
+                            Text(mode.title)
+                                .lineLimit(1)
+                                .tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 276)
+                }
+                .padding(16)
+
+                Divider().padding(.horizontal, 16)
+
+                settingRow(
+                    title: L10n.tr("应用语言"),
+                    detail: L10n.tr("切换后立即应用，无需重新启动")
+                ) {
+                    Picker("应用语言", selection: languageBinding) {
+                        ForEach(AppLanguage.allCases) { language in
+                            Text(verbatim: language.nativeName).tag(language)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 142)
+                }
+                .padding(16)
+            }
+        }
+    }
+
+    private var deviceSettings: some View {
         VStack(spacing: 16) {
-            settingsSection(title: L10n.tr("外观与语言")) {
+            settingsSection(title: L10n.tr("隐私权限")) {
                 VStack(spacing: 0) {
                     settingRow(
-                        title: L10n.tr("主题模式")
+                        title: L10n.tr("麦克风"),
+                        status: microphonePermissionStatus.text,
+                        statusColor: microphonePermissionStatus.color,
+                        detail: L10n.tr("用于通话时传输本机音频")
                     ) {
-                        Picker("主题模式", selection: appearanceModeBinding) {
-                            ForEach(AppAppearanceMode.allCases) { mode in
-                                Text(mode.title)
-                                    .lineLimit(1)
-                                    .tag(mode)
-                            }
+                        Button(microphonePermissionButtonTitle) {
+                            handleMicrophonePermissionAction()
                         }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .frame(width: 276)
+                        .adaptiveGlassButton()
+                        .controlSize(.small)
+                        .frame(width: 112)
                     }
                     .padding(16)
 
                     Divider().padding(.horizontal, 16)
 
                     settingRow(
-                        title: L10n.tr("应用语言"),
-                        detail: L10n.tr("切换后立即应用，无需重新启动")
+                        title: L10n.tr("通讯录"),
+                        status: contactPermissionStatus.text,
+                        statusColor: contactPermissionStatus.color,
+                        detail: L10n.tr("用于识别来电、短信联系人和拨号")
                     ) {
-                        Picker("应用语言", selection: languageBinding) {
-                            ForEach(AppLanguage.allCases) { language in
-                                Text(verbatim: language.nativeName).tag(language)
-                            }
+                        Button(contactPermissionButtonTitle) {
+                            handleContactPermissionAction()
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .frame(width: 142)
+                        .adaptiveGlassButton()
+                        .controlSize(.small)
+                        .frame(width: 112)
                     }
                     .padding(16)
                 }
+            }
+
+            inlineMessage(
+                L10n.tr("权限由 macOS 管理，可随时在系统设置中更改。"),
+                systemImage: "checkmark.shield",
+                color: .secondary
+            )
+            .padding(4)
+            .adaptiveGlassSurface(
+                cornerRadius: 18,
+                padding: 13,
+                treatment: .clear
+            )
+
+            settingsSection(title: L10n.tr("通话录音")) {
+                settingRow(
+                    title: L10n.tr("通话录音"),
+                    detail: L10n.tr("已接入 VoDog 网关的 SIM，通话录音会自动上传服务器保存，登录后可在其他客户端查看；未接入网关时录音仅保存在这台 Mac。")
+                ) {
+                    Text(L10n.tr("始终开启"))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(16)
             }
 
             settingsSection(title: L10n.tr("启动与菜单栏")) {
@@ -326,12 +344,10 @@ struct VoDogSettingsView: View {
                         if appState.isChangingLaunchAtLogin {
                             ProgressView().controlSize(.small)
                         } else {
-                            Toggle("登录时启动", isOn: Binding(
+                            settingsToggle(L10n.tr("登录时启动"), isOn: Binding(
                                 get: { appState.launchAtLoginStatus.isRegistered },
                                 set: { appState.setLaunchAtLogin($0) }
                             ))
-                            .labelsHidden()
-                            .toggleStyle(.adaptiveGlass)
                             .disabled(appState.launchAtLoginStatus == .unavailable)
                         }
                     }
@@ -355,12 +371,10 @@ struct VoDogSettingsView: View {
                             ? L10n.tr("重新连接模块后自动显示")
                             : L10n.tr("模块断开后继续显示状态图标")
                     ) {
-                        Toggle("未连接模块时隐藏菜单栏图标", isOn: Binding(
+                        settingsToggle(L10n.tr("未连接模块时隐藏菜单栏图标"), isOn: Binding(
                             get: { appState.hideMenuBarIconWhenDisconnected },
                             set: { appState.setHideMenuBarIconWhenDisconnected($0) }
                         ))
-                        .labelsHidden()
-                        .toggleStyle(.adaptiveGlass)
                     }
                     .padding(16)
                 }
@@ -385,11 +399,48 @@ struct VoDogSettingsView: View {
         }
     }
 
-    private var communicationSettings: some View {
-        VStack(spacing: 16) {
-            moduleStatusStrip
+    private var verificationAutoDeleteSettings: some View {
+        settingsSection(title: L10n.tr("短信处理")) {
+            VStack(spacing: 12) {
+                settingRow(
+                    title: L10n.tr("已读验证码自动删除"),
+                    detail: L10n.tr("标记已读 30 分钟后，从模块/SIM 与本地永久删除；不适用于已接入 VoDog 的 SIM")
+                ) {
+                    settingsToggle(L10n.tr("已读验证码自动删除"), isOn: Binding(
+                        get: { appState.autoDeleteReadVerificationMessages },
+                        set: { enabled in
+                            if enabled {
+                                isConfirmingVerificationAutoDelete = true
+                            } else {
+                                appState.setAutoDeleteReadVerificationMessages(false)
+                            }
+                        }
+                    ))
+                }
 
-            GatewaySettingsSection(gateway: appState.gateway)
+                inlineCallout(
+                    L10n.tr("删除后无法恢复，开启时需要确认。"),
+                    systemImage: "exclamationmark.triangle.fill",
+                    color: .orange
+                )
+            }
+            .padding(16)
+        }
+    }
+
+    private var notificationSettings: some View {
+        VStack(spacing: 16) {
+            settingsSection(title: L10n.tr("通知")) {
+                settingRow(
+                    title: L10n.tr("系统通知"),
+                    status: notificationPermissionStatus.text,
+                    statusColor: notificationPermissionStatus.color,
+                    detail: L10n.tr("用于来电、新短信和未接来电提醒")
+                ) {
+                    notificationPermissionAccessory
+                }
+                .padding(16)
+            }
 
             settingsSection(title: L10n.tr("声音")) {
                 VStack(spacing: 0) {
@@ -402,48 +453,16 @@ struct VoDogSettingsView: View {
                         .padding(16)
                 }
             }
-
-            settingsSection(title: L10n.tr("通话录音")) {
-                settingRow(
-                    title: L10n.tr("通话录音"),
-                    detail: L10n.tr("已接入 VoDog 网关的 SIM，通话录音会自动上传服务器保存，登录后可在其他客户端查看；未接入网关时录音仅保存在这台 Mac。")
-                ) {
-                    Text(L10n.tr("始终开启"))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(16)
-            }
-
-            settingsSection(title: L10n.tr("短信处理")) {
-                VStack(spacing: 12) {
-                    settingRow(
-                        title: L10n.tr("已读验证码自动删除"),
-                        detail: L10n.tr("标记已读 30 分钟后，从模块/SIM 与本地永久删除；不适用于已接入 VoDog 的 SIM")
-                    ) {
-                        Toggle("已读验证码自动删除", isOn: Binding(
-                            get: { appState.autoDeleteReadVerificationMessages },
-                            set: { enabled in
-                                if enabled {
-                                    isConfirmingVerificationAutoDelete = true
-                                } else {
-                                    appState.setAutoDeleteReadVerificationMessages(false)
-                                }
-                            }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.adaptiveGlass)
-                    }
-
-                    inlineCallout(
-                        L10n.tr("删除后无法恢复，开启时需要确认。"),
-                        systemImage: "exclamationmark.triangle.fill",
-                        color: .orange
-                    )
-                }
-                .padding(16)
-            }
         }
+    }
+
+    /// The title is already printed by `settingRow`; `AdaptiveGlassToggleStyle` draws its label even when
+    /// `labelsHidden()` is set, so the toggle carries it only for accessibility.
+    private func settingsToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+        Toggle(isOn: isOn) { EmptyView() }
+            .toggleStyle(.adaptiveGlass)
+            .fixedSize()
+            .accessibilityLabel(title)
     }
 
     private func soundSettingRow(_ kind: AlertSoundKind) -> some View {
@@ -452,6 +471,11 @@ struct VoDogSettingsView: View {
             detail: alertSounds.displayName(for: kind)
         ) {
             HStack(spacing: 8) {
+                settingsToggle(kind.title, isOn: Binding(
+                    get: { alertSounds.isEnabled(kind) },
+                    set: { alertSounds.setEnabled($0, for: kind) }
+                ))
+
                 Button {
                     previewSound(kind)
                 } label: {
@@ -513,96 +537,6 @@ struct VoDogSettingsView: View {
                     soundImportError = error.localizedDescription
                 }
             }
-        }
-    }
-
-    private var moduleStatusStrip: some View {
-        HStack(spacing: 14) {
-            Text(cellularSummary)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-
-            Spacer(minLength: 12)
-
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(moduleStatusColor)
-                    .frame(width: 8, height: 8)
-                Text(moduleStatusText)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(moduleStatusColor)
-            }
-        }
-        .adaptiveGlassSurface(
-            cornerRadius: 18,
-            padding: 16,
-            treatment: .clear,
-            tint: moduleStatusColor.opacity(0.045)
-        )
-        .accessibilityElement(children: .combine)
-    }
-
-    private var permissionSettings: some View {
-        VStack(spacing: 16) {
-            settingsSection(title: L10n.tr("通知")) {
-                settingRow(
-                    title: L10n.tr("系统通知"),
-                    status: notificationPermissionStatus.text,
-                    statusColor: notificationPermissionStatus.color,
-                    detail: L10n.tr("用于来电、新短信和未接来电提醒")
-                ) {
-                    notificationPermissionAccessory
-                }
-                .padding(16)
-            }
-
-            settingsSection(title: L10n.tr("隐私权限")) {
-                VStack(spacing: 0) {
-                    settingRow(
-                        title: L10n.tr("麦克风"),
-                        status: microphonePermissionStatus.text,
-                        statusColor: microphonePermissionStatus.color,
-                        detail: L10n.tr("用于通话时传输本机音频")
-                    ) {
-                        Button(microphonePermissionButtonTitle) {
-                            handleMicrophonePermissionAction()
-                        }
-                        .adaptiveGlassButton()
-                        .controlSize(.small)
-                        .frame(width: 112)
-                    }
-                    .padding(16)
-
-                    Divider().padding(.horizontal, 16)
-
-                    settingRow(
-                        title: L10n.tr("通讯录"),
-                        status: contactPermissionStatus.text,
-                        statusColor: contactPermissionStatus.color,
-                        detail: L10n.tr("用于识别来电、短信联系人和拨号")
-                    ) {
-                        Button(contactPermissionButtonTitle) {
-                            handleContactPermissionAction()
-                        }
-                        .adaptiveGlassButton()
-                        .controlSize(.small)
-                        .frame(width: 112)
-                    }
-                    .padding(16)
-                }
-            }
-
-            inlineMessage(
-                L10n.tr("权限由 macOS 管理，可随时在系统设置中更改。"),
-                systemImage: "checkmark.shield",
-                color: .secondary
-            )
-            .padding(4)
-            .adaptiveGlassSurface(
-                cornerRadius: 18,
-                padding: 13,
-                treatment: .clear
-            )
         }
     }
 
@@ -744,42 +678,15 @@ struct VoDogSettingsView: View {
         }
     }
 
-    private var cellularSummary: String {
-        guard appState.modem.isConnected else { return L10n.tr("SIM 1 · 模块未连接") }
-        return (["SIM 1", appState.modem.operatorName, appState.modem.accessTechnology]
-            .compactMap { $0 })
-            .joined(separator: " · ")
-    }
 
-    private var moduleStatusText: String {
-        switch appState.modem.operationalState {
-        case .absent: return L10n.tr("模块未连接")
-        case .enumerating: return L10n.tr("USB 枚举中")
-        case .initializing: return L10n.tr("模块初始化中")
-        case .configurationRequired: return L10n.tr("模块需要配置")
-        case .ready: return L10n.tr("模块已连接")
-        case .restarting: return L10n.tr("模块正在重启")
-        case .reconnecting: return L10n.tr("模块重新连接中")
-        case .failed: return L10n.tr("模块异常")
-        }
-    }
 
-    private var moduleStatusColor: Color {
-        switch appState.modem.operationalState {
-        case .ready: return .green
-        case .configurationRequired: return .orange
-        case .failed: return .red
-        case .enumerating, .initializing, .restarting, .reconnecting: return .blue
-        case .absent: return .secondary
-        }
-    }
 
     private var notificationPermissionStatus: (text: String, color: Color) {
         switch appState.notificationAuthorizationStatus {
         case .unknown: return (L10n.tr("读取中"), .secondary)
         case .notDetermined: return (L10n.tr("未请求"), .secondary)
         case .denied: return (L10n.tr("未允许"), .orange)
-        case .authorized: return (L10n.tr("已允许"), .green)
+        case .authorized: return (L10n.tr("已允许"), Signal.call)
         }
     }
 
@@ -800,7 +707,7 @@ struct VoDogSettingsView: View {
         case .notDetermined: return (L10n.tr("未请求"), .secondary)
         case .restricted: return (L10n.tr("受限制"), .orange)
         case .denied: return (L10n.tr("未允许"), .orange)
-        case .authorized: return (L10n.tr("已允许"), .green)
+        case .authorized: return (L10n.tr("已允许"), Signal.call)
         @unknown default: return (L10n.tr("未知"), .secondary)
         }
     }
@@ -814,7 +721,7 @@ struct VoDogSettingsView: View {
     private var contactPermissionStatus: (text: String, color: Color) {
         switch contacts.authorizationState {
         case .notDetermined: return (L10n.tr("未请求"), .secondary)
-        case .authorized: return (L10n.tr("已允许"), .green)
+        case .authorized: return (L10n.tr("已允许"), Signal.call)
         case .denied: return (L10n.tr("未允许"), .orange)
         case .restricted: return (L10n.tr("受限制"), .orange)
         }
@@ -865,5 +772,56 @@ struct VoDogSettingsView: View {
         appState.refreshSystemSettingsStatus()
         contacts.reload()
         microphoneAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+}
+
+/// Detail column. Observes the account so signing in / out re-renders every pane; signed-out 账号 is the
+/// full-height login page (it scrolls by itself).
+private struct SettingsDetailHost<Content: View>: View {
+    @ObservedObject var account: VoDogAccount
+    let pane: SettingsPane
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        if pane == .account, account.user == nil {
+            VoDogLoginView(account: account)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .communicationDetailColumnStyle()
+        } else {
+            ScrollView {
+                AdaptiveGlassContainer(spacing: 16) {
+                    VStack(alignment: .leading, spacing: 20) { content }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(22)
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .communicationDetailColumnStyle()
+        }
+    }
+}
+
+/// Account-backed cards: shown signed in; otherwise a login card that opens 设置 › 账号 (or nothing).
+private struct SettingsLoginGate<Content: View>: View {
+    @ObservedObject var account: VoDogAccount
+    @Binding var pane: SettingsPane
+    var showsLoginCard = true
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        if account.user != nil {
+            content
+        } else if showsLoginCard {
+            VoDogCard(title: L10n.tr("登录 VoDog")) {
+                Text(L10n.tr("登录后可在这台 Mac 上管理通讯录、屏蔽名单、通话记录与接听设置。"))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(L10n.tr("登录 VoDog")) { pane = .account }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityLabel(L10n.tr("登录 VoDog"))
+            }
+        }
     }
 }

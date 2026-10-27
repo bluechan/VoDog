@@ -141,7 +141,6 @@ final class StandaloneFlowWindowController: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   !self.windows.values.contains(where: \.isVisible),
-                  !MainWindowController.shared.isVisible,
                   !CommunicationWindowController.shared.hasVisibleWindows,
                   !InitialSetupWindowController.shared.isVisible else {
                 return

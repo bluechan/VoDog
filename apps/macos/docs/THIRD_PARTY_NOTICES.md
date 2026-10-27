@@ -83,3 +83,13 @@ No complete or reproducible kernel source or resolved redistribution obligations
 claimed. The kernel modules retain GPL-2.0 terms; CellDock noncommercial terms remain
 applicable to its component. The PCM helper source and build script are also present.
 Bundled runtime size/hash checks, payload construction and app payload decoding passed; this is not physical-device acceptance or a full signed archive build.
+
+## Bundled sounds
+
+`Resources/Sounds/bleeps.wav` (SMS chime) and `Resources/Sounds/ring.mp3` (ringtone) are not
+committed (git-ignored); they are synthesized from scratch with NumPy by `scripts/sounds/chime.py` and `scripts/sounds/ring.py`
+(sine tones, original phrases, no third-party samples), ported from upstream CellDock. They
+reproduce byte-for-byte: `python3 scripts/sounds/chime.py OUT` gives `OUT/dewdrop.wav` =
+`bleeps.wav`; `python3 scripts/sounds/ring.py OUT` then
+`ffmpeg -i OUT/ring-lullaby.wav -c:a libmp3lame -b:a 192k ring.mp3` gives `ring.mp3`
+(verified with NumPy 2.4.3 and FFmpeg 9.0.2; other versions may differ in the last bits).

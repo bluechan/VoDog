@@ -24,6 +24,7 @@ swiftc \
   "$ROOT/Sources/VoDog/VoDog/VoDogModels.swift" \
   "$ROOT/Sources/VoDog/VoDog/VoDogContract.swift" \
   "$ROOT/Sources/VoDog/VoDog/VoDogPhoneLogic.swift" \
+  "$ROOT/Sources/VoDog/SMSLinkPolicy.swift" \
   "$ROOT/Tests/VoDogUISelfTests/main.swift" \
   -o "$OUT/VoDogUISelfTests"
 

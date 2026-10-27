@@ -168,6 +168,10 @@ final class GatewayRuntime: ObservableObject, Identifiable {
     @Published private(set) var isPairing = false
     @Published private(set) var lastHeartbeatAt: Date?
     @Published private(set) var lastError: String?
+    /// S130: `GatewayModuleIdentity.revokedMarker` of credentials confirmed revoked; persisted per module.
+    @Published private(set) var revokedMarker: String?
+    /// Unpaired, or paired with credentials confirmed revoked: offer manual 配对 + 加入账号 again.
+    var needsPairing: Bool { GatewayModuleIdentity.showsPairingControls(credentials: credentials, revokedMarker: revokedMarker) }
     var isEnabled: Bool { agent?.isEnabled == true && !isPaused }
     var isRunning: Bool { loopTask != nil }
     var httpClient: GatewayHTTP? { http }
@@ -183,6 +187,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
         static let blocklist = "VoDogGateway.blocklist.v1"
         static let snapshotSequence = "VoDogGateway.snapshotSequence.v1"
         static let enabledAt = "VoDogGateway.enabledAt.v1"
+        static let revoked = "VoDogGateway.revoked.v1"
     }
 
     private weak var appState: AppState?
@@ -249,6 +254,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
         isPaused = UserDefaults.standard.bool(forKey: Keys.paused + "." + GatewayModuleIdentity.storageKey(imei: imei))
         provision = UserDefaults.standard.data(forKey: Keys.provision + "." + GatewayModuleIdentity.storageKey(imei: imei))
             .flatMap { try? JSONDecoder().decode(GatewayProvisionState.self, from: $0) }
+        revokedMarker = UserDefaults.standard.string(forKey: Keys.revoked + "." + GatewayModuleIdentity.storageKey(imei: imei))
     }
 
     /// Structured diagnostics; safe to call from any thread (media/recording code runs off-main).
@@ -320,7 +326,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
                 var request = URLRequest(url: baseURL.appendingPathComponent("api/v1/gateway/pair"), timeoutInterval: 20)
                 request.httpMethod = "POST"
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try JSONSerialization.data(withJSONObject: ["code": code, "label": "VoDog DJI 4G"])
+                request.httpBody = try JSONSerialization.data(withJSONObject: GatewayModuleIdentity.pairBody(code: code, imei: imei))
                 let (data, response) = try await URLSession.shared.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 let json = GatewayJSON.object(String(decoding: data, as: UTF8.self))
@@ -339,6 +345,12 @@ final class GatewayRuntime: ObservableObject, Identifiable {
                 moduleCopyChecked = true
                 applyCredentials(paired)
                 lastError = nil
+                if revokedMarker != nil {
+                    // S130 re-pair after revocation: undo fail()'s pause; the defer restarts the loop.
+                    setRevoked(nil)
+                    isPaused = false
+                    defaults.set(false, forKey: Keys.paused + "." + id)
+                }
                 diag("gateway.state", "info", nil, ["paired": ["was": false, "now": true], "deviceEpoch": epoch,
                                                     "gatewayId": gatewayId, "credentialSource": "pairing"])
                 // The module carries its own copy so any Mac it is plugged into can run it.
@@ -627,6 +639,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
             "timeZone": TimeZone.current.identifier,
             "kind": "dji4g", // S58: Control labels this gateway's calls/SIMs as DJI 4G.
         ]
+        for (key, value) in GatewayModuleIdentity.moduleFields(imei: imei) { body[key] = value } // S130
         if let version = blocklist?.syncedVersion { body["numberBlocklistVersion"] = version }
         return body
     }
@@ -657,11 +670,12 @@ final class GatewayRuntime: ObservableObject, Identifiable {
             let gateway = response["gateway"] as? [String: Any]
             if let epoch = GatewayJSON.int(gateway?["deviceEpoch"]), epoch != credentials.deviceEpoch {
                 let message = "This gateway was re-paired elsewhere (epoch \(epoch)); pair again"
-                if !recoverCredentials(message) { fail(message) }
+                if !recoverCredentials(message) { revoked(message) }
                 return nil
             }
             lastHeartbeatAt = Date()
             credentialRecoveryAttempted = false
+            if revokedMarker != nil { setRevoked(nil) }
             applyBlocklist(response["numberBlocklist"] as? [String: Any])
             earlyMedia = GatewayRules.earlyMedia(response)
             updateDoorbell(GatewayJSON.int((response["commandDoorbell"] as? [String: Any])?["maxHoldMs"]) ?? 0, http: http)
@@ -1576,7 +1590,7 @@ final class GatewayRuntime: ObservableObject, Identifiable {
     private func record(_ error: Error, context: String) {
         if let error = error as? GatewayHTTPError, error.status == 401 {
             let message = "Device credentials were revoked; pair again"
-            if !recoverCredentials(message) { fail(message) }
+            if !recoverCredentials(message) { revoked(message) }
             return
         }
         guard !Task.isCancelled else { return }
@@ -1602,6 +1616,18 @@ final class GatewayRuntime: ObservableObject, Identifiable {
         } else {
             diag("gateway.error", "debug", nil, fields)
         }
+    }
+
+    /// Revocation confirmed (the one module-copy re-read already used): keep every credential, mark it
+    /// so the settings card offers 配对 / 加入账号 again, then pause as before.
+    private func revoked(_ message: String) {
+        if let credentials { setRevoked(GatewayModuleIdentity.revokedMarker(credentials)) }
+        fail(message)
+    }
+
+    private func setRevoked(_ marker: String?) {
+        revokedMarker = marker
+        defaults.set(marker, forKey: Keys.revoked + "." + id)
     }
 
     private func fail(_ message: String) {

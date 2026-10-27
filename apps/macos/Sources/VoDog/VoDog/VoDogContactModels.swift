@@ -13,6 +13,8 @@ struct VoDogContactPhone: Decodable, Identifiable, Equatable {
     /// Server annotation per phone (S21 §A addendum); absent on older Controls.
     let blocked: Bool?
     let blockedEntryId: String?
+    /// S96: home location (absent when unknown).
+    var location: String? = nil
 
     var displayNumber: String { (e164?.isEmpty == false ? e164 : nil) ?? rawNumber }
     var isBlocked: Bool { blocked == true || blockedEntryId != nil }
@@ -115,6 +117,7 @@ struct VoDogInterception: Decodable, Identifiable, Equatable {
     let bodyPreview: String?
     let blockedEntryId: String?
     let source: String?         // "phone" | "gateway" | "control"
+    var remoteLocation: String? = nil   // S96
 
     var isSMS: Bool { kind == "sms" }
 }
@@ -216,7 +219,9 @@ struct VoDogContactDraft: Equatable {
 }
 
 enum VoDogContactsLogic {
-    static let contactsPageSize = 200
+    static let contactsPageSize = 500
+    /// Empty-search browse fetches pages until a short page, capped here (S114).
+    static let maxBrowsePages = 40
     static let interceptionsPageSize = 50
 
     /// `[String: Any]` from `VoDogAccount.json` into a Codable DTO.

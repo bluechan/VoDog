@@ -128,7 +128,7 @@ struct SIMManagementView: View {
         VStack(spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(L10n.tr("SIM 与 eSIM"))
+                    Text(L10n.tr("蜂窝模组"))
                         .font(.title2.weight(.bold))
                     Text(L10n.tr("%lld 个模组已连接", Int64(connectedModuleCount)))
                         .font(.callout)
@@ -182,11 +182,12 @@ struct SIMManagementView: View {
             Divider()
 
             if appState.cellularModules.isEmpty {
-                ContentUnavailableView(
-                    "未发现蜂窝模组",
-                    systemImage: "externaldrive.badge.questionmark",
-                    description: Text("连接设备后，VoDog 会自动识别。")
-                )
+                ContentUnavailableView {
+                    VoDogIllustration("module", width: 140, fallbackSystemImage: "externaldrive.badge.questionmark")
+                    Text("未发现蜂窝模组").font(.headline)
+                } description: {
+                    Text("连接设备后，VoDog 会自动识别。")
+                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in
@@ -911,13 +912,7 @@ struct SIMManagementView: View {
             esimProfilesCard
         }
         if let runtime = appState.gatewayRuntime(for: selectedModuleID) {
-            SIMGatewayStatusGroup(runtime: runtime, sim: appState.accountSIM(for: selectedModuleID),
-                                  lineName: appState.lineName(for: selectedModuleID))
-            Label(L10n.tr("拔出模组或退出应用，此号码会显示为『号码设备离线』"), systemImage: "exclamationmark.circle")
-                .font(.callout)
-                .foregroundStyle(Signal.ink3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .signalCard(cornerRadius: 12, padding: 13)
+            SIMGatewayLinkRow(runtime: runtime) { appState.showSettings(.gateways) }
         }
     }
 
@@ -1103,9 +1098,11 @@ struct SIMManagementView: View {
                     .controlSize(.small)
             }
 
-            Toggle("开启接收来电", isOn: incomingCallsBinding)
+            // S139: empty label — the adaptive-glass style draws its label even under labelsHidden (doubled text).
+            Toggle(isOn: incomingCallsBinding) { EmptyView() }
                 .labelsHidden()
                 .toggleStyle(.adaptiveGlass)
+                .accessibilityLabel(L10n.tr("开启接收来电"))
                 .disabled(!canChangeIncomingCalls)
                 .accessibilityIdentifier("SIMManagementIncomingCallsToggle")
                 .help(L10n.tr("控制模块是否接收运营商来电"))
@@ -1679,69 +1676,37 @@ private struct SIMSignalBars: View {
     }
 }
 
-/// 「VoDog 网关」: pairing state of this module's gateway and the SIM settings version (existing data only).
-private struct SIMGatewayStatusGroup: View {
+/// S139: one row 「已接入 VoDog · 状态」 that opens 设置 › 网关设备 (pairing, pause and modules live there).
+private struct SIMGatewayLinkRow: View {
     @ObservedObject var runtime: GatewayRuntime
-    let sim: VoDogSIM?
-    let lineName: String?
+    let open: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(L10n.tr("VoDog 网关"))
-                .font(.caption.weight(.bold))
-                .foregroundStyle(Signal.ink3)
-                .padding(.leading, 4)
-            VStack(spacing: 0) {
-                row(L10n.tr("配对状态"),
-                    detail: lineName.map { L10n.tr("本 Mac 作为 %@ 的网关", $0) },
-                    value: pairing.text, color: pairing.color)
-                if let settings = sim?.settings {
-                    Divider().overlay(Signal.line)
-                    let applied = settings.appliedVersion == settings.version
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(L10n.tr("接听方式"))
-                        }
-                        Spacer(minLength: 8)
-                        if settings.mode == VoDogReceptionMode.normal.rawValue {
-                            Text(VoDogReceptionMode.normal.title).font(.callout).foregroundStyle(Signal.ink2)
-                        } else {
-                            AiBadge(settings: settings, full: true)
-                        }
-                    }
-                    .padding(.vertical, 8)
-                    .frame(minHeight: 44)
-                    Divider().overlay(Signal.line)
-                    row(L10n.tr("设置版本"), detail: L10n.tr("服务器下发的 SIM 设置"),
-                        value: applied ? L10n.tr("v%lld 已应用", Int64(settings.version))
-                            : L10n.tr("v%lld 待设备应用", Int64(settings.version)),
-                        color: applied ? Signal.ink2 : Signal.warn)
+        Button(action: open) {
+            HStack(spacing: 10) {
+                LineStatusShape(status: runtime.credentials != nil && runtime.isOnline ? .online : .offline)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.tr("已接入 VoDog · %@", status)).foregroundStyle(Signal.ink)
+                    Text(L10n.tr("配对、暂停与模组状态都在 设置 › 网关设备"))
+                        .font(.caption).foregroundStyle(Signal.ink3)
                 }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Signal.ink3)
             }
-            .padding(.horizontal, 14)
-            .signalCard(cornerRadius: 12, padding: 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .signalCard(cornerRadius: 12, padding: 13)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(L10n.tr("已接入 VoDog · %@", status))
+        .accessibilityAddTraits(.isButton)
     }
 
-    private var pairing: (text: String, color: Color) {
-        guard runtime.credentials != nil else { return (L10n.tr("未配对"), Signal.ink3) }
-        return runtime.isOnline ? (L10n.tr("已配对 · 在线"), Signal.call) : (L10n.tr("已配对 · 离线"), Signal.ink3)
-    }
-
-    private func row(_ title: String, detail: String?, value: String, color: Color) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: title)
-                if let detail {
-                    Text(verbatim: detail).font(.caption).foregroundStyle(Signal.ink3)
-                }
-            }
-            Spacer(minLength: 8)
-            Text(verbatim: value)
-                .font(.callout.weight(.semibold).monospacedDigit())
-                .foregroundStyle(color)
-        }
-        .padding(.vertical, 8)
-        .frame(minHeight: 44)
+    private var status: String {
+        guard runtime.credentials != nil else { return L10n.tr("未配对") }
+        return runtime.isOnline ? L10n.tr("在线") : L10n.tr("离线")
     }
 }

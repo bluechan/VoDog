@@ -6,13 +6,23 @@ import SwiftUI
 // original local-module views are shown untouched.
 
 /// Picks the local-module view or the VoDog one; observing the account re-renders on login/logout.
+/// S139: also local while a present local-only module is the stored line (`VoDogPhone.localLine.v1`).
 struct VoDogPhoneRoute<Local: View, Remote: View>: View {
+    @EnvironmentObject private var appState: AppState
     @ObservedObject var account: VoDogAccount
+    @AppStorage(VoDogLinePolicy.localLineKey) private var localLine = ""
     @ViewBuilder let local: () -> Local
     @ViewBuilder let remote: () -> Remote
 
     var body: some View {
-        if VoDogPhonePolicy.usesRemoteRoute(signedIn: account.user != nil) { remote() } else { local() }
+        VoDogGatewayReader(gateway: appState.gateway) {
+            if VoDogPhonePolicy.usesRemoteRoute(signedIn: account.user != nil),
+               appState.localOnlyModule(storedLine: localLine) == nil {
+                remote()
+            } else {
+                local()
+            }
+        }
     }
 }
 
@@ -105,7 +115,8 @@ private struct VoDogSIMRefreshModifier: ViewModifier {
     @Binding var selection: String?
 
     func body(content: Content) -> some View {
-        content.task {
+        // S139: keyed on the user so a menu created signed out (local line) starts polling after login.
+        content.task(id: account.user?.id) {
             // ponytail: plain 5 s poll while the picker is on screen, same as the 号码与接听 page.
             while !Task.isCancelled, account.user != nil {
                 await account.refreshSIMs()
@@ -122,60 +133,6 @@ private struct VoDogSIMRefreshModifier: ViewModifier {
 extension View {
     func voDogSIMRefresh(account: VoDogAccount, selection: Binding<String?>) -> some View {
         modifier(VoDogSIMRefreshModifier(account: account, selection: selection))
-    }
-}
-
-/// macOS toolbar line popup (spec 01 §5 线路选择): line block + name, online SIMs first; same refresh as the strip.
-struct VoDogSIMMenu: View {
-    @ObservedObject var account: VoDogAccount
-    @Binding var selection: String?
-
-    private var fresh: Bool { account.simsError == nil }
-
-    var body: some View {
-        HStack(spacing: 6) {
-            if let error = account.simsError {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(Signal.warn)
-                    .help(error)
-                    .accessibilityLabel(error)
-            }
-            Menu {
-                ForEach(VoDogPhonePolicy.displayOrder(account.sims, fresh: fresh)) { sim in
-                    Toggle(isOn: Binding(get: { selection == sim.id }, set: { if $0 { selection = sim.id } })) {
-                        Text(verbatim: [sim.displayName, sim.phoneLabel, status(sim), AiBadge.menuSuffix(sim.settings)]
-                            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
-                    }
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    if let sim = account.sims.first(where: { $0.id == selection }) {
-                        LineBlock(color: color(sim), size: 8)
-                        Text(verbatim: sim.displayName).lineLimit(1)
-                        AiBadge(settings: sim.settings)
-                        LineStatusShape(status: VoDogPhonePolicy.showsOnline(sim, fresh: fresh) ? .online : .offline)
-                    } else {
-                        Text(account.simsLoaded ? L10n.tr("没有已分配的 SIM") : L10n.tr("正在读取号码…")).lineLimit(1)
-                    }
-                }
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .padding(.horizontal, 8)
-            .frame(height: 28)
-            .background(Signal.surface2, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .disabled(account.sims.isEmpty)
-        }
-        .voDogSIMRefresh(account: account, selection: $selection)
-    }
-
-    private func color(_ sim: VoDogSIM) -> Color {
-        .voDogSIM(rank: VoDogPhonePolicy.colorRank(of: sim.id, in: account.sims))
-    }
-
-    private func status(_ sim: VoDogSIM) -> String {
-        !fresh ? L10n.tr("号码状态待刷新")
-            : VoDogPhonePolicy.showsOnline(sim, fresh: fresh) ? L10n.tr("在线") : L10n.tr("号码设备离线")
     }
 }
 
@@ -256,9 +213,13 @@ struct VoDogSIMStrip: View {
 struct VoDogDialerView: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var account: VoDogAccount
+    /// S139: the 电话 page hides the strip (its header carries `VoDogLineMenu`).
+    var showsSIMStrip = true
     @ObservedObject private var calls = VoDogCallStore.shared
     @AppStorage("VoDogPhone.sim.v1") private var storedSIM = ""
     @State private var number = ""
+    /// S96 `GET /contacts/lookup` result for the typed number: `{name} · {location}` or either alone.
+    @State private var lookupHint: String?
 
     private var selection: Binding<String?> {
         Binding(get: { storedSIM.isEmpty ? nil : storedSIM }, set: { storedSIM = $0 ?? "" })
@@ -276,8 +237,10 @@ struct VoDogDialerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            VoDogSIMStrip(account: account, selection: selection, badgeKind: .calls)
-            Divider()
+            if showsSIMStrip {
+                VoDogSIMStrip(account: account, selection: selection, badgeKind: .calls)
+                Divider()
+            }
             ScrollView {
                 VStack(spacing: 18) {
                     TextField(L10n.tr("输入电话号码"), text: $number)
@@ -301,7 +264,12 @@ struct VoDogDialerView: View {
                         }
                     }
 
-                    Text(hint).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    VStack(spacing: 4) {
+                        Text(hint).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        // S96: own line, height reserved (" " when empty) so the layout never jumps.
+                        Text(verbatim: lookupHint ?? " ").font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                            .accessibilityHidden(lookupHint == nil)
+                    }
                     if let error = calls.error {
                         Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.red)
                     }
@@ -312,6 +280,31 @@ struct VoDogDialerView: View {
             .scrollIndicators(.never)
         }
         .communicationDetailColumnStyle()
+        .task(id: VoDogPhonePolicy.normalizedNumber(number)) { await lookUp() }
+        // Key tone for both keypad clicks and keyboard typing: both land in `number`.
+        .onChange(of: number) { old, new in DialKeyTone.shared.numberChanged(from: old, to: new) }
+        .onDisappear { DialKeyTone.shared.stop() }
+        // S139: 菜单栏 拨号 / 通讯录 拨打 hand the number over through the window model; take it once.
+        .onReceive(CommunicationWindowController.shared.phoneModel.$dialNumber) { handed in
+            guard !handed.isEmpty else { return }
+            number = String(handed.prefix(32))
+            DispatchQueue.main.async { CommunicationWindowController.shared.phoneModel.dialNumber = "" }
+        }
+    }
+
+    /// Debounced by `.task(id:)`: a new number cancels the sleep / request, so stale answers never land.
+    private func lookUp() async {
+        let typed = VoDogPhonePolicy.normalizedNumber(number)
+        lookupHint = nil
+        guard typed.count >= 3 else { return }
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        guard !Task.isCancelled,
+              let object = try? await account.json("GET", "/contacts/lookup", query: ["number": typed]),
+              let result = try? VoDogJSON.decode(VoDogContactLookup.self, from: object),
+              !Task.isCancelled else { return }
+        let text = [result.item?.displayName.flatMap(VoDogLocation.full), VoDogLocation.full(result.location)]
+            .compactMap { $0 }.joined(separator: " · ")
+        lookupHint = text.isEmpty ? nil : text
     }
 
     private var hint: String {
@@ -322,6 +315,7 @@ struct VoDogDialerView: View {
 
     private func dial() {
         guard canDial, let sim = selectedSIM else { return }
+        DialKeyTone.shared.stop()
         let target = number
         if let localModule {
             appState.dial(target, moduleID: localModule)
@@ -396,6 +390,9 @@ struct VoDogCallLayer: View {
         VStack(spacing: 12) {
             Text(L10n.tr("VoDog 来电")).font(.caption).foregroundStyle(.secondary)
             Text(title(call)).font(.title2.weight(.semibold)).lineLimit(1)
+            if let location = VoDogLocation.full(call.remoteLocation) {
+                Text(verbatim: location).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }
             if let sim = simName(call) { Text(sim).font(.callout).foregroundStyle(.secondary) }
             HStack(spacing: 40) {
                 CircularLiquidCallButton(title: L10n.tr("拒接"), systemImage: "phone.down.fill", tint: .red,
@@ -419,6 +416,9 @@ struct VoDogCallLayer: View {
             Spacer(minLength: 12)
             Text(stateText(call.state)).font(.callout.weight(.medium)).foregroundStyle(.secondary)
             Text(title(call)).font(.system(size: 30, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
+            if let location = VoDogLocation.full(call.remoteLocation) {
+                Text(verbatim: location).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }
             if let sim = simName(call) { Text(L10n.tr("经「%@」", sim)).font(.callout).foregroundStyle(.secondary) }
             Label(media.statusText, systemImage: media.state == .connected ? "waveform" : "exclamationmark.circle")
                 .font(.caption)

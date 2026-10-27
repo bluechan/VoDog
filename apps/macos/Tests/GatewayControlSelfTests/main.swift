@@ -381,6 +381,45 @@ do {
     check(!matches(nil, nil, nil, "d1"), "nil callId never matches a nil server id")
 }
 
+// S130: module identity in /gateway/pair, 409 module-binding messages, re-pair visibility.
+do {
+    let imei = "861234567890123"
+    let body = GatewayModuleIdentity.pairBody(code: "ABCD-1234", imei: imei)
+    check(body["code"] as? String == "ABCD-1234" && body["label"] as? String == "VoDog DJI 4G", "pair body keeps code + label")
+    check(body["moduleKey"] as? String == GatewayModuleIdentity.storageKey(imei: imei), "moduleKey is the Keychain key")
+    check((body["moduleKey"] as? String)?.range(of: "^[0-9a-f]{16}$", options: .regularExpression) != nil, "moduleKey is 16 hex")
+    check(body["moduleLabel"] as? String == "890123", "moduleLabel is the last 6 IMEI digits")
+    check(!body.values.contains { "\($0)".contains(imei) }, "full IMEI is never sent")
+    check(GatewayModuleIdentity.moduleFields(imei: "12345")["moduleLabel"] == nil, "short IMEI sends no label")
+
+    func error(_ code: String, _ detail: [String: Any] = [:]) -> GatewayHTTPError {
+        var payload = detail
+        payload["code"] = code
+        let data = (try? JSONSerialization.data(withJSONObject: ["error": payload])) ?? Data()
+        return GatewayHTTPError(status: 409, code: code, body: data)
+    }
+    let mismatch = GatewayNetworkIssue.userMessage(for: error("MODULE_MISMATCH", ["boundModuleLabel": "000101"]))
+    check(mismatch == "该配对码所属网关已绑定模组 …000101，与当前模组不符；请在 Web 选对应行，或用『更换模组配对码』", "MODULE_MISMATCH message")
+    let required = GatewayNetworkIssue.userMessage(for: error("MODULE_KEY_REQUIRED", ["boundModuleLabel": "000102"]))
+    check(required.contains("…000102") && required.contains("更换模组配对码"), "MODULE_KEY_REQUIRED message")
+    let elsewhere = GatewayNetworkIssue.userMessage(for: error("MODULE_BOUND_ELSEWHERE", ["boundGatewayName": "DJI 4G 000103"]))
+    check(elsewhere.contains("「DJI 4G 000103」") && elsewhere.contains("更换模组配对码"), "MODULE_BOUND_ELSEWHERE names the row")
+    check(GatewayNetworkIssue.userMessage(for: error("PAIRING_CODE_INVALID")) ==
+          GatewayNetworkIssue.userMessage(for: NSError(domain: "x", code: 1)), "other 409 stays generic")
+
+    let show = GatewayModuleIdentity.showsPairingControls
+    let old = GatewayCredentials(baseURL: URL(string: "https://x")!, deviceToken: "t", gatewayId: "g", deviceEpoch: 2)
+    var repaired = old
+    repaired.deviceEpoch = 3
+    repaired.deviceToken = "t2"
+    let marker = GatewayModuleIdentity.revokedMarker(old)
+    check(show(nil, nil) && show(nil, marker), "unpaired shows pairing controls")
+    check(!show(old, nil), "valid credentials hide pairing controls")
+    check(show(old, marker), "confirmed revoked credentials show pairing controls")
+    check(!show(repaired, marker), "re-paired (new epoch) hides them again")
+    check(!marker.contains("t"), "marker never carries the token")
+}
+
 print("GatewayControlSelfTests passed")
 
 check(VoDogServer.validatedURL("https://vodog.example.invalid") != nil, "configured HTTPS origin")

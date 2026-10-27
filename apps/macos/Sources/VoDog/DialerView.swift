@@ -31,6 +31,11 @@ struct DialerView: View {
         .onAppear {
             numberFocused = model.dialNumber.isEmpty
         }
+        // Key tone for both keypad clicks and keyboard typing: both land in dialNumber.
+        .onChange(of: model.dialNumber) { old, new in
+            DialKeyTone.shared.numberChanged(from: old, to: new)
+        }
+        .onDisappear { DialKeyTone.shared.stop() }
     }
 
     private func dialerCard(metrics: DialerMetrics) -> some View {
@@ -244,6 +249,7 @@ struct DialerView: View {
 
     private func dial() {
         guard canDial else { return }
+        DialKeyTone.shared.stop()
         appState.dial(model.dialNumber)
     }
 

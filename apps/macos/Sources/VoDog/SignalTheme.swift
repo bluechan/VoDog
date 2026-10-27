@@ -164,6 +164,7 @@ struct SignalBars: View {
 /// 「复制验证码 NNNNNN」: copy only; detection happens in the caller.
 struct CopyCodeButton: View {
     let code: String
+    var onCopy: (() -> Void)? = nil
     @State private var copied = false
 
     var body: some View {
@@ -171,6 +172,7 @@ struct CopyCodeButton: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(code, forType: .string)
             copied = true
+            onCopy?()
             Task {
                 try? await Task.sleep(for: .seconds(1.5))
                 copied = false
@@ -205,7 +207,8 @@ extension View {
     }
 
     /// SMS bubble: received `surface3`/ink, sent `bubbleOut`/white; radius 18 with a 6pt tail corner.
-    func signalBubble(outgoing: Bool) -> some View {
+    /// `fill`/`ink` override the colours (S101 AI turns: `aiSoft`/ink on the outgoing side).
+    func signalBubble(outgoing: Bool, fill: Color? = nil, ink: Color? = nil) -> some View {
         let shape = UnevenRoundedRectangle(
             topLeadingRadius: Signal.Radius.bubble,
             bottomLeadingRadius: outgoing ? Signal.Radius.bubble : Signal.Radius.bubbleTail,
@@ -215,8 +218,8 @@ extension View {
         )
         return self.padding(.horizontal, 13)
             .padding(.vertical, 8)
-            .foregroundStyle(outgoing ? Color.white : Signal.ink)
-            .background(outgoing ? Signal.bubbleOut : Signal.surface3, in: shape)
+            .foregroundStyle(ink ?? (outgoing ? Color.white : Signal.ink))
+            .background(fill ?? (outgoing ? Signal.bubbleOut : Signal.surface3), in: shape)
     }
 
     /// 52pt column toolbar with a bottom hairline.

@@ -79,6 +79,24 @@ enum VoDogJSON {
     }
 }
 
+/// S96 number home location. Full = the server string (`广东 深圳 · 移动`); short = the part before the first ` · `.
+enum VoDogLocation {
+    static func full(_ value: String?) -> String? {
+        guard let text = value?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        return text
+    }
+
+    static func short(_ value: String?) -> String? {
+        guard let text = full(value) else { return nil }
+        return full(text.range(of: " · ").map { String(text[..<$0.lowerBound]) } ?? text)
+    }
+
+    /// Row accessibility suffix 「，归属地 X」 (empty when there is no location).
+    static func accessibilitySuffix(_ value: String?) -> String {
+        short(value).map { "，" + L10n.tr("归属地 %@", $0) } ?? ""
+    }
+}
+
 enum VoDogReceptionMode: String, CaseIterable, Identifiable {
     case normal, ai, timeoutAI = "timeout_ai"
     var id: String { rawValue }
@@ -164,12 +182,15 @@ struct VoDogVoiceProviderList: Codable, Equatable {
     var items: [VoDogVoiceProvider]
     var selected: String?
     var configVersion: Int
+    /// S137: nil = old Control without the switch → hide it.
+    var contactInstantAi: Bool?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = try c.decodeIfPresent([VoDogVoiceProvider].self, forKey: .items) ?? []
         selected = try c.decodeIfPresent(String.self, forKey: .selected)
         configVersion = try c.decodeIfPresent(Int.self, forKey: .configVersion) ?? 1
+        contactInstantAi = try c.decodeIfPresent(Bool.self, forKey: .contactInstantAi)
     }
 }
 
@@ -303,6 +324,31 @@ struct VoDogBadges: Codable, Equatable {
     /// Badge text: nil hides it (0), >99 shows `99+`.
     static func text(_ count: Int) -> String? {
         count <= 0 ? nil : count > 99 ? "99+" : String(count)
+    }
+}
+
+/// Admin rename of a gateway: `PATCH /admin/gateways/:gatewayId` `{name}` (1…120 chars after trim).
+enum VoDogGatewayRename {
+    static let maxLength = 120
+
+    /// Trimmed name, or nil when empty or longer than 120 UTF-16 units (Control counts JS `.length`).
+    static func validName(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name.utf16.count > maxLength ? nil : name
+    }
+
+    static func request(gatewayId: String, name raw: String) -> (method: String, path: String, body: [String: Any])? {
+        guard let name = validName(raw) else { return nil }
+        return ("PATCH", "/admin/gateways/\(gatewayId)", ["name": name])
+    }
+
+    /// 409 name taken / 403 not admin get fixed copy; everything else goes through `VoDogErrorText`.
+    static func errorText(for error: Error) -> String {
+        if let api = error as? VoDogAPIError {
+            if api.status == 409 && (api.code ?? "").lowercased() == "gateway_name_taken" { return L10n.tr("已有同名网关") }
+            if api.status == 403 { return L10n.tr("需要管理员权限") }
+        }
+        return VoDogErrorText.text(for: error)
     }
 }
 

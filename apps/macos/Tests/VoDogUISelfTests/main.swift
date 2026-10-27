@@ -146,13 +146,13 @@ do {
 do {
     typealias D = VoDogSMSDeletePolicy
     let messages = [
-        VoDogSMSMessage(id: "a", simId: "s1", remoteNumber: "+8613800138000", createdAt: "2026-01-01"),
-        VoDogSMSMessage(id: "b", simId: "s1", remoteNumber: "13800138000", createdAt: "2026-01-02"),
+        VoDogSMSMessage(id: "a", simId: "s1", remoteNumber: "+862025550123", createdAt: "2026-01-01"),
+        VoDogSMSMessage(id: "b", simId: "s1", remoteNumber: "2025550123", createdAt: "2026-01-02"),
         VoDogSMSMessage(id: "c", simId: "s1", remoteNumber: "  ", createdAt: "2026-01-03")
     ]
-    let main = VoDogConversation(id: "13800138000", displayNumber: "+86 138", replyNumber: nil, canReply: true,
+    let main = VoDogConversation(id: "2025550123", displayNumber: "+86 138", replyNumber: nil, canReply: true,
                                         contactName: nil, messages: messages)
-    check(main.blockNumber == "13800138000", "newest non-empty raw remote number")
+    check(main.blockNumber == "2025550123", "newest non-empty raw remote number")
     check(main.threadAddress == "+86 138", "thread address is the display number")
     let blank = VoDogConversation(id: "x", displayNumber: " ", replyNumber: nil, canReply: false, contactName: nil,
                                          messages: [VoDogSMSMessage(id: "z", remoteNumber: nil)])
@@ -207,6 +207,142 @@ do {
     let items = try! JSONDecoder().decode([VoDogLiveCall].self, from: Data(#"[{"id":"a","internal":true,"peerSimId":"p","peerSimLabel":" 联通186 "},{"id":"b","internal":true,"peerSimLabel":""},{"id":"c","peerSimLabel":"x"}]"#.utf8))
     check(items[0].internalPeerLabel == "联通186", "internal ring shows the calling SIM label")
     check(items[1].internalPeerLabel == nil && items[2].internalPeerLabel == nil, "no label / external → normal title")
+}
+
+// S87: SMS body links — the spec's shared vectors, verbatim, plus the open guard.
+do {
+    func urls(_ text: String) -> [String] { SMSLinkPolicy.links(in: text).map(\.url) }
+    check(urls("验证码见 https://a.com/x?y=1，请查收") == ["https://a.com/x?y=1"], "S87: full-width comma ends link")
+    check(urls("点击 t.cn/A6abc 退订回T") == ["http://t.cn/A6abc"], "S87: short link gets http://")
+    check(urls("访问 www.10086.cn。") == ["http://www.10086.cn"], "S87: full-width period ends link")
+    check(urls("(详见 https://x.org/a).") == ["https://x.org/a"], "S87: trailing ). trimmed")
+    check(urls("两个链接 https://a.cn 和 b.com/c") == ["https://a.cn", "http://b.com/c"], "S87: two links in order")
+    check(urls("HTTP://EXAMPLE.COM/A") == ["HTTP://EXAMPLE.COM/A"], "S87: uppercase scheme kept as is")
+    check(urls("邮箱 foo@bar.com") == [], "S87: email is not a link")
+    check(urls("版本 3.5.1 价格 12.50") == [], "S87: numbers are not links")
+    check(urls("abc.community") == [], "S87: TLD must end at a boundary")
+    check(urls("ftp://x.com") == [], "S87: ftp not a link")
+    check(urls("https://") == [], "S87: bare scheme dropped")
+    check(urls("") == [], "S87: empty body")
+    let text = "(详见 https://x.org/a)."
+    check((text as NSString).substring(with: SMSLinkPolicy.links(in: text)[0].range) == "https://x.org/a",
+          "S87: range excludes trimmed punctuation")
+    check(SMSLinkPolicy.isOpenable(URL(string: "https://a.com")!), "S87: https openable")
+    check(SMSLinkPolicy.isOpenable(URL(string: "HTTP://EXAMPLE.COM/A")!), "S87: HTTP openable")
+    check(!SMSLinkPolicy.isOpenable(URL(string: "ftp://x.com")!), "S87: ftp blocked")
+    check(!SMSLinkPolicy.isOpenable(URL(string: "javascript:alert(1)")!), "S87: javascript blocked")
+    check(!SMSLinkPolicy.isOpenable(URL(string: "tel:10086")!), "S87: tel blocked")
+    check(!SMSLinkPolicy.isOpenable(URL(string: "a.com/x")!), "S87: schemeless blocked")
+}
+
+// S88: bubble right-click menu and single delete.
+do {
+    typealias D = VoDogSMSDeletePolicy
+    check(D.bubbleMenu(body: "hi", id: "m1") == [.copy, .select, .delete], "S88: full menu in fixed order")
+    check(D.bubbleMenu(body: "", id: "m1") == [.select, .delete], "S88: empty body hides 复制")
+    check(D.bubbleMenu(body: nil, id: "m1") == [.select, .delete], "S88: nil body hides 复制")
+    check(D.bubbleMenu(body: "hi", id: "") == [.copy], "S88: empty id hides 多选 and 删除")
+    check(D.bubbleMenu(body: nil, id: "") == [], "S88: nothing to offer")
+    check(D.singleDeleteIDs("m1") == ["m1"] && D.canDelete(D.singleDeleteIDs("m1")), "S88: single delete sends [id]")
+    check(D.singleDeleteIDs("") == [] && !D.canDelete(D.singleDeleteIDs("")), "S88: empty id never posts")
+}
+
+// S89: SMS list paging (spec common test table).
+do {
+    typealias S = VoDogSMSPaging
+    struct PageFailed: Error {}
+    func page(_ ids: [String], next: (String, String)? = nil) -> VoDogSMSPage {
+        let items = ids.map { "{\"id\":\"\($0)\",\"body\":\"\($0)\"}" }.joined(separator: ",")
+        let cursor = next.map { "{\"before\":\"\($0.0)\",\"beforeId\":\"\($0.1)\"}" } ?? "null"
+        return try! JSONDecoder().decode(VoDogSMSPage.self,
+                                         from: Data("{\"items\":[\(items)],\"nextCursor\":\(cursor)}".utf8))
+    }
+    final class Recorder { var queries: [[String: String]] = [] }
+
+    check(try! JSONDecoder().decode(VoDogSMSPage.self, from: Data(#"{"items":[]}"#.utf8)).nextCursor == nil,
+          "S89: old server without nextCursor = last page")
+
+    var r = Recorder()
+    var result = try! await S.fetchAll { q in r.queries.append(q); return page(["a", "b"]) }
+    check(r.queries == [["limit": "500"]] && result.items.map(\.id) == ["a", "b"] && !result.capped,
+          "S89: one page → one request, result is that page")
+
+    r = Recorder()
+    let pages = [page(["a", "b"], next: ("2026-09-01T00:00:00.000+08:00", "b")), page(["c"])]
+    result = try! await S.fetchAll { q in r.queries.append(q); return pages[r.queries.count - 1] }
+    check(r.queries.count == 2 && r.queries[1] == ["limit": "500", "before": "2026-09-01T00:00:00.000+08:00",
+                                                 "beforeId": "b"]
+          && result.items.map(\.id) == ["a", "b", "c"], "S89: two pages → cursor on 2nd request, page order kept")
+
+    r = Recorder()
+    let dupes = [page(["a", "b"], next: ("t", "b")), page(["b", "c"])]
+    result = try! await S.fetchAll { q in r.queries.append(q); return dupes[r.queries.count - 1] }
+    check(result.items.map(\.id) == ["a", "b", "c"] && result.items[1].body == "b", "S89: duplicate id → first wins")
+
+    r = Recorder()
+    var threw = false
+    do {
+        _ = try await S.fetchAll { q in
+            r.queries.append(q)
+            if r.queries.count == 2 { throw PageFailed() }
+            return page(["a"], next: ("t", "a"))
+        }
+    } catch { threw = error is PageFailed }
+    check(threw && r.queries.count == 2, "S89: second page fails → whole refresh fails (caller keeps old list)")
+
+    r = Recorder()
+    result = try! await S.fetchAll { q in r.queries.append(q); return page(["p\(r.queries.count)"], next: ("t", "x")) }
+    check(r.queries.count == 20 && result.items.count == 20 && result.capped,
+          "S89: endless nextCursor stops after page 20 with the data so far")
+    r = Recorder()
+    result = try! await S.fetchAll { q in
+        r.queries.append(q)
+        if q["limit"] == "500" { throw VoDogAPIError(status: 400, code: nil, message: nil, body: Data()) }
+        return page(["a", "b"], next: ("t", "b"))
+    }
+    check(r.queries == [["limit": "500"], ["limit": "100"]] && result.items.map(\.id) == ["a", "b"] && !result.capped,
+          "S89: old Control 400 on page 1 → one limit=100 request, its items, no paging")
+
+    r = Recorder()
+    threw = false
+    do {
+        _ = try await S.fetchAll { q in
+            r.queries.append(q)
+            if r.queries.count == 2 { throw VoDogAPIError(status: 400, code: nil, message: nil, body: Data()) }
+            return page(["a"], next: ("t", "a"))
+        }
+    } catch { threw = (error as? VoDogAPIError)?.status == 400 }
+    check(threw && r.queries.count == 2, "S89: 400 on a later page still fails the refresh")
+
+    r = Recorder()
+    threw = false
+    do {
+        _ = try await S.fetchAll { q in
+            r.queries.append(q)
+            throw VoDogAPIError(status: 500, code: nil, message: nil, body: Data())
+        }
+    } catch { threw = true }
+    check(threw && r.queries.count == 1, "S89: non-400 on page 1 fails without fallback")
+}
+
+do {
+    // S96: remoteLocation is optional on calls and SMS; conversation location = newest message's.
+    let calls = try! JSONDecoder().decode([VoDogLiveCall].self,
+        from: Data(#"[{"id":"a","remoteLocation":"广东 深圳 · 移动"},{"id":"b"}]"#.utf8))
+    check(calls[0].remoteLocation == "广东 深圳 · 移动" && calls[1].remoteLocation == nil, "S96 call remoteLocation decode")
+    let sms = try! JSONDecoder().decode([VoDogSMSMessage].self, from: Data(#"""
+        [{"id":"1","simId":"s","remoteNumber":"2025550123","createdAt":"2026-01-01","remoteLocation":"北京 · 联通"},
+         {"id":"2","simId":"s","remoteNumber":"2025550123","createdAt":"2026-01-02","remoteLocation":"广东 深圳 · 移动"},
+         {"id":"3","simId":"s","remoteNumber":"10086","createdAt":"2026-01-03"}]
+        """#.utf8))
+    let threads = VoDogPhonePolicy.conversations(sms, simID: "s")
+    check(threads.first { $0.id == "2025550123" }?.location == "广东 深圳 · 移动", "S96 conversation location from latest")
+    check(threads.first { $0.id == "10086" }?.location == nil, "S96 conversation without location")
+    let hit = try! JSONDecoder().decode(VoDogContactLookup.self,
+        from: Data(#"{"item":{"id":"c","displayName":"张三"},"location":"北京 · 联通"}"#.utf8))
+    check(hit.item?.displayName == "张三" && hit.location == "北京 · 联通", "S96 lookup decode")
+    let miss = try! JSONDecoder().decode(VoDogContactLookup.self, from: Data(#"{"item":null}"#.utf8))
+    check(miss.item == nil && miss.location == nil, "S96 lookup miss decode")
 }
 
 print("VoDogUISelfTests passed (\(checks) checks)")

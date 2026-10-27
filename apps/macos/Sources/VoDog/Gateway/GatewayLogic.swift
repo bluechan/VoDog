@@ -385,6 +385,34 @@ enum GatewayModuleIdentity {
     static func displayKey(imei: String) -> String { "imei:" + String(imei.filter(\.isNumber).suffix(6)) }
 
     static func diagKey(imei: String) -> String { "imei:***" + String(imei.filter(\.isNumber).suffix(4)) }
+
+    /// S130: `moduleKey` (= `storageKey`) + `moduleLabel` (last 6 IMEI digits) for `/gateway/pair` and the
+    /// heartbeat. Control validates `^\d{6}$`, so a short IMEI sends the key alone.
+    static func moduleFields(imei: String) -> [String: String] {
+        var fields = ["moduleKey": storageKey(imei: imei)]
+        let label = String(imei.filter(\.isNumber).suffix(6))
+        if label.count == 6 { fields["moduleLabel"] = label }
+        return fields
+    }
+
+    static func pairBody(code: String, imei: String) -> [String: Any] {
+        var body: [String: Any] = ["code": code, "label": "VoDog DJI 4G"]
+        for (key, value) in moduleFields(imei: imei) { body[key] = value }
+        return body
+    }
+
+    /// S130: credentials confirmed revoked (401 / epoch fence after the one module-copy re-read) are
+    /// remembered by gateway + epoch (never the token), so the marker survives a restart and goes stale
+    /// by itself once a re-pair or a module copy brings a new epoch.
+    static func revokedMarker(_ credentials: GatewayCredentials) -> String {
+        "\(credentials.gatewayId)|\(credentials.deviceEpoch)"
+    }
+
+    /// Manual 配对 / 加入账号 show when unpaired or when the current credentials are the revoked ones.
+    static func showsPairingControls(credentials: GatewayCredentials?, revokedMarker: String?) -> Bool {
+        guard let credentials else { return true }
+        return revokedMarker == Self.revokedMarker(credentials)
+    }
 }
 
 struct GatewayCredentialResolution: Equatable {
@@ -443,10 +471,28 @@ extension GatewayNetworkIssue {
             }
         }
         if let error = error as? GatewayHTTPError {
+            if error.status == 409, let message = moduleBindingMessage(error) { return message }
             if error.status == 401 { return L10n.tr("设备凭据已失效") }
             if error.status >= 500 { return L10n.tr("服务器暂时不可用") }
         }
         return L10n.tr("网关请求失败")
+    }
+
+    /// S130 `/gateway/pair` 409s. 『更换模组配对码』 stays Chinese in every language: it names the Web button.
+    static func moduleBindingMessage(_ error: GatewayHTTPError) -> String? {
+        let detail = GatewayJSON.object(String(decoding: error.body, as: UTF8.self))["error"] as? [String: Any]
+        let label = (detail?["boundModuleLabel"] as? String).map { "…" + $0 } ?? "…"
+        switch error.code {
+        case "MODULE_MISMATCH":
+            return L10n.tr("该配对码所属网关已绑定模组 %@，与当前模组不符；请在 Web 选对应行，或用『更换模组配对码』", label)
+        case "MODULE_KEY_REQUIRED":
+            return L10n.tr("该配对码所属网关已绑定模组 %@，配对需要当前模组标识；请在 Web 选对应行，或用『更换模组配对码』", label)
+        case "MODULE_BOUND_ELSEWHERE":
+            let name = detail?["boundGatewayName"] as? String ?? ""
+            return L10n.tr("当前模组已绑定在网关「%@」上，该配对码属于另一网关；请在 Web 选对应行，或用『更换模组配对码』", name)
+        default:
+            return nil
+        }
     }
 }
 

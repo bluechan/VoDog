@@ -176,7 +176,8 @@ struct RecordingsLibraryView: View {
                 detail: recordings.records.isEmpty
                     ? L10n.tr("在通话中手动开始录音，结束后会保存在此 Mac。")
                     : L10n.tr("可播放、定位、重命名、导出或删除通话录音。"),
-                systemImage: "waveform"
+                systemImage: "waveform",
+                illustration: "records-empty"
             )
         }
     }

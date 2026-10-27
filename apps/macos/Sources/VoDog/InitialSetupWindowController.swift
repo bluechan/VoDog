@@ -103,8 +103,7 @@ final class InitialSetupWindowController: NSObject, NSWindowDelegate {
         dismissalGeneration &+= 1
         appState?.initialSetupDidDismiss()
 
-        guard !MainWindowController.shared.isVisible,
-              !StandaloneFlowWindowController.shared.hasVisibleWindows,
+        guard !StandaloneFlowWindowController.shared.hasVisibleWindows,
               !CommunicationWindowController.shared.hasVisibleWindows else { return }
         NSApp.setActivationPolicy(.accessory)
     }

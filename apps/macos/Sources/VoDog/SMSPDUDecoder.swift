@@ -102,15 +102,16 @@ enum SMSPDUDecoder {
         }
         var headerByteCount = 0
         var concatenation: ConcatenationInfo?
+        var applicationPort: Int?
         if hasUserDataHeader {
             guard let userDataHeaderLength = availableUserData.first.map(Int.init),
                   userDataHeaderLength + 1 <= availableUserData.count else {
                 throw SMSPDUDecoderError.truncated(L10n.tr("用户数据头"))
             }
             headerByteCount = userDataHeaderLength + 1
-            concatenation = parseConcatenationHeader(
-                Array(availableUserData.prefix(headerByteCount))
-            )
+            let header = Array(availableUserData.prefix(headerByteCount))
+            concatenation = parseConcatenationHeader(header)
+            applicationPort = parseApplicationPort(header)
         }
 
         let body: String
@@ -137,6 +138,7 @@ enum SMSPDUDecoder {
             body: body,
             timestamp: timestamp,
             concatenation: concatenation,
+            applicationPort: applicationPort,
             dataCodingScheme: dataCodingScheme,
             rawPDU: rawPDU.uppercased()
         )
@@ -367,6 +369,23 @@ enum SMSPDUDecoder {
         if dcs & 0xF0 == 0xE0 { return .ucs2 }
         if dcs & 0xF0 == 0xF0 { return dcs & 0x04 == 0 ? .gsm7 : .eightBit }
         return .gsm7
+    }
+
+    /// Destination port of an application-addressed (data) SMS, TS 23.040 IEI 04 / 05.
+    private static func parseApplicationPort(_ header: [UInt8]) -> Int? {
+        guard header.count >= 2 else { return nil }
+        let end = 1 + min(Int(header[0]), header.count - 1)
+        var cursor = 1
+        while cursor + 2 <= end {
+            let identifier = header[cursor]
+            let length = Int(header[cursor + 1])
+            cursor += 2
+            guard cursor + length <= end else { break }
+            if identifier == 0x04, length == 2 { return Int(header[cursor]) }
+            if identifier == 0x05, length == 4 { return Int(header[cursor]) << 8 | Int(header[cursor + 1]) }
+            cursor += length
+        }
+        return nil
     }
 
     private static func parseConcatenationHeader(_ header: [UInt8]) -> ConcatenationInfo? {

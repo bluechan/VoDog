@@ -4,14 +4,32 @@ import SwiftUI
 // VoDog 记录与报告（S54 C3）。参照 iOS RecordsView.swift：左栏为通话记录 / 报告两种模式的分页列表，
 // 右栏为同一个通话详情（事实、转录、AI 对话、录音播放与 mp3 导出、删除）。
 
+/// S139: the 记录 section drives the two pages from its own segmented control.
+enum VoDogRecordsPage { case calls, reports }
+
 struct VoDogRecordsView: View {
     @ObservedObject var account: VoDogAccount
     @StateObject private var player = VoDogRecordingPlayer()
 
     @Binding var sidebarWidth: CGFloat
     /// S67: the rail 通话 route keeps its 拨打新号码 button (nil in VoDog → 记录与报告).
-    var onDial: (() -> Void)? = nil
-    @State private var mode = 0 // 0 通话记录，1 报告
+    var onDial: (() -> Void)?
+    /// S139: set → the internal 通话记录 / 报告 tabs are hidden and this binding picks the page.
+    private var page: Binding<VoDogRecordsPage>?
+    @State private var internalMode = 0 // 0 通话记录，1 报告
+    private var mode: Int { page.map { $0.wrappedValue == .calls ? 0 : 1 } ?? internalMode }
+
+    init(account: VoDogAccount, sidebarWidth: Binding<CGFloat>, onDial: (() -> Void)? = nil) {
+        self.account = account
+        _sidebarWidth = sidebarWidth
+        self.onDial = onDial
+    }
+
+    init(account: VoDogAccount, sidebarWidth: Binding<CGFloat>, page: Binding<VoDogRecordsPage>) {
+        self.account = account
+        _sidebarWidth = sidebarWidth
+        self.page = page
+    }
     @State private var query = ""
     @State private var simFilter = ""
     @State private var period: CCReportPeriod = .week
@@ -68,23 +86,25 @@ struct VoDogRecordsView: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
 
-            CommunicationGlassTabs(items: [(0, "通话记录"), (1, "报告")], selection: $mode)
-                .overlay {
-                    // S67: calls badge on the 通话记录 half (the two tabs are equal width).
-                    HStack(spacing: 0) {
-                        Color.clear.overlay(alignment: .topTrailing) {
-                            VoDogBadgeCount(store: account.badges, kind: .calls).offset(x: -2, y: -6)
+            if page == nil {
+                CommunicationGlassTabs(items: [(0, "通话记录"), (1, "报告")], selection: $internalMode)
+                    .overlay {
+                        // S67: calls badge on the 通话记录 half (the two tabs are equal width).
+                        HStack(spacing: 0) {
+                            Color.clear.overlay(alignment: .topTrailing) {
+                                VoDogBadgeCount(store: account.badges, kind: .calls).offset(x: -2, y: -6)
+                            }
+                            Color.clear
                         }
-                        Color.clear
+                        .allowsHitTesting(false)
                     }
-                    .allowsHitTesting(false)
-                }
-                .padding(.horizontal, 14)
-                .padding(.bottom, 8)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+            }
 
             HStack(spacing: 8) {
                 Picker(L10n.tr("线路"), selection: $simFilter) {
-                    Text(L10n.tr("全部线路")).tag("")
+                    Text(L10n.tr(page == nil ? "全部线路" : "全部 SIM 卡")).tag("")
                     ForEach(sims) { Text($0.title).tag($0.id) }
                 }
                 .labelsHidden()
@@ -140,7 +160,8 @@ struct VoDogRecordsView: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel((unseen ? L10n.tr("未查看") + "，" : "")
                                 + rowLabel(number: call.remoteNumber, name: call.internal == true ? recordTitle(call, ownSIM: simTitle(call.simId)) : call.contactName,
-                                           state: call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state)))
+                                           state: call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state, failureReason: call.failureReason))
+                                + VoDogLocation.accessibilitySuffix(call.remoteLocation))
                             .accessibilityAddTraits(selectedID == call.id ? .isSelected : [])
                         }
                         .listRowInsets(CommunicationUI.listRowInsets)
@@ -156,7 +177,8 @@ struct VoDogRecordsView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel((unseen ? L10n.tr("未查看") + "，" : "")
-                                + rowLabel(number: item.remoteNumber, name: item.internal == true ? recordTitle(item.asCallRecord, ownSIM: item.sim?.label) : item.contactName, state: nil))
+                                + rowLabel(number: item.remoteNumber, name: item.internal == true ? recordTitle(item.asCallRecord, ownSIM: item.sim?.label) : item.contactName, state: nil)
+                                + VoDogLocation.accessibilitySuffix(item.remoteLocation))
                             .accessibilityAddTraits(selectedID == item.callId ? .isSelected : [])
                         }
                         .listRowInsets(CommunicationUI.listRowInsets)
@@ -195,15 +217,7 @@ struct VoDogRecordsView: View {
     /// in-flight POST when another row is clicked quickly, leaving the first call unmarked).
     private func select(_ id: String) {
         selectedID = id
-        let call = calls.first { $0.id == id } ?? reports.first { $0.callId == id }?.asCallRecord
-        Task { await account.badges.markCallSeen(id, simID: call?.simId, pending: call?.unseen ?? call?.isBadgeCandidate ?? false) }
-    }
-
-    private func rowLabel(number: String?, name: String?, state: String?) -> String {
-        var parts = [callerTitle(number: number, name: name)]
-        if let name, !name.isEmpty, let number { parts.append(number) }
-        if let state { parts.append(L10n.tr(state)) }
-        return parts.joined(separator: "，")
+        markCallSeen(id, call: calls.first { $0.id == id } ?? reports.first { $0.callId == id }?.asCallRecord, account: account)
     }
 
     private func turnPage(_ delta: Int) {
@@ -234,7 +248,8 @@ struct VoDogRecordsView: View {
             PhoneEmptyState(
                 title: "选择一条通话",
                 detail: "可查看转录、AI 对话，播放或导出录音。",
-                systemImage: mode == 0 ? "clock" : "chart.bar.xaxis"
+                systemImage: mode == 0 ? "clock" : "chart.bar.xaxis",
+                illustration: "records-empty"
             )
         }
     }
@@ -297,7 +312,7 @@ struct VoDogRecordsView: View {
 
 // MARK: - 行
 
-private struct VoDogCallRow: View {
+struct VoDogCallRow: View {
     let call: CCCallRecord
     let simTitle: String?
     let ownSIM: String?
@@ -316,8 +331,10 @@ private struct VoDogCallRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(recordTitle(call, ownSIM: ownSIM))
                     .font(.callout.weight(.medium)).lineLimit(1)
-                if let name = call.contactName, !name.isEmpty, let number = call.remoteNumber {
-                    Text(number).font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                if hasNumberLine, let number = call.remoteNumber {
+                    (Text(verbatim: number).font(.caption.monospacedDigit())
+                        + Text(verbatim: location.map { " · \($0)" } ?? "").font(.caption))
+                        .foregroundStyle(.secondary).lineLimit(1)
                 }
                 Text(metaLine).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 if !tags.isEmpty {
@@ -333,8 +350,13 @@ private struct VoDogCallRow: View {
         .padding(.vertical, 4)
     }
 
+    private var hasNumberLine: Bool { call.contactName?.isEmpty == false && call.remoteNumber != nil }
+    /// S96: short location after the number line, or first in the meta line when the number is the title.
+    private var location: String? { VoDogLocation.short(call.remoteLocation) }
+
     private var metaLine: String {
-        var parts = [CCTime.gatewayClock(call.startedAt, zone: call.gatewayTimeZone)]
+        var parts = hasNumberLine ? [] : [location].compactMap { $0 }
+        parts.append(CCTime.gatewayClock(call.startedAt, zone: call.gatewayTimeZone))
         if let simTitle { parts.append(simTitle) }
         if let duration = CCTime.duration(answeredAt: call.answeredAt, endedAt: call.endedAt) { parts.append(duration) }
         return parts.joined(separator: " · ")
@@ -347,7 +369,7 @@ private struct VoDogCallRow: View {
         if let occ = CCRecordLabels.occupancy(call) {
             return L10n.tr("通话中 · 由 %@ 接听 · 自 %@", occ.owner.isKey ? L10n.tr(occ.owner.text) : occ.owner.text, occ.since)
         }
-        return L10n.tr(call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state))
+        return L10n.tr(call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state, failureReason: call.failureReason))
     }
 }
 
@@ -413,14 +435,27 @@ private struct ReportBadges: View {
     }
 }
 
-private func callerTitle(number: String?, name: String?) -> String {
+/// S67 mark-seen on select, shared by 记录 and the S139 电话 page (the detail itself does not mark).
+@MainActor
+func markCallSeen(_ id: String, call: CCCallRecord?, account: VoDogAccount) {
+    Task { await account.badges.markCallSeen(id, simID: call?.simId, pending: call?.unseen ?? call?.isBadgeCandidate ?? false) }
+}
+
+func rowLabel(number: String?, name: String?, state: String?) -> String {
+    var parts = [callerTitle(number: number, name: name)]
+    if let name, !name.isEmpty, let number { parts.append(number) }
+    if let state { parts.append(L10n.tr(state)) }
+    return parts.joined(separator: "，")
+}
+
+func callerTitle(number: String?, name: String?) -> String {
     if let name = name?.trimmingCharacters(in: .whitespaces), !name.isEmpty { return name }
     if let number = number?.trimmingCharacters(in: .whitespaces), !number.isEmpty { return number }
     return L10n.tr("未知号码")
 }
 
 /// S72: internal calls read "内部通话 A → B" (caller SIM → callee SIM) instead of a number.
-private func recordTitle(_ call: CCCallRecord, ownSIM: String?) -> String {
+func recordTitle(_ call: CCCallRecord, ownSIM: String?) -> String {
     if let route = CCRecordLabels.internalRoute(call, ownSIM: ownSIM) {
         return L10n.tr("内部通话 %@ → %@", route.from, route.to)
     }
@@ -428,7 +463,7 @@ private func recordTitle(_ call: CCCallRecord, ownSIM: String?) -> String {
 }
 
 /// 接听端 / 来源 / AI 标签，列表与详情共用。
-private func callTags(_ call: CCCallRecord) -> [String] {
+func callTags(_ call: CCCallRecord) -> [String] {
     var tags: [String] = []
     if let badge = CCRecordLabels.badge(call) { tags.append(L10n.tr(badge)) }
     if let owner = CCRecordLabels.owner(call), call.answeredAt != nil || call.originatingPlatform != nil {
@@ -440,8 +475,9 @@ private func callTags(_ call: CCCallRecord) -> [String] {
 }
 
 private func reportFacts(_ item: CCReportItem, simTitle: String?) -> String {
-    var parts = [simTitle.flatMap { $0.isEmpty ? nil : $0 } ?? L10n.tr("未知线路"),
-                 L10n.tr(CCRecordLabels.direction(item.direction))]
+    var parts = [simTitle.flatMap { $0.isEmpty ? nil : $0 } ?? L10n.tr("未知线路")]
+    if let location = VoDogLocation.short(item.remoteLocation) { parts.append(location) }
+    parts.append(L10n.tr(CCRecordLabels.direction(item.direction)))
     if let duration = CCTime.duration(answeredAt: item.answeredAt, endedAt: item.endedAt) { parts.append(duration) }
     parts.append(L10n.tr(CCRecordLabels.answerMethod(
         answerMode: item.answerMode, answeredByPlatform: item.answeredByPlatform, answeredAt: item.answeredAt)))
@@ -450,12 +486,13 @@ private func reportFacts(_ item: CCReportItem, simTitle: String?) -> String {
 
 // MARK: - 详情
 
-private struct VoDogRecordDetail: View {
+struct VoDogRecordDetail: View {
     @ObservedObject var account: VoDogAccount
     @ObservedObject var player: VoDogRecordingPlayer
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var calls = VoDogCallStore.shared
     @AppStorage("VoDogPhone.sim.v1") private var storedSIM = ""
+    @AppStorage(VoDogLinePolicy.localLineKey) private var localLine = ""
     let callId: String
     let seed: CCCallRecord?
     let report: CCReportItem?
@@ -486,10 +523,10 @@ private struct VoDogRecordDetail: View {
             AdaptiveGlassContainer(spacing: 16) {
                 VStack(alignment: .leading, spacing: 16) {
                     header
+                    recordingCard
                     if let report { reportCard(report) }
                     transcriptCard
                     if !aiItems.isEmpty { aiCard }
-                    recordingCard
                     if let actionError {
                         Label(actionError, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption).foregroundStyle(.red)
@@ -543,6 +580,9 @@ private struct VoDogRecordDetail: View {
                     if let name = shown?.contactName, !name.isEmpty, let number = shown?.remoteNumber {
                         Text(number).font(.callout.monospacedDigit()).foregroundStyle(.secondary).textSelection(.enabled)
                     }
+                    if let location = VoDogLocation.full(shown?.remoteLocation) {
+                        Text(verbatim: location).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
                 }
                 .layoutPriority(1)
             }
@@ -593,7 +633,7 @@ private struct VoDogRecordDetail: View {
                 (L10n.tr("开始"), CCTime.gatewayClock(call.startedAt, zone: call.gatewayTimeZone)),
             ]
             if call.state != nil {
-                rows.append((L10n.tr("状态"), L10n.tr(call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state))))
+                rows.append((L10n.tr("状态"), L10n.tr(call.isMissedIncoming ? "未接来电" : CCRecordLabels.state(call.state, failureReason: call.failureReason))))
             }
             if let sim = simTitle(call.simId) { rows.append((L10n.tr("线路"), sim)) }
             rows.append((L10n.tr("时长"), CCTime.duration(answeredAt: call.answeredAt, endedAt: call.endedAt) ?? L10n.tr("未接通")))
@@ -663,7 +703,7 @@ private struct VoDogRecordDetail: View {
             Label(L10n.tr("转录失败"), systemImage: "xmark.circle").foregroundStyle(.red)
                 .reportsVoDogError(L10n.tr("转录失败"))
         case "succeeded":
-            if let result = job.result { transcriptResult(result) }
+            if let result = job.result { transcriptResult(result, dialog: job.dialog) }
             else {
                 Label(L10n.tr("转录结果无效"), systemImage: "exclamationmark.triangle").foregroundStyle(.red)
                     .reportsVoDogError(L10n.tr("转录结果无效"))
@@ -673,7 +713,7 @@ private struct VoDogRecordDetail: View {
         }
     }
 
-    @ViewBuilder private func transcriptResult(_ result: CCTranscriptResult) -> some View {
+    @ViewBuilder private func transcriptResult(_ result: CCTranscriptResult, dialog: CCTranscriptDialog?) -> some View {
         if let summary = result.summary, !summary.isEmpty {
             VStack(alignment: .leading, spacing: 3) {
                 Text(L10n.tr("摘要")).font(.caption).foregroundStyle(.secondary)
@@ -689,7 +729,9 @@ private struct VoDogRecordDetail: View {
             }
         }
         let blocks = CCTranscriptBlock.blocks(from: result.segments ?? [])
-        if blocks.isEmpty {
+        if let dialog, let turns = CCTranscriptDialogLayout.turns(dialog) {
+            transcriptDialog(turns, estimated: CCTranscriptDialogLayout.showsEstimateNote(dialog))
+        } else if blocks.isEmpty {
             Text(result.text ?? "").textSelection(.enabled)
         } else {
             VStack(alignment: .leading, spacing: 10) {
@@ -708,6 +750,34 @@ private struct VoDogRecordDetail: View {
             }
         }
         Text(L10n.tr("机器转录供参考，可对照原始录音核实。")).font(.caption2).foregroundStyle(.secondary)
+    }
+
+    /// S101: one conversation, remote left / me and AI right, mm:ss from call start under each bubble.
+    private func transcriptDialog(_ turns: [CCTranscriptTurn], estimated: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if estimated {
+                Text(L10n.tr("时间为估算")).font(.caption).foregroundStyle(Signal.ink3).padding(.bottom, 8)
+            }
+            ForEach(Array(turns.enumerated()), id: \.offset) { index, turn in
+                let style = CCTranscriptDialogLayout.style(turn.role)
+                let trailing = style != .incoming
+                VStack(alignment: trailing ? .trailing : .leading, spacing: 3) {
+                    if let label = CCTranscriptDialogLayout.label(turn.role) {
+                        Text(verbatim: label).font(.system(size: 11, weight: .semibold)).foregroundStyle(Signal.ai)
+                    }
+                    Text(turn.text)
+                        .textSelection(.enabled)
+                        .signalBubble(outgoing: trailing,
+                                      fill: style == .ai ? Signal.aiSoft : nil,
+                                      ink: style == .ai ? Signal.ink : nil)
+                        .frame(maxWidth: 620, alignment: trailing ? .trailing : .leading)  // ≈72% of the 940 pt detail column
+                    Text(verbatim: CCTranscriptDialogLayout.clock(turn.atMs))
+                        .font(.system(size: 12).monospacedDigit()).foregroundStyle(Signal.ink3)
+                }
+                .frame(maxWidth: .infinity, alignment: trailing ? .trailing : .leading)
+                .padding(.top, CCTranscriptDialogLayout.spacing(before: index, in: turns))
+            }
+        }
     }
 
     // AI 对话
@@ -735,7 +805,9 @@ private struct VoDogRecordDetail: View {
     private var recordingCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             cardTitle("录音", systemImage: "waveform")
-            if !recordingLoaded {
+            if CCRecordLabels.hasNoRecording(shown?.recordingStatus, state: shown?.state) {
+                Text(L10n.tr("本次通话没有录音")).font(.callout).foregroundStyle(.secondary)
+            } else if !recordingLoaded {
                 ProgressView().controlSize(.small)
             } else if let recordingError {
                 Label(recordingError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red)
@@ -857,6 +929,10 @@ private struct VoDogRecordDetail: View {
 
     /// 先取 Pixel 原始归档；503 / 404 / 空清单都退到媒体节点。
     private func loadRecording() async {
+        if CCRecordLabels.hasNoRecording(shown?.recordingStatus, state: shown?.state) {
+            recordingLoaded = true
+            return
+        }
         var lastError: Error?
         for source in ["pixel", "media_node"] {
             do {
@@ -911,6 +987,7 @@ private struct VoDogRecordDetail: View {
     private func openSMS() {
         guard let simId = shown?.simId, !remoteNumber.isEmpty else { return }
         storedSIM = simId
+        localLine = ""  // S139: an account SIM line, so 短信 shows the cloud thread
         VoDogMessagesView.pendingRecipient = remoteNumber
         appState.showPhoneWindow(section: .messages)
     }
@@ -939,6 +1016,7 @@ private struct VoDogRecordDetail: View {
             // DELETE 返回 204 无正文，用 data() 避免 JSON 解析。
             _ = try await account.data("DELETE", "/calls/\(callId)")
             player.stop()
+            VoDogRecordingPlayer.removeCached(callId: callId)
             account.diag("records.delete", callId: callId)
             onDeleted()
         } catch {

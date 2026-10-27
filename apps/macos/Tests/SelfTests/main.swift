@@ -726,6 +726,16 @@ do {
     try expect(ucs2.body == "你好", "UCS2 body")
     try expect(ucs2.concatenation == nil, "unexpected UDH")
 
+    // Synthetic data SMS (fictional sender +1 555-555-0100): UDH 06 05 04 9199 0000 (port 37273), UCS2 "579816".
+    let dataPDU = "00440B915155550501F00008620152614530231306050491990000003500370039003800310036"
+    let dataSMS = try SMSPDUDecoder.decode(dataPDU)
+    try expect(dataSMS.applicationPort == 37273, "16-bit application port")
+    try expect(dataSMS.body == "579816" && dataSMS.concatenation == nil, "data SMS payload")
+    try expect(ucs2.applicationPort == nil, "plain SMS has no port")
+    let dataMessage = SMSMessage(id: "data", modemIndices: [1], sender: dataSMS.sender, body: dataSMS.body,
+                                 timestamp: Date(), rawPDUs: [dataPDU], isRead: false, firstSeenAt: Date())
+    try expect(dataMessage.isApplicationDataSMS, "data SMS flagged for hiding")
+
     let gsm7PDU = "00040A91214365870900006270211020302305E8329BFD06"
     let gsm7 = try SMSPDUDecoder.decode(gsm7PDU)
     try expect(gsm7.sender == "+1234567890", "GSM-7 sender")

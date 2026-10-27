@@ -45,6 +45,10 @@ do {
 // MARK: labels
 
 check(CCRecordLabels.platform("ios") == "iPhone 端", "ios")
+check(CCRecordLabels.platform("watchos") == "手表端", "S105 watchos")
+var watchCall = CCCallRecord(id: "w")
+watchCall.answeredByPlatform = "watchos"
+check(CCRecordLabels.owner(watchCall)?.isKey == true && CCRecordLabels.owner(watchCall)?.text == "手表端", "S105 watchos owner → 手表端")
 check(CCRecordLabels.platform("android") == "Android 端", "android")
 check(CCRecordLabels.platform("web") == "网页端", "web")
 check(CCRecordLabels.platform("ai") == "AI 接听", "ai")
@@ -53,16 +57,29 @@ check(CCRecordLabels.platform("zzz") == nil, "unknown platform")
 // S58 gateway kind: text only, missing → pixel.
 check(CCRecordLabels.platform("pixel", gatewayKind: "dji4g") == "通过 DJI 4G 模组拨打", "dji4g direct dial")
 check(CCRecordLabels.platform("pixel", gatewayKind: nil) == "通过手机拨打", "missing kind → pixel")
+// S143: a blocked incoming call reads 已拦截, other failures still 失败.
+check(CCRecordLabels.state("failed", failureReason: "number_blocked") == "已拦截", "blocked call state")
+check(CCRecordLabels.state("failed", failureReason: "remoteHangup") == "失败", "other failure state")
+check(CCRecordLabels.state("failed") == "失败", "failure without reason")
 check(CCRecordLabels.badge(failureReason: nil, blockedSource: nil, conflictDisposition: nil, originatingPlatform: "pixel",
                            gatewayKind: "dji4g") == "通过 DJI 4G 模组拨打", "dji4g badge")
 check(CCRecordLabels.recordingSource("pixel", gatewayKind: "dji4g") == "DJI 4G 原始归档", "dji4g archive")
 check(CCRecordLabels.recordingSource("pixel", gatewayKind: "pixel") == "Pixel 原始归档", "pixel archive")
 check(CCRecordLabels.recordingSource("server", gatewayKind: "dji4g") == "服务器录音", "server recording")
+// S120 (caller-center S118): ended/failed + status nil / empty / none → 本次通话没有录音.
+check(CCRecordLabels.hasNoRecording("none", state: "ended"), "S120 none + ended → no recording")
+check(CCRecordLabels.hasNoRecording("", state: "ended"), "S120 empty + ended → no recording")
+check(CCRecordLabels.hasNoRecording(nil, state: "failed"), "S120 nil + failed → no recording")
+check(!CCRecordLabels.hasNoRecording("pending", state: "ended"), "S120 pending keeps fetch")
+check(!CCRecordLabels.hasNoRecording("ready", state: "ended"), "S120 ready keeps fetch")
+check(!CCRecordLabels.hasNoRecording("none", state: "active"), "S120 none while active → not yet")
+check(!CCRecordLabels.hasNoRecording("none", state: nil), "S120 none without state → not ended")
 check(CCRecordLabels.state("active") == "通话中" && CCRecordLabels.state(nil) == "状态待确认", "state titles")
 check(CCRecordLabels.badge(failureReason: "number_blocked", blockedSource: nil, conflictDisposition: nil, originatingPlatform: "pixel") == "已拦截", "blocked wins, unknown source")
 check(CCRecordLabels.badge(failureReason: "number_blocked", blockedSource: "phone", conflictDisposition: nil, originatingPlatform: nil) == "手机自动拦截", "phone source")
 check(CCRecordLabels.badge(failureReason: "busy_auto_rejected", blockedSource: nil, conflictDisposition: nil, originatingPlatform: nil) == "忙线未接", "S72 busy reject → 忙线未接")
 check(CCRecordLabels.badge(failureReason: nil, blockedSource: nil, conflictDisposition: "ai_answered", originatingPlatform: "pixel") == "忙线 AI 代接", "conflict before pixel")
+check(CCRecordLabels.badge(failureReason: nil, blockedSource: nil, conflictDisposition: "screened_ai", originatingPlatform: "pixel") == "拦截转 AI 接听", "S136 screened AI")
 check(CCRecordLabels.badge(failureReason: nil, blockedSource: nil, conflictDisposition: nil, originatingPlatform: "pixel") == "通过手机拨打", "pixel badge")
 check(CCRecordLabels.answerMethod(answerMode: "ai", answeredByPlatform: "ai", answeredAt: nil) == "未接", "missed first")
 check(CCRecordLabels.answerMethod(answerMode: "timeout_ai", answeredByPlatform: "ai", answeredAt: "t") == "超时 AI", "timeout ai")
@@ -144,6 +161,56 @@ do {
     let ai = try CCRecords.decode(CCAiTranscriptEnvelope.self, from: json(#"{"items":[{"role":"ai","text":"您好","at":"t"},{"role":"caller","text":"找谁","at":null}]}"#))
     check(ai.items.count == 2 && CCRecordLabels.aiRole(ai.items[0].role) == "AI 助理" && CCRecordLabels.aiRole(ai.items[1].role) == "对方", "ai transcript")
 } catch { check(false, "transcript decode threw \(error)") }
+
+// MARK: S101 transcript dialog (expected turns copied from caller-center docs/specs/fixtures/s101-dialog.json)
+
+do {
+    let human = try CCRecords.decode(CCTranscriptEnvelope.self, from: json(#"""
+    {"transcript":{"status":"succeeded","result":{"text":"x","segments":[]},
+     "dialog":{"timebase":"end_aligned","maxSkewMs":600,"turns":[
+       {"role":"remote","text":"喂，你好是王总吗","atMs":500,"endAtMs":2000,"source":"asr","track":"remote_original"},
+       {"role":"me","text":"对，我是","atMs":2500,"endAtMs":3400,"source":"asr","track":"caller_original"},
+       {"role":"remote","text":"好的再见","atMs":8000,"endAtMs":9000,"source":"asr","track":"remote_original"},
+       {"role":"me","text":"再见","atMs":8500,"endAtMs":9000,"source":"asr","track":"caller_original"}]}}}
+    """#))
+    let dialog = human.transcript!.dialog!
+    let turns = CCTranscriptDialogLayout.turns(dialog)!
+    check(dialog.timebase == "end_aligned" && turns.count == 4 && turns[1].text == "对，我是" && turns[1].endAtMs == 3400, "human dialog decodes")
+    check(turns.map { CCTranscriptDialogLayout.style($0.role) } == [.incoming, .outgoing, .incoming, .outgoing], "remote left, me right")
+    check(turns.map { CCTranscriptDialogLayout.trailing($0.role) } == [false, true, false, true], "sides")
+    check(turns.map { CCTranscriptDialogLayout.label($0.role) } == [nil, nil, nil, nil], "no label on human turns")
+    check(turns.map { CCTranscriptDialogLayout.clock($0.atMs) } == ["00:00", "00:02", "00:08", "00:08"], "human mm:ss")
+    check((0..<4).map { CCTranscriptDialogLayout.spacing(before: $0, in: turns) } == [0, 12, 12, 12], "alternating roles → 12")
+    check(!CCTranscriptDialogLayout.showsEstimateNote(dialog), "600 ms skew → no estimate note")
+
+    let ai = try CCRecords.decode(CCTranscriptDialog.self, from: json(#"""
+    {"timebase":"ai_realtime","maxSkewMs":0,"turns":[
+      {"role":"ai","text":"您好，这里是王总的助理，请问哪位？","atMs":2753,"source":"ai_realtime"},
+      {"role":"remote","text":"你好，我找王总","atMs":12231,"source":"ai_realtime"},
+      {"role":"ai","text":"好的，请问您贵姓？","atMs":12819,"source":"ai_realtime"}]}
+    """#))
+    let aiTurns = CCTranscriptDialogLayout.turns(ai)!
+    check(aiTurns[0].endAtMs == nil && aiTurns[0].track == nil, "realtime turns have no endAtMs/track")
+    check(aiTurns.map { CCTranscriptDialogLayout.style($0.role) } == [.ai, .incoming, .ai], "ai right on aiSoft")
+    check(CCTranscriptDialogLayout.trailing("ai") && CCTranscriptDialogLayout.label("ai") == "✦ AI", "ai label")
+    check(aiTurns.map { CCTranscriptDialogLayout.clock($0.atMs) } == ["00:02", "00:12", "00:12"], "ai mm:ss")
+    check(CCTranscriptDialogLayout.clock(83000) == "01:23" && CCTranscriptDialogLayout.clock(3725000) == "62:05"
+          && CCTranscriptDialogLayout.clock(-5) == "00:00", "clock edges")
+
+    var run = ai
+    run.turns.insert(.init(role: "ai", text: "稍等", atMs: 3000), at: 1)
+    run.maxSkewMs = 1600
+    check((0..<4).map { CCTranscriptDialogLayout.spacing(before: $0, in: run.turns) } == [0, 4, 12, 12], "same role → 4")
+    check(CCTranscriptDialogLayout.showsEstimateNote(run), "1600 ms skew → estimate note")
+    check(CCTranscriptDialogLayout.style("unknown") == .incoming, "unknown role stays left")
+
+    let old = try CCRecords.decode(CCTranscriptEnvelope.self, from: json(#"{"transcript":{"status":"succeeded","result":{"text":"a"}}}"#))
+    check(old.transcript?.dialog == nil && CCTranscriptDialogLayout.turns(nil) == nil, "old Control: no dialog → flat fallback")
+    let nullDialog = try CCRecords.decode(CCTranscriptEnvelope.self, from: json(#"{"transcript":{"status":"queued","dialog":null}}"#))
+    check(nullDialog.transcript?.dialog == nil, "null dialog")
+    check(CCTranscriptDialogLayout.turns(.init(timebase: nil, maxSkewMs: nil, turns: [.init(role: "me", text: " ", atMs: 0)])) == nil,
+          "blank-only turns → fallback")
+} catch { check(false, "S101 dialog decode threw \(error)") }
 
 // MARK: recording manifests
 
@@ -304,5 +371,38 @@ do {
     let report = try CCRecords.decode([CCReportItem].self, from: json(#"[{"callId":"r","internal":true,"peerSimLabel":"A"}]"#))
     check(report[0].asCallRecord.internal == true && report[0].asCallRecord.peerSimLabel == "A", "report carries internal fields")
 } catch { check(false, "S72 decode threw \(error)") }
+
+do {
+    // S96: optional remoteLocation on calls and report items; the report → call copy keeps it.
+    let calls = try CCRecords.decode([CCCallRecord].self, from: json(#"[{"id":"a","remoteLocation":"北京 · 联通"},{"id":"b"}]"#))
+    check(calls[0].remoteLocation == "北京 · 联通" && calls[1].remoteLocation == nil, "S96 call remoteLocation decode")
+    let report = try CCRecords.decode([CCReportItem].self, from: json(#"[{"callId":"r","remoteLocation":"加纳"},{"callId":"s"}]"#))
+    check(report[0].asCallRecord.remoteLocation == "加纳" && report[1].asCallRecord.remoteLocation == nil,
+          "S96 report remoteLocation survives asCallRecord")
+} catch { check(false, "S96 decode threw \(error)") }
+
+// 播放：看门狗、mp3 优先、本地缓存命名与淘汰。
+check(CCPlaybackPolicy.loadTimeoutSeconds(track: "conversation") == 90, "conversation mix gets 90 s")
+check(CCPlaybackPolicy.loadTimeoutSeconds(track: "caller_original") == 30, "single track keeps 30 s")
+check(CCPlaybackPolicy.mp3First(track: "conversation", source: "media"), "conversation is mp3-only")
+check(CCPlaybackPolicy.mp3First(track: "caller_original", source: "pixel"), "pixel single track asks mp3 first")
+check(!CCPlaybackPolicy.mp3First(track: "caller_original", source: "media"), "media node track stays Ogg")
+do {
+    let id = "0c7336d3-1a2b-4c5d-8e9f-0123456789ab"
+    let name = CCRecordingCacheNaming.fileName(callId: id, source: "pixel", track: "conversation", ext: "mp3")
+    check(name == "\(id).pixel.conversation.mp3", "cache name keeps uuid hyphens: \(name)")
+    check(name.hasPrefix(CCRecordingCacheNaming.callPrefix(id)), "call prefix matches its files")
+    let odd = CCRecordingCacheNaming.fileName(callId: "../a b", source: "x/y", track: "t.", ext: "ogg")
+    check(odd == "___a_b.x_y.t_.ogg" && !odd.contains("/"), "path characters sanitized: \(odd)")
+    check(!CCRecordingCacheNaming.fileName(callId: "ab", source: "s", track: "t", ext: "mp3")
+        .hasPrefix(CCRecordingCacheNaming.callPrefix("a")), "prefix of one call never matches another id")
+    let base = Date(timeIntervalSince1970: 1_000)
+    let files = (0..<5).map { i in (url: URL(fileURLWithPath: "/c/\(i)"), size: 10, mtime: base.addingTimeInterval(Double(i))) }
+    check(Set(CCRecordingCacheNaming.pruneSelection(files, maxFiles: 3, maxBytes: 1_000).map(\.lastPathComponent)) == ["0", "1"],
+          "count cap keeps the 3 newest")
+    check(Set(CCRecordingCacheNaming.pruneSelection(files, maxFiles: 100, maxBytes: 25).map(\.lastPathComponent)) == ["0", "1", "2"],
+          "byte cap keeps the 2 newest")
+    check(CCRecordingCacheNaming.pruneSelection(files).isEmpty, "default caps keep everything small")
+}
 
 print("VoDogRecordsSelfTests passed")

@@ -45,6 +45,9 @@ final class VoDogAccount: ObservableObject {
     /// S67 unread badges (separate object so a count change re-renders only the badge sites).
     let badges = VoDogBadgeStore()
     let baseURL = VoDogServer.baseURL
+    /// 录音本地回放缓存（VoDogPlayback.swift 读写）；放在这里是为了让 `clearLocal()` 退出登录时整目录清掉。
+    nonisolated static let recordingCacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("org.vodog.macos/VoDogRecordings", isDirectory: true)
 
     /// Session persistence; the Keychain in the app, in memory in self-tests.
     struct Store {
@@ -156,6 +159,7 @@ final class VoDogAccount: ObservableObject {
         simsError = nil
         simsLoaded = false
         badges.reset()
+        try? FileManager.default.removeItem(at: Self.recordingCacheDirectory)
     }
 
     /// `GET /sims` into the shared cache. A failure keeps the last list but marks it stale.
@@ -531,7 +535,7 @@ enum VoDogKeychain {
 enum VoDogPollCadence {
     static var isForeground: Bool {
         guard let app = NSApp else { return true }  // self-tests run without an NSApplication
-        return app.isActive || onScreen(["VoDogCommunicationWindow.v5", "VoDogMessagesWindow.v4"])
+        return app.isActive || onScreen(["VoDogCommunicationWindow.v6"])
     }
 
     /// Open, not minimized, and not fully covered (`isVisible` alone stays true behind other windows).
