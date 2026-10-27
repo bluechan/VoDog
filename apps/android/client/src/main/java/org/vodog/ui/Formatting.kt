@@ -160,14 +160,15 @@ internal fun directionLabel(value: String): String = when (value) {
  * title everywhere else; Android deliberately uses this map in both places so a call never reads
  * "ended" on one screen and "已结束" on another.
  */
-internal fun callStateLabel(value: String): String = when (value) {
+internal fun callStateLabel(value: String, failureReason: String? = null): String = when (value) {
+    // S143: a blocked incoming call is stored as `failed` + `number_blocked`; it reads 已拦截, never 失败.
+    "failed" -> if (failureReason == "number_blocked") "已拦截" else "失败"
     "incoming_ringing" -> "来电响铃"
     "outgoing_pending" -> "等待拨号"
     "connecting" -> "连接中"
     "active" -> "通话中"
     "ending" -> "正在结束"
     "ended" -> "已结束"
-    "failed" -> "失败"
     else -> "状态待确认"
 }
 

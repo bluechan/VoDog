@@ -62,6 +62,8 @@ object ClientApiRoutes {
     // and the 设置 section hides itself.
     const val AI_VOICE_PROVIDERS = "/ai/voice-providers"
     const val AI_VOICE_PROVIDER = "/ai/voice-provider"
+    /** S137：通讯录来电 AI 即接开关；旧 Control 404，GET 里也没有 `contactInstantAi`，开关不显示。 */
+    const val AI_CONTACT_INSTANT_AI = "/ai/contact-instant-ai"
     /** S36 C3: 结构化诊断事件，来源靠 `X-Diag-Source` 头，不在体里。 */
     const val DIAG_EVENTS = "/diag/events"
     // S30 §1. 删除没有幂等键：`DELETE /calls/:id` 天然幂等（重复一次是 404），两条短信删除是按 id /
@@ -137,47 +139,52 @@ object ClientApiRoutes {
         return "$CALLS?query=${query(trimmed)}&limit=${limit.coerceIn(1, CALLS_PAGE_LIMIT)}"
     }
     /**
-     * S28 分页版 `GET /calls`. `page` 是分页的开关，所以这条路由永远带 `page`；`limit` 和游标
-     * (`before`/`beforeId`) 一律不送——服务端把 `page` 与游标的组合判成 400。`simId` 也走服务端：
-     * 先切页再按 SIM 过滤会同时报错行和错总数。
+     * 记录页「全部通话」的游标版 `GET /calls`：每次 [CALLS_CHUNK] 条，下一段带上已加载最后一行的
+     * `startedAt`/`id`（`before`/`beforeId`，原样转义）。`page`/`pageSize` 一律不送——服务端把 `page`
+     * 与游标的组合判成 400。`simId` 和搜索词也走服务端的 WHERE。
      */
     fun callsPage(
         query: String = "",
         simId: String = "",
-        page: Int = 1,
-        pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
+        before: String = "",
+        beforeId: String = "",
     ): String = buildString {
         append(CALLS)
-        append("?page=").append(page.coerceAtLeast(1))
-        append("&pageSize=").append(RecordsPagingPolicy.clampPageSize(pageSize))
+        append("?limit=").append(CALLS_CHUNK)
         // S38b: 被拦截的来电默认被服务端藏起来，记录页要连它们一起显示。
         append("&includeBlocked=true")
         simId.trim().takeIf(String::isNotEmpty)?.let { append("&simId=").append(query(it)) }
         query.trim().takeIf(String::isNotEmpty)?.let { append("&query=").append(query(it)) }
+        if (before.isNotEmpty()) {
+            append("&before=").append(query(before))
+            if (beforeId.isNotEmpty()) append("&beforeId=").append(query(beforeId))
+        }
     }
 
-    /** S28 分页版 `GET /reports/calls`：窗口与搜索不变，`limit` 换成 `page`/`pageSize`。 */
+    /**
+     * S28 分页版 `GET /reports/calls`：窗口与搜索不变，`limit` 换成 `page`/`pageSize`。这条路由没有
+     * 游标，滚动加载就是一段一段地要 `page`，`pageSize` 固定是 [RecordsPagingPolicy.CHUNK]。
+     */
     fun reportsPage(
         range: ReportDateRange,
         timeZone: String,
         query: String = "",
         simId: String = "",
         page: Int = 1,
-        pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
     ): String = buildString {
         append(REPORT_CALLS)
         append("?timeZone=").append(query(timeZone))
         append("&from=").append(query(range.fromWire))
         append("&to=").append(query(range.toWire))
         append("&page=").append(page.coerceAtLeast(1))
-        append("&pageSize=").append(RecordsPagingPolicy.clampPageSize(pageSize))
+        append("&pageSize=").append(RecordsPagingPolicy.CHUNK)
         simId.trim().takeIf(String::isNotEmpty)?.let { append("&simId=").append(query(it)) }
         query.trim().takeIf(String::isNotEmpty)?.let { append("&query=").append(query(it)) }
     }
 
-    /** S28 分页版拦截记录；这条列表没有游标，`page` 直接接管 `limit`。 */
-    fun interceptionsPage(page: Int = 1, pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE): String =
-        "/blocklist/interceptions?page=${page.coerceAtLeast(1)}&pageSize=${RecordsPagingPolicy.clampPageSize(pageSize)}"
+    /** S28 分页版拦截记录；这条列表没有游标，`page` 直接接管 `limit`，一段固定 [RecordsPagingPolicy.CHUNK] 条。 */
+    fun interceptionsPage(page: Int = 1): String =
+        "/blocklist/interceptions?page=${page.coerceAtLeast(1)}&pageSize=${RecordsPagingPolicy.CHUNK}"
 
     fun aiTranscript(callId: String) = "/calls/${encodePathSegment(callId)}/ai-transcript"
     fun contact(contactId: String) = "/contacts/${encodePathSegment(contactId)}"
@@ -213,6 +220,8 @@ object ClientApiRoutes {
     const val SMS_DELETE_BATCH = 500
     /** Server caps: `/calls` at 100, `/reports/calls` at 200 (S22 接口合同). */
     const val CALLS_PAGE_LIMIT = 100
+    /** 记录页「全部通话」一次读的条数；回来不足这个数就是到底了。 */
+    const val CALLS_CHUNK = 50
     const val REPORTS_PAGE_LIMIT = 200
 
     internal fun encodePathSegment(value: String): String = buildString {
@@ -521,21 +530,21 @@ class ClientApi internal constructor(
     fun calls(): List<JSONObject> = collection(ClientApiRoutes.CALLS)
 
     /**
-     * S22 的不分页搜索。S28 之后「记录 → 全部通话」走 [callsPage]，这条留作不带 `page` 的老读法
-     * （服务端的合同明确说不带 `page` 时整条路由不变），也是分页出问题时的回退路径。
+     * S22 的不分页搜索。「记录 → 全部通话」走 [callsPage]，这条留作不带游标的老读法。
      */
     fun searchCalls(search: String): List<JSONObject> = collection(ClientApiRoutes.calls(search))
 
     /**
-     * S28 记录页分页。这三个读法只有「记录」页会用，拨号页仍旧走 [calls]，所以轮询列表和运行时对账
-     * （[ClientViewModel] 的 `applyLoadedCalls`）完全不受分页影响。
+     * 记录页的三个读法，只有「记录」页会用；拨号页仍旧走 [calls]，所以轮询列表和运行时对账
+     * （[ClientViewModel] 的 `applyLoadedCalls`）完全不受影响。「全部通话」是游标（一段
+     * [ClientApiRoutes.CALLS_CHUNK] 条，没有信封），报告和拦截记录按 S28 的 `page` 一段一段读。
      */
     fun callsPage(
         query: String = "",
         simId: String = "",
-        page: Int = 1,
-        pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
-    ): Page<JSONObject> = collectionPage(ClientApiRoutes.callsPage(query, simId, page, pageSize), pageSize)
+        before: String = "",
+        beforeId: String = "",
+    ): List<JSONObject> = collection(ClientApiRoutes.callsPage(query, simId, before, beforeId))
 
     fun reportsPage(
         range: ReportDateRange,
@@ -543,16 +552,11 @@ class ClientApi internal constructor(
         query: String = "",
         simId: String = "",
         page: Int = 1,
-        pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
     ): CallReportPage = parseCallReport(
-        request("GET", ClientApiRoutes.reportsPage(range, timeZone, query, simId, page, pageSize)),
-        RecordsPagingPolicy.clampPageSize(pageSize),
+        request("GET", ClientApiRoutes.reportsPage(range, timeZone, query, simId, page)),
     ).also { require(it.window.timeZone == timeZone) { "report window mismatch" } }
 
-    fun interceptionsPage(
-        page: Int = 1,
-        pageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
-    ): Page<JSONObject> = collectionPage(ClientApiRoutes.interceptionsPage(page, pageSize), pageSize)
+    fun interceptionsPage(page: Int = 1): Page<JSONObject> = collectionPage(ClientApiRoutes.interceptionsPage(page))
     fun sms(): List<JSONObject> = SmsPagingPolicy.fetchAll(
         fetchPage = { cursor -> SmsPagingPolicy.readPage(request("GET", ClientApiRoutes.smsPage(cursor))) },
         fetchLegacy = { collection(ClientApiRoutes.SMS_LEGACY) },
@@ -738,6 +742,11 @@ class ClientApi internal constructor(
             JSONObject().put("provider", provider).put("expectedVersion", expectedVersion),
         ).toClientVoiceProviderList()
     }
+
+    /** S137：成功返回与 GET 相同的结构。 */
+    fun setContactInstantAi(enabled: Boolean): ClientVoiceProviderList =
+        request("PUT", ClientApiRoutes.AI_CONTACT_INSTANT_AI, JSONObject().put("enabled", enabled))
+            .toClientVoiceProviderList()
 
     fun passkeys(): List<PasskeyItem> {
         val array = request("GET", ClientApiRoutes.PASSKEYS).getJSONArray("items")
@@ -963,11 +972,11 @@ class ClientApi internal constructor(
     }
 
     /** [collection] 的分页版：同样的 `{items}`，外面多一层 S28 信封（旧 Control 缺信封，见 [readPageEnvelope]）。 */
-    private fun collectionPage(path: String, pageSize: Int): Page<JSONObject> {
+    private fun collectionPage(path: String): Page<JSONObject> {
         val response = request("GET", path)
         val array = response.getJSONArray("items")
         val items = buildList { for (index in 0 until array.length()) add(array.getJSONObject(index)) }
-        return readPageEnvelope(response, items, RecordsPagingPolicy.clampPageSize(pageSize))
+        return readPageEnvelope(response, items, RecordsPagingPolicy.CHUNK)
     }
 
     private fun request(

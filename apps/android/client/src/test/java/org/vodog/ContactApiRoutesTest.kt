@@ -52,6 +52,20 @@ class ContactApiRoutesTest {
         assertEquals(9L, result.configVersion)
     }
 
+    @Test fun `contact instant AI toggle PUTs the enabled flag and parses the list`() {
+        var captured: ClientRequest? = null
+        val api = ClientApi(transport = ClientTransport { request ->
+            captured = request
+            JSONObject().put("items", JSONArray()).put("selected", "xai").put("contactInstantAi", true)
+        })
+        val result = api.setContactInstantAi(true)
+        val request = checkNotNull(captured)
+        assertEquals("PUT", request.method)
+        assertEquals("/ai/contact-instant-ai", request.path)
+        assertEquals("""{"enabled":true}""", request.body.toString())
+        assertEquals(true, result.contactInstantAi)
+    }
+
     @Test fun `the contacts list encodes its query and clamps the page size`() {
         assertEquals("/contacts?limit=500&offset=0", ClientApiRoutes.contacts())
         assertEquals("/contacts?limit=50&offset=100", ClientApiRoutes.contacts(limit = 50, offset = 100))

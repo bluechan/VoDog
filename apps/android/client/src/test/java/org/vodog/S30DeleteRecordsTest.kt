@@ -14,7 +14,7 @@ import org.junit.Test
  * S30 删除：通话记录单条删除、短信选择删除、对话删除与「删除并屏蔽」。
  *
  * 这一份刻意是新文件：S28 钉死 [clientStateWithCallsPage] 不写 [ClientUiState.calls] 的那条测试
- * （`RecordsPagingApiTest.landingAPagedResultNeverTouchesThePolledCallList`）一个字都不许改，删除走
+ * （`RecordsPagingApiTest.landingAPagedResultNeverTouchesThePolledCallList`）不许松，删除走
  * 的是另一条路 [clientStateWithoutCall]，两条路的约束在下面 `deletionWritesCallsWhilePagingStillDoesNot`
  * 里正面对照了一次。
  */
@@ -169,9 +169,7 @@ class S30DeleteRecordsTest {
     @Test fun deletingACallRemovesItFromThePolledListThePageAndTheReport() {
         val before = ClientUiState(
             calls = RemoteList.Loaded(listOf(callRow("call-1"), callRow("call-2"))),
-            callsPage = RemoteResource.Loaded(
-                Page(listOf(callRow("call-1"), callRow("call-2")), page = 1, pageSize = 50, total = 2, totalPages = 1),
-            ),
+            callsPage = RemoteResource.Loaded(listOf(callRow("call-1"), callRow("call-2"))),
             reports = RemoteResource.Loaded(
                 CallReportPage(
                     reportWindow,
@@ -183,13 +181,9 @@ class S30DeleteRecordsTest {
         val after = clientStateWithoutCall(before, "call-1")
 
         assertEquals(listOf("call-2"), (after.calls as RemoteList.Loaded).items.map { it.getString("id") })
-        val page = (after.callsPage as RemoteResource.Loaded).value
-        assertEquals(listOf("call-2"), page.items.map { it.getString("id") })
-        assertEquals(1, page.total)
-        assertEquals(1, page.totalPages)
+        assertEquals(listOf("call-2"), (after.callsPage as RemoteResource.Loaded).value.map { it.getString("id") })
         val report = (after.reports as RemoteResource.Loaded).value
         assertEquals(listOf("call-2"), report.items.map(CallReportItem::callId))
-        assertEquals(1, report.paging.total)
     }
 
     /** 这一条与 S28 的钉死测试是正面对照：分页落地不写 `calls`，删除必须写。 */
@@ -199,7 +193,7 @@ class S30DeleteRecordsTest {
 
         val paged = clientStateWithCallsPage(
             before,
-            RemoteResource.Loaded(Page(listOf(callRow("paged-1")), page = 1, pageSize = 50, total = 1, totalPages = 1)),
+            RemoteResource.Loaded(listOf(callRow("paged-1"))),
         )
         assertSame(polled, paged.calls)
 
@@ -207,80 +201,69 @@ class S30DeleteRecordsTest {
         assertEquals(listOf("call-2"), (deleted.calls as RemoteList.Loaded).items.map { it.getString("id") })
     }
 
-    @Test fun totalPagesAreRecomputedFromTheNewTotal() {
-        assertEquals(1, RecordsPagingPolicy.totalPagesFor(0, 50))
-        assertEquals(1, RecordsPagingPolicy.totalPagesFor(50, 50))
-        assertEquals(2, RecordsPagingPolicy.totalPagesFor(51, 50))
-        assertEquals(3, RecordsPagingPolicy.totalPagesFor(101, 50))
-        assertEquals(1, RecordsPagingPolicy.totalPagesFor(200, 200))
-
+    /**
+     * 报告也是滚动加载：删除只拿掉这一行。总数不在本地改（紧接着的重读带回服务端的口径），「到底了」
+     * 和转圈也不动；下一段的页码从行数算，所以少了一行之后是重读同一页（重叠），不会跳过一行。
+     */
+    @Test fun deletingAReportRowOnlyRemovesThatRowAndTheNextPageOverlaps() {
         val before = ClientUiState(
-            callsPage = RemoteResource.Loaded(
-                Page(List(50) { callRow("call-$it") }, page = 1, pageSize = 50, total = 101, totalPages = 3),
+            reports = RemoteResource.Loaded(
+                CallReportPage(
+                    reportWindow,
+                    Page(List(50) { reportItem("call-$it") }, page = 1, pageSize = 50, total = 101, totalPages = 3),
+                ),
             ),
-            callsPageNum = 1,
+            reportsLoadingMore = true,
         )
 
-        val page = (clientStateWithoutCall(before, "call-0").callsPage as RemoteResource.Loaded).value
+        val after = clientStateWithoutCall(before, "call-0")
+        val paging = (after.reports as RemoteResource.Loaded).value.paging
 
-        assertEquals(100, page.total)
-        assertEquals(2, page.totalPages)
-        assertEquals(1, page.page)
+        assertEquals(49, paging.items.size)
+        assertEquals(101, paging.total)
+        assertEquals(before.copy(reports = after.reports), after)
+        assertEquals(1, RecordsPagingPolicy.nextPage(paging.items.size))
     }
 
-    /** 删掉最后一页上的唯一一行：就地退回上一页，否则紧接着的重读会去请求一页空结果。 */
-    @Test fun deletingTheOnlyRowOfTheLastPageRewindsOnePage() {
+    /**
+     * 删掉已加载的最后一行：只是少了这一行。没有页码可退，「到底了」和滚动加载的转圈都不动 —— 下一段
+     * 的游标自然变成新的最后一行。
+     */
+    @Test fun deletingTheLastLoadedRowOnlyRemovesThatRow() {
         val before = ClientUiState(
-            callsPage = RemoteResource.Loaded(
-                Page(listOf(callRow("call-101")), page = 3, pageSize = 50, total = 101, totalPages = 3),
-            ),
-            callsPageNum = 3,
+            callsPage = RemoteResource.Loaded(List(101) { callRow("call-${101 - it}") }),
+            callsEndReached = true,
+            callsLoadingMore = true,
         )
 
-        val after = clientStateWithoutCall(before, "call-101")
-        val page = (after.callsPage as RemoteResource.Loaded).value
+        val after = clientStateWithoutCall(before, "call-1")
+        val rows = (after.callsPage as RemoteResource.Loaded).value
 
-        assertTrue(page.items.isEmpty())
-        assertEquals(100, page.total)
-        assertEquals(2, page.totalPages)
-        assertEquals(2, page.page)
-        // 页码也要落到 state 上，否则默认参数的 loadCallsPage() 还会去读第 3 页。
-        assertEquals(2, after.callsPageNum)
+        assertEquals(100, rows.size)
+        assertEquals("call-2", rows.last().getString("id"))
+        assertEquals(before.copy(callsPage = after.callsPage), after)
     }
 
-    /** 第 1 页删空不退页（没有第 0 页），旧 Control 的 `supported=false` 信封也不去算页数。 */
-    @Test fun theFirstPageAndAnUnpagedControlNeverRewind() {
-        val first = ClientUiState(
-            callsPage = RemoteResource.Loaded(Page(listOf(callRow("call-1")), page = 1, pageSize = 50, total = 1, totalPages = 1)),
-        )
-        val afterFirst = (clientStateWithoutCall(first, "call-1").callsPage as RemoteResource.Loaded).value
-        assertEquals(1, afterFirst.page)
-        assertEquals(0, afterFirst.total)
-        assertEquals(1, afterFirst.totalPages)
+    /** 删空了也还是「读过、现在是空的」，不退回 NotLoaded（那会让记录页再发一次首次加载）。 */
+    @Test fun deletingTheOnlyRowLeavesAnEmptyLoadedList() {
+        val only = ClientUiState(callsPage = RemoteResource.Loaded(listOf(callRow("call-1"))), callsEndReached = true)
 
-        val legacy = ClientUiState(
-            callsPage = RemoteResource.Loaded(Page.unpaged(listOf(callRow("call-1"), callRow("call-2")))),
-        )
-        val afterLegacy = (clientStateWithoutCall(legacy, "call-1").callsPage as RemoteResource.Loaded).value
-        assertFalse(afterLegacy.supported)
-        assertEquals(1, afterLegacy.total)
-        assertEquals(1, afterLegacy.totalPages)
-        assertEquals(1, afterLegacy.page)
+        val after = clientStateWithoutCall(only, "call-1")
+
+        assertTrue((after.callsPage as RemoteResource.Loaded).value.isEmpty())
+        assertTrue(after.callsEndReached)
     }
 
     @Test fun deletingACallThatIsNotOnScreenChangesNothing() {
+        val loaded = listOf(callRow("call-2"))
         val before = ClientUiState(
             calls = RemoteList.Loaded(listOf(callRow("call-2"))),
-            callsPage = RemoteResource.Loaded(
-                Page(listOf(callRow("call-2")), page = 2, pageSize = 50, total = 60, totalPages = 2),
-            ),
-            callsPageNum = 2,
+            callsPage = RemoteResource.Loaded(loaded),
         )
 
         val after = clientStateWithoutCall(before, "call-1")
 
-        assertEquals(60, (after.callsPage as RemoteResource.Loaded).value.total)
-        assertEquals(2, after.callsPageNum)
+        assertEquals(loaded, (after.callsPage as RemoteResource.Loaded).value)
         assertEquals(before.copy(calls = after.calls, callsPage = after.callsPage), after)
         // 空 id 是 no-op，连一份新对象都不该造出来。
         assertSame(before, clientStateWithoutCall(before, ""))

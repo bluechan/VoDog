@@ -8,6 +8,8 @@ import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -29,10 +31,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -158,9 +158,10 @@ internal fun SettingsPage(
         ) {
         item { InlineSectionHeader("外观") }
         item { SettingsCard { Box(Modifier.padding(ScreenPadding)) { AppearancePicker() } } }
-        // S24 决策 3: right after SIM 与接听模式, like iOS. Hidden entirely on a Control that predates S24.
+        item { SettingsFooter("只保存在这台手机，离线也可以切换。") }
+        // S24 决策 3 / S138 决策 1: AI 代接 right under 外观, like iOS. Hidden entirely on a Control that predates S24.
         if (!state.voiceProviderUnavailable) {
-            item { InlineSectionHeader("通用") }
+            item { InlineSectionHeader("AI 代接") }
             item { VoiceProviderSection(state, model) }
         }
         item { InlineSectionHeader("SIM 卡") }
@@ -175,68 +176,15 @@ internal fun SettingsPage(
             }
             is RemoteList.Loaded -> if (sims.isEmpty()) {
                 item { EmptyCard("没有已分配的 SIM", Modifier) }
-            } else items(displayedSims, key = { it.optString("id") }) { sim ->
-            val settings = sim.optJSONObject("settings") ?: JSONObject()
-            val clientSim = runCatching { sim.toClientSim() }.getOrNull()
-            val allSims = sims.mapNotNull { runCatching { it.toClientSim() }.getOrNull() }
-            val versions = sim.simSettingsVersions()
-            val pending = versions.appliedVersion != null && versions.appliedVersion < versions.version
-            val online = state.networkAvailable && sim.optBoolean("online")
-            val signal = LocalSignal.current
-            Card(
-                onClick = { selectedSimId = sim.optString("id") },
-                modifier = Modifier.fillMaxWidth().testTag("settings.sim.${sim.optString("id")}"),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                ListItem(
-                    modifier = Modifier.heightIn(min = 64.dp),
-                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                    leadingContent = { clientSim?.let { LineBlock(simColor(it, allSims), 14.dp) } },
-                    headlineContent = {
-                        // S95b §A: full AiBadge after the name; FlowRow lets it wrap under the name at large font scales.
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), itemVerticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                clientSim?.let(::simPickerTitle) ?: sim.optString("label", "SIM"),
-                                style = MaterialTheme.typography.bodyLarge.copy(fontSize = MaterialTheme.typography.titleMedium.fontSize),
-                            )
-                            AiBadge(settings.optString("mode"), settings.timeoutSecondsOrNull(), compact = false)
-                        }
-                    },
-                    supportingContent = {
-                        Column {
-                            if (pending) Text("已保存，等待设备应用", style = MaterialTheme.typography.bodyMedium, color = signal.warn)
-                            Text(
-                                listOfNotNull(
-                                    sim.optString("phoneLabel").takeIf { it.isNotBlank() && it != "null" },
-                                    // AI modes are carried by the badge; 人工 stays plain text (§A).
-                                    settings.optString("mode").takeIf { aiBadgeText(it) == null }?.let(::modeDisplayLabel),
-                                ).joinToString(" · "),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            // 号码所在设备（与 iOS SIMIdentityDetail 一致）；顶部胶囊不再显示设备短号。
-                            Text(
-                                "${clientSim?.let(::simDeviceLabel) ?: "设备待确认"} · ${simConnectionLabel(state.networkAvailable, sim.optBoolean("online"))}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    },
-                    trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            StatusShape(
-                                when {
-                                    pending -> LineStatus.PENDING
-                                    online -> LineStatus.ONLINE
-                                    else -> LineStatus.OFFLINE
-                                },
-                                10.dp,
-                            )
-                            Icon(Icons.Filled.ChevronRight, contentDescription = "打开 SIM 设置", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    },
-                )
-            }
+            } else item {
+                // S138: one grouped card, rows split by dividers (was one card per SIM).
+                val allSims = sims.mapNotNull { runCatching { it.toClientSim() }.getOrNull() }
+                SettingsCard {
+                    displayedSims.forEachIndexed { index, sim ->
+                        if (index > 0) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        SimSettingsRow(sim, allSims, state.networkAvailable) { selectedSimId = sim.optString("id") }
+                    }
+                }
             }
         }
         if (state.sims is RemoteList.Loaded && state.simsRefreshError.isNotBlank()) {
@@ -248,6 +196,10 @@ internal fun SettingsPage(
                 )
             }
         }
+        item { SettingsFooter("显示名称和号码标注只用于辨认线路，不会更换 SIM 的稳定身份或中断通话。") }
+        item { InlineSectionHeader("网关设备") }
+        item { GatewayPowerSection(state, model) }
+        item { SettingsFooter("远程开启需要先在网关设备上打开「允许远程开启（待命）」。通话进行中不会被远程关闭。") }
         item { InlineSectionHeader("隐私与安全") }
         item {
             Card(
@@ -259,7 +211,7 @@ internal fun SettingsPage(
                     modifier = Modifier.heightIn(min = TouchTarget),
                     colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     leadingContent = { Icon(Icons.Filled.Block, null) },
-                    headlineContent = { Text("管理已屏蔽号码") },
+                    headlineContent = { Text("已屏蔽号码") },
                     supportingContent = {
                         Text(blocklistSummary(state.blocklist, state.smsBlocklist))
                     },
@@ -270,20 +222,15 @@ internal fun SettingsPage(
         item {
             SettingsCard {
                 Column(Modifier.padding(ScreenPadding), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Icon(Icons.Filled.Key, null, tint = MaterialTheme.colorScheme.primary)
+                        Text("通行密钥", style = MaterialTheme.typography.bodyLarge)
+                    }
                     Text(
                         "使用系统通行密钥安全登录，无需输入密码。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    OutlinedButton(
-                        onClick = { model.registerPasskey(passkeys) },
-                        enabled = state.networkAvailable && passkeyRegistrationAllowed(state),
-                        modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget).testTag("settings.passkey.add"),
-                    ) {
-                        Icon(Icons.Filled.Key, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("添加通行密钥")
-                    }
                     if (state.passkeysLoading) LoadingRow("正在读取通行密钥…")
                     if (state.passkeysLoaded && !state.passkeysLoading && state.passkeys.isEmpty() && state.passkeyError.isBlank()) {
                         EmptyCard("还没有通行密钥", Modifier)
@@ -296,6 +243,16 @@ internal fun SettingsPage(
                             onRename = { renaming = passkey },
                             onDelete = { deleting = passkey },
                         )
+                    }
+                    // S138: 添加 is the last row under the list, like iOS.
+                    OutlinedButton(
+                        onClick = { model.registerPasskey(passkeys) },
+                        enabled = state.networkAvailable && passkeyRegistrationAllowed(state),
+                        modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget).testTag("settings.passkey.add"),
+                    ) {
+                        Icon(Icons.Filled.Key, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("添加通行密钥")
                     }
                     if (state.passkeyStatus.isNotBlank()) StatusLine(state.passkeyStatus)
                     // errorContainer rather than raw `error` text: the saturated red drops below
@@ -310,93 +267,83 @@ internal fun SettingsPage(
                 }
             }
         }
-        item { InlineSectionHeader("角标") }
+        item { InlineSectionHeader("通知与角标") }
         item {
             BadgeSettingsSection(model, needsPermission = !notificationsAllowed && Build.VERSION.SDK_INT >= 33) {
                 backgroundPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
-        item { InlineSectionHeader("网关设备") }
-        item { GatewayPowerSection(state, model) }
+        item { SettingsFooter("图标数字 = 待查看通话 + 未读短信。") }
         item { InlineSectionHeader("设备与连接") }
         item {
-            ItemCard(
-                "后台来电",
-                when {
-                    !notificationsAllowed -> "请允许通知，才能在锁屏和后台接听"
-                    !microphoneAllowed -> "请允许麦克风，接听后才能连接通话音频"
-                    state.pushRegistration == PushRegistrationState.Ready -> "后台来电与通知已就绪"
-                    state.pushRegistration == PushRegistrationState.Registering -> "正在完成后台通知设置…"
-                    state.pushRegistration == PushRegistrationState.Failed -> "后台通知暂不可用，请稍后重试"
-                    else -> "后台来电等待推送服务连接"
-                },
-            ) {
-                if ((!notificationsAllowed && Build.VERSION.SDK_INT >= 33) || !microphoneAllowed) {
-                    OutlinedButton(
-                        onClick = {
-                            backgroundPermission.launch(
-                                if (!notificationsAllowed && Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS
-                                else Manifest.permission.RECORD_AUDIO,
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
-                    ) { Text(if (!notificationsAllowed) "允许来电通知" else "允许通话麦克风") }
-                } else {
+            // S138: the old 后台来电 card split into rows; every state sentence stays as a row subtitle.
+            SettingsCard {
+                ConnectionRow("来电通知", if (notificationsAllowed) null else "请允许通知，才能在锁屏和后台接听") {
+                    when {
+                        notificationsAllowed -> StatusValue(LineStatus.ONLINE, "已允许")
+                        Build.VERSION.SDK_INT >= 33 -> TextButton(
+                            onClick = { backgroundPermission.launch(Manifest.permission.POST_NOTIFICATIONS) },
+                            modifier = Modifier.heightIn(min = TouchTarget),
+                        ) { Text("允许来电通知") }
+                        // Below API 33 there is no runtime prompt; the subtitle says what to do.
+                        else -> StatusValue(LineStatus.OFFLINE, "未允许")
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ConnectionRow("通话麦克风", if (microphoneAllowed) null else "请允许麦克风，接听后才能连接通话音频") {
+                    if (microphoneAllowed) StatusValue(LineStatus.ONLINE, "已允许")
+                    else TextButton(
+                        onClick = { backgroundPermission.launch(Manifest.permission.RECORD_AUDIO) },
+                        modifier = Modifier.heightIn(min = TouchTarget),
+                    ) { Text("允许通话麦克风") }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                val (pushStatus, pushWord, pushDetail) = when (state.pushRegistration) {
+                    PushRegistrationState.Ready -> Triple(LineStatus.ONLINE, "已就绪", "后台来电与通知已就绪")
+                    PushRegistrationState.Registering -> Triple(LineStatus.PENDING, "正在注册", "正在完成后台通知设置…")
+                    PushRegistrationState.Failed -> Triple(LineStatus.OFFLINE, "暂不可用", "后台通知暂不可用，请稍后重试")
+                    else -> Triple(LineStatus.OFFLINE, "等待连接", "后台来电等待推送服务连接")
+                }
+                ConnectionRow("后台来电推送", pushDetail) { StatusValue(pushStatus, pushWord) }
+                if (!((!notificationsAllowed && Build.VERSION.SDK_INT >= 33) || !microphoneAllowed)) {
                     OutlinedButton(
                         onClick = model::refreshBackgroundCalling,
                         enabled = state.networkAvailable && state.pushRegistration != PushRegistrationState.Registering,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = ScreenPadding).heightIn(min = TouchTarget),
                     ) { Text("检查后台来电") }
                 }
                 if (!phoneStateAllowed) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     TextButton(
                         onClick = { phoneStatePermission.launch(Manifest.permission.READ_PHONE_STATE) },
                         modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
                     ) { Text("允许识别通话状态（通话中来电转 AI）") }
                 }
-                Text(
-                    "系统强行停止应用后，需要重新打开 VoDog。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(Icons.Filled.Autorenew, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(
-                        "通话和短信状态以服务器记录为准。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                ConnectionRow("通话网络", "标准连接失败后自动改用兼容连接") {
+                    Text("自动", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Text(
-                    "号码设备离线时，请在对应网关设备上重新开启 VoDog。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    "通话网络：自动，标准连接失败后尝试兼容连接。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                OutlinedButton(
+                    onClick = {
+                        notificationsAllowed = canShowCallNotification(context)
+                        microphoneAllowed = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO,
+                        ) == PackageManager.PERMISSION_GRANTED
+                        model.refreshSettings()
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(start = ScreenPadding, end = ScreenPadding, bottom = ScreenPadding)
+                        .heightIn(min = TouchTarget).testTag("settings.refreshAll"),
+                    enabled = state.networkAvailable,
+                ) {
+                    Icon(Icons.Filled.Refresh, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("刷新应用状态")
+                }
             }
         }
-        item {
-            OutlinedButton(
-                onClick = {
-                    notificationsAllowed = canShowCallNotification(context)
-                    microphoneAllowed = ContextCompat.checkSelfPermission(
-                        context,
-                        Manifest.permission.RECORD_AUDIO,
-                    ) == PackageManager.PERMISSION_GRANTED
-                    model.refreshSettings()
-                },
-                modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget).testTag("settings.refreshAll"),
-                enabled = state.networkAvailable,
-            ) {
-                Icon(Icons.Filled.Refresh, null)
-                Spacer(Modifier.width(8.dp))
-                Text("刷新应用状态")
-            }
-        }
+        item { SettingsFooter("通话和短信状态以服务器记录为准。号码设备离线时，请在对应网关设备上重新开启。") }
+        item { SettingsFooter("系统强行停止应用后，需要重新打开 VoDog。") }
         item { InlineSectionHeader("账号") }
         item {
             SettingsCard {
@@ -405,7 +352,10 @@ internal fun SettingsPage(
                 SettingsRow("角色", roleDisplayLabel(state.session?.role.orEmpty()))
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 SettingsRow("当前会话", "Android App")
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            }
+        }
+        item {
+            SettingsCard {
                 TextButton(
                     onClick = model::logout,
                     modifier = Modifier
@@ -491,7 +441,7 @@ private fun VoiceProviderSection(state: ClientUiState, model: ClientViewModel) {
                                 state.voiceProviderReview ?: providers.value.selected,
                             ),
                             // One request at a time: two quick taps would otherwise leave the 勾 on the wrong row.
-                            busy = state.voiceProviderPending.isNotEmpty() || state.voiceProviderConflict,
+                            busy = state.voiceProviderPending.isNotEmpty() || state.voiceProviderConflict || state.contactInstantAiPending,
                             submitting = state.voiceProviderPending == provider.id,
                             onSelect = { haptic.performHapticFeedback(HapticFeedbackType.Confirm); model.selectVoiceProvider(provider.id) },
                         )
@@ -504,6 +454,19 @@ private fun VoiceProviderSection(state: ClientUiState, model: ClientViewModel) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        // S137：旧 Control 不发 contactInstantAi → 不显示。
+        (state.voiceProviders as? RemoteResource.Loaded)?.value?.contactInstantAi?.let { instant ->
+            SettingsCard {
+                BadgeSwitchRow(
+                    CONTACT_INSTANT_AI_TITLE,
+                    CONTACT_INSTANT_AI_DETAIL,
+                    instant,
+                    state.networkAvailable && !state.contactInstantAiPending &&
+                        state.voiceProviderPending.isEmpty() && !state.voiceProviderConflict,
+                    "settings.contactInstantAi",
+                ) { haptic.performHapticFeedback(HapticFeedbackType.Confirm); model.setContactInstantAi(it) }
+            }
+        }
         if (state.voiceProviderMessage.isNotBlank()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) { MessageCard(state.voiceProviderMessage) }
@@ -666,15 +629,13 @@ private fun VoiceProviderRow(
         headlineContent = { Text(provider.label, style = MaterialTheme.typography.bodyLarge) },
         supportingContent = {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    if (voiceProviderAvailability(provider) == VoiceProviderAvailability.AVAILABLE) {
-                        Icon(Icons.Filled.CheckCircle, contentDescription = null,
-                            modifier = Modifier.size(16.dp).testTag("settings.provider.${provider.id}.available"),
-                            tint = MaterialTheme.colorScheme.tertiary)
-                    }
-                    Text(voiceProviderStatusLabel(provider), style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                // S138 决策 3: ● 可用, ◐ 未配置 / 服务离线 — the same shapes as SIM and gateway rows.
+                val available = voiceProviderAvailability(provider) == VoiceProviderAvailability.AVAILABLE
+                StatusValue(
+                    if (available) LineStatus.ONLINE else LineStatus.PENDING,
+                    voiceProviderStatusLabel(provider),
+                    if (available) Modifier.testTag("settings.provider.${provider.id}.available") else Modifier,
+                )
                 // The reason a row cannot be chosen belongs on that row, not in a banner elsewhere.
                 if (reason.isNotEmpty()) {
                     Text(
@@ -745,65 +706,77 @@ private fun GatewayPowerCard(power: ClientGatewayPower, state: ClientUiState, mo
     // Remote ON needs the standby beacon; remote OFF needs a live heartbeat. Either way the server
     // decides — this only keeps the switch from firing a request that cannot succeed.
     val canToggle = if (power.powerOn) power.online else power.remotePowerAllowed && power.standbyOnline
-    ItemCard(
-        power.name,
-        if (!state.networkAvailable) "设备未联网" else listOf("状态 ${gatewayPowerStatusLabel(power)}", gatewayRemotePowerLabel(power)).joinToString(" · "),
-    ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                // S92: same wording as iOS — a neutral 「网关总控」 title; the subtitle carries the state and
-                // turning it off still goes through the confirmation dialog below.
-                Text("网关总控", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
-                Text(
-                    when {
-                        !state.networkAvailable -> "设备未联网"
-                        submitting || power.pending -> "正在等待网关执行…"
-                        power.online -> "已开启"
-                        power.standbyOnline -> "已关闭（待命中，可远程开启）"
-                        else -> "号码设备离线"
+    SettingsCard {
+        Column(Modifier.fillMaxWidth().padding(ScreenPadding), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            // S138: name | ● 在线 / ○ 待命中 / ○ 离线; without a network the state is unknown, so say that instead.
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(power.name.ifBlank { "未提供标题" }, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                if (!state.networkAvailable) StatusValue(LineStatus.OFFLINE, "设备未联网")
+                else StatusValue(if (power.online) LineStatus.ONLINE else LineStatus.OFFLINE, gatewayPowerStatusLabel(power))
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    // S92: same wording as iOS — a neutral 「网关总控」 title; the subtitle carries the state and
+                    // turning it off still goes through the confirmation dialog below.
+                    Text("网关总控", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
+                    Text(
+                        when {
+                            !state.networkAvailable -> "设备未联网"
+                            submitting || power.pending -> "正在等待网关执行…"
+                            power.online -> "已开启"
+                            power.standbyOnline -> "已关闭（待命中，可远程开启）"
+                            else -> "号码设备离线"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (submitting || power.pending) warningColor() else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = power.powerOn,
+                    onCheckedChange = { desiredOn ->
+                        if (desiredOn) model.setGatewayPower(power.gatewayId, true)
+                        else confirmingOff = true
                     },
-                    style = MaterialTheme.typography.labelSmall,
+                    enabled = state.networkAvailable && canToggle && !submitting && !power.pending,
+                    modifier = Modifier.testTag("settings.gateway.${power.gatewayId}"),
+                    colors = signalSwitchColors(),
+                )
+            }
+            Text(
+                gatewayRemotePowerLabel(power),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (power.remotePowerAllowed) MaterialTheme.colorScheme.onSurfaceVariant else warningColor(),
+            )
+            Text(
+                listOfNotNull(
+                    power.lastSeenAt?.let { "最近心跳 ${displayDateTime(it)}" },
+                    power.standbySeenAt?.let { "待命心跳 ${displayDateTime(it)}" },
+                ).joinToString(" · ").ifBlank { "尚未收到心跳" },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (!state.networkAvailable || !canToggle) {
+                Text(
+                    if (!state.networkAvailable) "设备未联网，联网后可操作号码设备。"
+                    else if (power.powerOn) "网关当前不在线，无法远程关闭。"
+                    else if (!power.remotePowerAllowed) "请先在网关设备上打开“允许远程开启（待命）”。"
+                    else "网关的待命通道已离线，需要在网关设备上手动开启。",
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Switch(
-                checked = power.powerOn,
-                onCheckedChange = { desiredOn ->
-                    if (desiredOn) model.setGatewayPower(power.gatewayId, true)
-                    else confirmingOff = true
-                },
-                enabled = state.networkAvailable && canToggle && !submitting && !power.pending,
-                modifier = Modifier.testTag("settings.gateway.${power.gatewayId}"),
-            )
+            if (power.occupied) {
+                Text(
+                    "这台网关设备正在通话中，远程关闭会被拒绝。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = warningColor(),
+                )
+            }
+            gatewayPowerResultLabel(power.lastPowerResult)?.let {
+                Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
-        if (!state.networkAvailable || !canToggle) {
-            Text(
-                if (!state.networkAvailable) "设备未联网，联网后可操作号码设备。"
-                else if (power.powerOn) "网关当前不在线，无法远程关闭。"
-                else if (!power.remotePowerAllowed) "请先在网关设备上打开“允许远程开启（待命）”。"
-                else "网关的待命通道已离线，需要在网关设备上手动开启。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        if (power.occupied) {
-            Text(
-                "这台网关设备正在通话中，远程关闭会被拒绝。",
-                style = MaterialTheme.typography.bodySmall,
-                color = warningColor(),
-            )
-        }
-        gatewayPowerResultLabel(power.lastPowerResult)?.let {
-            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Text(
-            listOfNotNull(
-                power.lastSeenAt?.let { "最近心跳 ${displayDateTime(it)}" },
-                power.standbySeenAt?.let { "待命心跳 ${displayDateTime(it)}" },
-            ).joinToString(" · ").ifBlank { "尚未收到心跳" },
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
     if (confirmingOff) AlertDialog(
         onDismissRequest = { confirmingOff = false },
@@ -882,7 +855,13 @@ private fun BadgeSwitchRow(
         headlineContent = { Text(title) },
         supportingContent = { Text(detail, style = MaterialTheme.typography.labelSmall) },
         trailingContent = {
-            Switch(checked = checked, onCheckedChange = onChange, enabled = enabled, modifier = Modifier.testTag(tag))
+            Switch(
+                checked = checked,
+                onCheckedChange = onChange,
+                enabled = enabled,
+                modifier = Modifier.testTag(tag),
+                colors = signalSwitchColors(),
+            )
         },
     )
 }
@@ -895,6 +874,102 @@ private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
     ) {
         Column(Modifier.fillMaxWidth(), content = content)
     }
+}
+
+/** S138 grey footnote under a section card (iOS List footer). */
+@Composable
+private fun SettingsFooter(text: String) {
+    Text(
+        text,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/** S138 决策 3: a status is always shape + word; ◐ words take the warn colour. */
+@Composable
+private fun StatusValue(status: LineStatus, word: String, shapeModifier: Modifier = Modifier) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        StatusShape(status, 8.dp, shapeModifier)
+        Text(
+            word,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (status == LineStatus.PENDING) warningColor() else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** 设备与连接 row: title (+ the old state sentence) | value or action. */
+@Composable
+private fun ConnectionRow(title: String, detail: String?, trailing: @Composable () -> Unit) {
+    ListItem(
+        modifier = Modifier.heightIn(min = TouchTarget),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(title) },
+        supportingContent = detail?.let { { Text(it, style = MaterialTheme.typography.labelSmall) } },
+        trailingContent = trailing,
+    )
+}
+
+/** One SIM inside the grouped SIM 卡 card: line block | name + AiBadge | ● word | ›. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SimSettingsRow(sim: JSONObject, allSims: List<ClientSim>, networkAvailable: Boolean, onOpen: () -> Unit) {
+    val settings = sim.optJSONObject("settings") ?: JSONObject()
+    val clientSim = runCatching { sim.toClientSim() }.getOrNull()
+    val versions = sim.simSettingsVersions()
+    val pending = versions.appliedVersion != null && versions.appliedVersion < versions.version
+    val online = networkAvailable && sim.optBoolean("online")
+    val signal = LocalSignal.current
+    ListItem(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp)
+            .testTag("settings.sim.${sim.optString("id")}")
+            .clickable(onClick = onOpen),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        leadingContent = { clientSim?.let { LineBlock(simColor(it, allSims), 14.dp) } },
+        headlineContent = {
+            // S95b §A: full AiBadge after the name; FlowRow lets it wrap under the name at large font scales.
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), itemVerticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    clientSim?.let(::simPickerTitle) ?: sim.optString("label", "SIM"),
+                    style = MaterialTheme.typography.bodyLarge.copy(fontSize = MaterialTheme.typography.titleMedium.fontSize),
+                )
+                AiBadge(settings.optString("mode"), settings.timeoutSecondsOrNull(), compact = false)
+            }
+        },
+        supportingContent = {
+            Column {
+                listOfNotNull(
+                    sim.optString("phoneLabel").takeIf { it.isNotBlank() && it != "null" },
+                    // AI modes are carried by the badge; 人工 stays plain text (§A).
+                    settings.optString("mode").takeIf { aiBadgeText(it) == null }?.let(::modeDisplayLabel),
+                ).joinToString(" · ").takeIf(String::isNotEmpty)?.let {
+                    Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                // 号码所在设备（与 iOS SIMIdentityDetail 一致）；离线时仍说明是本机未联网还是号码设备离线。
+                Text(
+                    listOfNotNull(
+                        clientSim?.let(::simDeviceLabel) ?: "设备待确认",
+                        simConnectionLabel(networkAvailable, sim.optBoolean("online")).takeIf { !online },
+                    ).joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (pending) Text("已保存，等待设备应用", style = MaterialTheme.typography.bodyMedium, color = signal.warn)
+            }
+        },
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                when {
+                    pending -> StatusValue(LineStatus.PENDING, "待应用")
+                    online -> StatusValue(LineStatus.ONLINE, "在线")
+                    else -> StatusValue(LineStatus.OFFLINE, "离线")
+                }
+                Icon(Icons.Filled.ChevronRight, contentDescription = "打开 SIM 设置", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+    )
 }
 
 @Composable
@@ -1066,7 +1141,6 @@ private fun SimDetailPage(sim: JSONObject, state: ClientUiState, model: ClientVi
         if (!state.networkAvailable || !sim.optBoolean("online")) item {
             MessageCard(simConnectionLabel(state.networkAvailable, sim.optBoolean("online")))
         }
-        item { InlineSectionHeader("号码备注") }
         item {
             SimNotesCard(
                 sim = sim,
@@ -1077,7 +1151,7 @@ private fun SimDetailPage(sim: JSONObject, state: ClientUiState, model: ClientVi
                 onSave = model::setSimNotes,
             )
         }
-        item { InlineSectionHeader("接听模式") }
+        item { InlineSectionHeader("接听方式") }
         item {
             SimSettingsCard(
                 sim,
@@ -1159,8 +1233,16 @@ internal fun SimNotesCard(
             enabled = LocalNetworkAvailable.current && !busy,
             singleLine = true,
         )
-        if (dirty) Text("未保存设置", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("settings.sim.notes.unsaved"))
+        // S138 决策 6: 放弃修改 resets only the local draft to its baseline; a conflict still needs 载入最新.
+        if (dirty) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("未保存设置", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.weight(1f).testTag("settings.sim.notes.unsaved"))
+            TextButton(
+                onClick = { label = baselineLabel; phoneLabel = baselinePhoneLabel },
+                enabled = !busy,
+                modifier = Modifier.heightIn(min = TouchTarget).testTag("settings.sim.notes.discard"),
+            ) { Text("放弃修改") }
+        }
         if (conflict) {
             MessageCard("号码备注已被另一端更新，当前草稿已保留。")
             OutlinedButton(
@@ -1253,79 +1335,151 @@ internal fun SimSettingsCard(
     } ?: setOf("normal")
     val applied = sim.simSettingsVersions().appliedVersion
     val applyLabel = SettingsApplyPolicy.label(applyState, applied, version)
-    val choices = listOf("normal", "ai", "timeout_ai").map { it to modeDisplayLabel(it) }
     val haptic = LocalHapticFeedback.current
-    ItemCard(
-        sim.optString("label", sim.optString("id", "SIM")),
-        "${modeDisplayLabel(settings.optString("mode"))} · " +
-            SettingsApplyPolicy.subtitle(applyState, applied, version),
-    ) {
-        AiBadge(settings.optString("mode"), settings.timeoutSecondsOrNull(), compact = false)
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().heightIn(min = TouchTarget)) {
-            choices.forEachIndexed { index, (value, label) ->
-                SegmentedButton(
-                    selected = mode == value,
-                    onClick = { if (mode != value) haptic.performHapticFeedback(HapticFeedbackType.VirtualKey); mode = value },
-                    enabled = LocalNetworkAvailable.current && !busy && value in availableModes,
-                    shape = SegmentedButtonDefaults.itemShape(index, choices.size),
-                    modifier = Modifier.heightIn(min = TouchTarget).testTag("settings.sim.mode.$value"),
-                ) { Text(label) }
-            }
-        }
-        if ("ai" !in availableModes || "timeout_ai" !in availableModes) {
-            Text(
-                if (!settings.isNull("aiUnavailableReason")) settings.optString("aiUnavailableReason", "AI 接听尚未开放")
-                else "AI 接听尚未开放",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        if (mode == "timeout_ai") {
-            Text("等待时间 $timeoutSeconds 秒", style = MaterialTheme.typography.bodyMedium)
-            Slider(
-                value = timeoutSeconds.toFloat(),
-                onValueChange = { timeoutSeconds = ((it / 5f).roundToInt() * 5).coerceIn(10, 120) },
-                valueRange = 10f..120f,
-                steps = 21,
-                enabled = LocalNetworkAvailable.current && !busy && !conflict,
-                modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
-            )
-        }
-        if (draftDirty) Text("未保存设置", style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("settings.sim.mode.unsaved"))
-        if (conflict) {
-            MessageCard("设置已被另一端更新，当前草稿已保留。请载入最新设置后重新核对。")
-            OutlinedButton(
-                onClick = {
-                    if (onAcceptLatest(sim.optString("id"), version)) {
-                        baselineVersion = version
-                        baselineMode = serverMode
-                        baselineTimeout = serverTimeout
-                        mode = serverMode
-                        timeoutSeconds = serverTimeout
-                    }
-                },
-                enabled = LocalNetworkAvailable.current && !busy && (conflictVersion == null || version >= conflictVersion),
-                modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
+    val controlsEnabled = LocalNetworkAvailable.current && !busy
+    val aiUnavailableReason =
+        if (!settings.isNull("aiUnavailableReason")) settings.optString("aiUnavailableReason", "AI 接听尚未开放")
+        else "AI 接听尚未开放"
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // S138 决策 5: three selectable cards for the one mode field (was a 3-segment row).
+        listOf(
+            Triple("normal", "我自己接", "来电在你的设备上响铃，由你接听。"),
+            Triple("timeout_ai", "先响铃，无人接听再交给 AI", "等待 $timeoutSeconds 秒无人接听，由 AI 代接。"),
+            Triple("ai", "AI 立即代接", "来电立即由 AI 接听。"),
+        ).forEach { (value, title, detail) ->
+            SimModeCard(
+                value = value,
+                title = title,
+                detail = detail,
+                selected = mode == value,
+                enabled = controlsEnabled && value in availableModes,
+                unavailableReason = aiUnavailableReason.takeIf { value != "normal" && value !in availableModes },
+                onSelect = { if (mode != value) haptic.performHapticFeedback(HapticFeedbackType.VirtualKey); mode = value },
             ) {
-                Text(
-                    if (conflictVersion == null || version >= conflictVersion) "载入最新设置（替换当前草稿）"
-                    else "正在载入最新设置…",
-                )
+                if (value == "timeout_ai" && mode == "timeout_ai") {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("等待时间", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                        Text("$timeoutSeconds 秒", style = MaterialTheme.typography.bodyMedium, color = LocalSignal.current.brand)
+                    }
+                    Slider(
+                        value = timeoutSeconds.toFloat(),
+                        onValueChange = { timeoutSeconds = ((it / 5f).roundToInt() * 5).coerceIn(10, 120) },
+                        valueRange = 10f..120f,
+                        steps = 21,
+                        enabled = controlsEnabled && !conflict,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
+                    )
+                    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                        listOf("10 秒", "步长 5 秒", "120 秒").forEach {
+                            Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
             }
         }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        InlineSectionHeader("应用状态")
-        SettingsRow("草稿基于版本", baselineVersion.toString())
-        if (version != baselineVersion) SettingsRow("服务器当前版本", version.toString())
-        SettingsRow("设备已应用", applied?.toString() ?: "尚未确认")
-        SettingsApplyStatusLine(applyLabel)
-        Button(
-            onClick = { haptic.performHapticFeedback(HapticFeedbackType.Confirm); onApply(sim.optString("id"), mode, timeoutSeconds, baselineVersion) },
-            enabled = LocalNetworkAvailable.current && !busy && !conflict && !syncingFreshCleanDraft && !awaitingSubmittedVersion &&
-                mode in availableModes,
-            modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget).testTag("settings.sim.saveMode"),
-        ) { Text("保存设置") }
+        Text(
+            "三种方式是同一项设置；保存后由网关设备确认应用才生效。",
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ItemCard(
+            sim.optString("label", sim.optString("id", "SIM")),
+            "${modeDisplayLabel(settings.optString("mode"))} · " +
+                SettingsApplyPolicy.subtitle(applyState, applied, version),
+        ) {
+            AiBadge(settings.optString("mode"), settings.timeoutSecondsOrNull(), compact = false)
+            // S138 决策 6: back to the draft's baseline version, local only; a conflict still needs 载入最新.
+            if (draftDirty) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("未保存设置", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f).testTag("settings.sim.mode.unsaved"))
+                TextButton(
+                    onClick = { mode = baselineMode; timeoutSeconds = baselineTimeout },
+                    enabled = !busy,
+                    modifier = Modifier.heightIn(min = TouchTarget).testTag("settings.sim.discard"),
+                ) { Text("放弃修改") }
+            }
+            if (conflict) {
+                MessageCard("设置已被另一端更新，当前草稿已保留。请载入最新设置后重新核对。")
+                OutlinedButton(
+                    onClick = {
+                        if (onAcceptLatest(sim.optString("id"), version)) {
+                            baselineVersion = version
+                            baselineMode = serverMode
+                            baselineTimeout = serverTimeout
+                            mode = serverMode
+                            timeoutSeconds = serverTimeout
+                        }
+                    },
+                    enabled = LocalNetworkAvailable.current && !busy && (conflictVersion == null || version >= conflictVersion),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget),
+                ) {
+                    Text(
+                        if (conflictVersion == null || version >= conflictVersion) "载入最新设置（替换当前草稿）"
+                        else "正在载入最新设置…",
+                    )
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            InlineSectionHeader("应用状态")
+            SettingsRow("草稿基于版本", baselineVersion.toString())
+            if (version != baselineVersion) SettingsRow("服务器当前版本", version.toString())
+            SettingsRow("设备已应用", applied?.toString() ?: "尚未确认")
+            SettingsApplyStatusLine(applyLabel)
+            Button(
+                onClick = { haptic.performHapticFeedback(HapticFeedbackType.Confirm); onApply(sim.optString("id"), mode, timeoutSeconds, baselineVersion) },
+                enabled = LocalNetworkAvailable.current && !busy && !conflict && !syncingFreshCleanDraft && !awaitingSubmittedVersion &&
+                    mode in availableModes,
+                modifier = Modifier.fillMaxWidth().heightIn(min = TouchTarget).testTag("settings.sim.saveMode"),
+            ) { Text("保存设置") }
+        }
+    }
+}
+
+/**
+ * One 接听方式 card. Selected = brandSoft fill + 1.5 dp brand border + filled radio. Only the header row is
+ * the selectable node, so the slider passed in [content] stays its own TalkBack/tap target.
+ */
+@Composable
+private fun SimModeCard(
+    value: String,
+    title: String,
+    detail: String,
+    selected: Boolean,
+    enabled: Boolean,
+    unavailableReason: String?,
+    onSelect: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val signal = LocalSignal.current
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = if (selected) signal.brandSoft else MaterialTheme.colorScheme.surface),
+        border = if (selected) BorderStroke(1.5.dp, signal.brand) else null,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = TouchTarget)
+                .testTag("settings.sim.mode.$value")
+                .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onSelect)
+                .padding(ScreenPadding),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            RadioButton(selected = selected, enabled = enabled, onClick = null)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = if (enabled || selected) 1f else 0.38f),
+                )
+                Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                unavailableReason?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        Column(Modifier.fillMaxWidth().padding(start = ScreenPadding, end = ScreenPadding), content = content)
     }
 }
 
@@ -1341,14 +1495,14 @@ internal fun simDraftConflicted(
 }
 
 /**
- * 「应用状态」的那一行。等待用网关总控 pending 同一种次要色加一个 16 dp 转圈，成功用应用里
- * 「在线」的那支绿（`colorScheme.tertiary`），未确认仍是原来的 [warningColor]。
+ * 「应用状态」的那一行。等待用网关总控 pending 同一种次要色加一个 16 dp 转圈，成功是 ● 在线形状
+ * （S138 决策 3）加正文色文字，未确认仍是原来的 [warningColor]。
  */
 @Composable
 private fun SettingsApplyStatusLine(label: SettingsApplyLabel) {
     if (label.text.isBlank()) return
     val color = when (label.tone) {
-        SettingsApplyTone.SUCCESS -> MaterialTheme.colorScheme.tertiary
+        SettingsApplyTone.SUCCESS -> MaterialTheme.colorScheme.onSurface
         SettingsApplyTone.WARNING -> warningColor()
         SettingsApplyTone.PENDING, SettingsApplyTone.NONE -> MaterialTheme.colorScheme.onSurfaceVariant
     }
@@ -1360,6 +1514,8 @@ private fun SettingsApplyStatusLine(label: SettingsApplyLabel) {
         if (label.tone == SettingsApplyTone.PENDING) {
             CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = color)
         }
+        // S138 决策 3: success is the ● online shape + word, not green text.
+        if (label.tone == SettingsApplyTone.SUCCESS) StatusShape(LineStatus.ONLINE, 8.dp)
         Text(label.text, style = MaterialTheme.typography.bodySmall, color = color)
     }
 }

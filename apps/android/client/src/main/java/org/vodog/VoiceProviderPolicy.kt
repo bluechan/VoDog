@@ -24,7 +24,12 @@ data class ClientVoiceProviderList(
     val items: List<ClientVoiceProvider>,
     val selected: String,
     val configVersion: Long = 1,
+    /** S137：null = 服务器没发这个字段（S137 之前的 Control），开关不显示。 */
+    val contactInstantAi: Boolean? = null,
 )
+
+const val CONTACT_INSTANT_AI_TITLE = "通讯录用户启用AI即接"
+const val CONTACT_INSTANT_AI_DETAIL = "关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。"
 
 /** 分组底部说明：切换只改之后新建的 AI run，进行中的通话不受影响。 */
 const val VOICE_PROVIDER_FOOTER = "切换只影响之后的 AI 即接 / 超时代接来电。"
@@ -52,6 +57,7 @@ internal fun JSONObject.toClientVoiceProviderList(): ClientVoiceProviderList {
         items = items,
         selected = optString("selected").trim(),
         configVersion = optLong("configVersion", 1L).coerceAtLeast(1L),
+        contactInstantAi = if (has("contactInstantAi")) optBoolean("contactInstantAi") else null,
     )
 }
 

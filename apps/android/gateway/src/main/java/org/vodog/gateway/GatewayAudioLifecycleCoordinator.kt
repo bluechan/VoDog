@@ -674,8 +674,8 @@ class GatewayAudioLifecycleCoordinator(private val context: Context) {
 
     private fun exactActiveCall(): DeviceCallRecord? {
         val records = DeviceCallJournal(context).recordsForSnapshot().filter {
-            // S38 §3: a call the user dialled on the Pixel has no remote VoDog party, so it
-            // never gets a WebRTC session; GatewayPassiveCallRecorder owns its audio instead.
+            // S38 §3 / S134: a call dialled or answered on the Pixel has no remote VoDog party, so
+            // it never gets a WebRTC session; GatewayPassiveCallRecorder owns its audio instead.
             it.state == DeviceCallState.ACTIVE && it.serverCallId != null && it.creationTimeMillis != null &&
                 needsRemoteMedia(it) &&
                 GatewayTelecomCallRegistry.snapshot(it.deviceCallId)?.state == ActualTelecomState.ACTIVE

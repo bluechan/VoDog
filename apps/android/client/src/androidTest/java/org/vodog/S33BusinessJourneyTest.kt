@@ -34,6 +34,9 @@ import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
@@ -700,8 +703,8 @@ class S33BusinessJourneyTest {
         compose.onNodeWithTag("history.report.preset.today", useUnmergedTree = true).performClick()
         val reportZone = ZoneId.of("Asia/Taipei")
         val recordedStartedAt = ClientApi(ClientSessionProcess.coordinator(instrumentation.targetContext))
-            .callsPage(query = "0900000001", simId = S33Ids.SIM_PRIMARY, pageSize = 100)
-            .items.single { it.optString("id") == S33Ids.CALL_RECORDED }
+            .callsPage(query = "0900000001", simId = S33Ids.SIM_PRIMARY)
+            .single { it.optString("id") == S33Ids.CALL_RECORDED }
             .getString("startedAt")
         val recordedStartDate = Instant.parse(recordedStartedAt).atZone(reportZone).toLocalDate()
         val todayExpected = if (recordedStartDate == ZonedDateTime.now(reportZone).toLocalDate()) {
@@ -752,11 +755,9 @@ class S33BusinessJourneyTest {
         compose.onNodeWithTag(unavailableInterceptionTag, useUnmergedTree = false)
             .assertIsDisplayed()
             .assertTextContains("S33 Unavailable SIM", substring = true)
-        waitForText("第 1 / 2 页")
-        compose.onNodeWithContentDescription("下一页", useUnmergedTree = false)
-            .assertIsEnabled()
-            .performClick()
-        waitForText("第 2 / 2 页")
+        // 拦截记录不再有分页条：滚到底会自己接下一段。分页条的文字和按钮都不该再出现。
+        compose.onAllNodesWithText("第 1 / 2 页").assertCountEquals(0)
+        compose.onAllNodesWithContentDescription("下一页").assertCountEquals(0)
 
         compose.onNodeWithTag("history.view.all_calls", useUnmergedTree = true).performClick()
         val historySearch = compose.onNodeWithTag("history.search", useUnmergedTree = true)
@@ -782,7 +783,7 @@ class S33BusinessJourneyTest {
         waitForText("Android App")
         waitForText("S33 Primary SIM", substring = true)
         compose.onNodeWithTag("settings.sim.${S33Ids.SIM_PRIMARY}", useUnmergedTree = true).performClick()
-        listOf("人工接听", "AI 即接", "超时转 AI").forEach { waitForText(it) }
+        listOf("我自己接", "先响铃，无人接听再交给 AI", "AI 立即代接").forEach { waitForText(it) }
         replace("settings.sim.label", "S33 Android SIM Draft")
         replace("settings.sim.phoneLabel", "S33 Android phone label")
         compose.onNodeWithTag("settings.sim.notes.unsaved", useUnmergedTree = true).assertTextContains("未保存设置")
@@ -1007,8 +1008,8 @@ class S33BusinessJourneyTest {
                 true
             }.getOrDefault(false)
         }
-        settingsList.performScrollToNode(hasText("正在等待 Pixel 执行…"))
-        compose.onNodeWithText("正在等待 Pixel 执行…", useUnmergedTree = true).assertIsDisplayed()
+        settingsList.performScrollToNode(hasText("正在等待网关执行…"))
+        compose.onNodeWithText("正在等待网关执行…", useUnmergedTree = true).assertIsDisplayed()
         val powerAck = fixture.peer(
             "gateway.powerAck",
             id = S33Ids.GATEWAY_PRIMARY,
@@ -1030,7 +1031,7 @@ class S33BusinessJourneyTest {
         compose.onNode(hasText("远程关闭已完成", substring = true), useUnmergedTree = true)
             .assertIsDisplayed()
         settingsList.performScrollToNode(hasTestTag("settings.refreshAll"))
-        waitForText("通话网络：自动，标准连接失败后尝试兼容连接。")
+        waitForText("标准连接失败后自动改用兼容连接")
         compose.onNodeWithTag("settings.refreshAll", useUnmergedTree = true).performClick()
         listOf("sims", "provider", "blocklist", "gateway", "passkeys").forEach {
             waitForSettingsSection(it, timeoutMs = 15_000)
