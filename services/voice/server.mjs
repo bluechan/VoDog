@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { VoiceControlClient } from './control-client.mjs';
-import { PROVIDER_ID_PATTERN, availableProviders, providerConfig, providerUnavailable } from './providers/index.mjs';
+import { PROVIDER_ID_PATTERN, availableProviders, greetingFor, providerConfig, providerUnavailable } from './providers/index.mjs';
 import { ThreadedVoiceAgent } from './provider-proxy.mjs';
 import { loadWrtc } from './webrtc-media.mjs';
 import { VoiceWorker, logLevel } from './worker.mjs';
@@ -77,6 +77,18 @@ export function jsonLogger({ nodeId, write = line => process.stdout.write(line),
     if (record?.event === 'run_closed') callIds.delete(record.runId);
   };
 }
+/**
+ * The production `createAgent`: the startup config per provider, plus (S137) a per-run greeting
+ * override for `greetingKind`. Without a kind the config passes through untouched.
+ */
+export function agentFactory(configs, { create = options => new ThreadedVoiceAgent(options) } = {}) {
+  return ({ provider, greetingKind }) => {
+    const config = configs.get(provider);
+    if (!config) throw providerUnavailable();
+    const greeting = greetingFor(provider, greetingKind);
+    return create({ provider, config: greeting === undefined ? config : { ...config, greeting } });
+  };
+}
 export async function main(env = process.env) {
   // Validate all startup configuration and native dependencies before advertising
   // worker health. The service's environment contains no DB or MEDIA_SECRET.
@@ -93,11 +105,7 @@ export async function main(env = process.env) {
   if (!wrtc.nonstandard?.RTCAudioSource || !wrtc.nonstandard?.RTCAudioSink) throw new Error('Native WebRTC audio is unavailable');
   // S24 决策 2: one provider thread per run. The main thread keeps the wrtc objects, the audio
   // bridge's pacing and Control I/O; nothing else.
-  const createAgent = ({ provider }) => {
-    const config = configs.get(provider);
-    if (!config) throw providerUnavailable();
-    return new ThreadedVoiceAgent({ provider, config });
-  };
+  const createAgent = agentFactory(configs);
   const log = jsonLogger({ nodeId });
   // S98: the between-runs heap check can only collect before it decides to restart when node runs
   // with --expose-gc (Dockerfile ENTRYPOINT / systemd ExecStart); without it that step is a no-op.

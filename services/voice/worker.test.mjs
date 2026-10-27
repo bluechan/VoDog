@@ -1097,3 +1097,45 @@ test('S129: response_done carries leadTrimMs when the provider reports it, and r
     assert.equal('rx' in t.logs.find(entry => entry.event === 'run_closed'), false);
   }
 });
+test('S137: greetingKind on the claim reaches createAgent; absent it stays undefined', async () => {
+  const asked = [];
+  const ended = { read: async () => ({ run: { state: 'ended' }, callState: 'ended', audioAllowed: false }) };
+  const s = setup({ createAgent: options => { asked.push(options); return new Agent(); }, control: ended });
+  await s.worker.execute({ ...run(), greetingKind: 'leave_message' });
+  await setup({ createAgent: options => { asked.push(options); return new Agent(); }, control: ended }).worker.execute(run());
+  assert.equal(asked[0].greetingKind, 'leave_message');
+  assert.equal(asked[1].greetingKind, undefined);
+});
+test('S137: an earlier triggerAt read during the prewarm wait commits earlier', async () => {
+  const started = Date.now(); let committedAt = 0;
+  const earlier = new Date(started + 500).toISOString();
+  const s = setup({ control: {
+    read: async () => ({ run: { state: 'preparing', triggerAt: earlier }, callState: 'ringing', audioAllowed: false }),
+    commit: async () => { committedAt = Date.now(); throw Object.assign(new Error('stop here'), { code: 'test_stop' }); } } });
+  await s.worker.execute({ ...run(), triggerAt: new Date(started + 3_000).toISOString() });
+  assert.ok(committedAt > 0 && committedAt - started < 2_000, `committed after ${committedAt - started} ms`);
+  const advanced = s.logs.filter(l => l.event === 'trigger_advanced');
+  assert.equal(advanced.length, 1); assert.equal(advanced[0].toMs, Date.parse(earlier));
+});
+test('S137: a failing read during the prewarm wait keeps the original trigger and still commits', async () => {
+  const started = Date.now(); let committedAt = 0, reads = 0;
+  const s = setup({ control: {
+    read: async () => { reads++; throw new Error('tunnel stall'); },
+    commit: async () => { committedAt = Date.now(); throw Object.assign(new Error('stop here'), { code: 'test_stop' }); } } });
+  await s.worker.execute({ ...run(), triggerAt: new Date(started + 2_500).toISOString() });
+  assert.ok(committedAt - started >= 2_400, `committed after ${committedAt - started} ms`);
+  assert.ok(reads >= 2);
+  assert.equal(s.logs.filter(l => l.event === 'trigger_read_failed').length, 1);
+});
+test('S137: a call that ends during the prewarm wait stops as call_terminal without answering', async () => {
+  const s = setup({ control: { read: async () => ({ run: { state: 'preparing' }, callState: 'ended', audioAllowed: false }) } });
+  await s.worker.execute({ ...run(), triggerAt: new Date(Date.now() + 3_000).toISOString() });
+  assert.deepEqual(s.calls, ['fail:call_terminal']);
+});
+test('S137: a due trigger commits without reading Control first', async () => {
+  let readsBeforeCommit = null, reads = 0;
+  const s = setup({ control: { read: async () => { reads++; return { run: { state: 'ended' }, callState: 'ended', audioAllowed: false }; },
+    commit: async () => { readsBeforeCommit = reads; } } });
+  await s.worker.execute(run());
+  assert.equal(readsBeforeCommit, 0);
+});

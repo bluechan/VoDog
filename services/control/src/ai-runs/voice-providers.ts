@@ -46,7 +46,7 @@ export async function selectedVoiceProvider(db:Queryable,userId:string):Promise<
 export async function voiceProviderStatus(db:Db,config:Pick<Config,'AI_VOICE_PROVIDERS'>,userId:string){
   const configured=parseVoiceProviders(config.AI_VOICE_PROVIDERS);
   const [selection,online]=await Promise.all([
-    db.query(`SELECT ai_voice_provider,ai_voice_provider_version FROM users WHERE id=$1`,[userId]),
+    db.query(`SELECT ai_voice_provider,ai_voice_provider_version,contact_instant_ai FROM users WHERE id=$1`,[userId]),
     onlineVoiceProviders(db),
   ]);
   const selected=(selection.rows[0]?.ai_voice_provider as string|undefined)??DEFAULT_VOICE_PROVIDER;
@@ -56,6 +56,8 @@ export async function voiceProviderStatus(db:Db,config:Pick<Config,'AI_VOICE_PRO
     items:ids.map(id=>({id,label:voiceProviderLabel(id),configured:configured.includes(id),online:online.has(id)})),
     selected,
     configVersion,
+    // S137 决策 5: 「通讯录用户启用AI即接」 lives beside the provider choice.
+    contactInstantAi:selection.rows[0]?.contact_instant_ai===true,
   };
 }
 
@@ -98,6 +100,24 @@ export function registerVoiceProviderRoutes(app:FastifyInstance,db:Db,config:Pic
           WHERE id=$1 AND ai_voice_provider_version=$3`,[userId,body.provider,body.expectedVersion]);
         await c.query(`INSERT INTO audit_events(actor_user_id,action,resource_type,resource_id,details)
           VALUES($1,'ai.voice_provider.update','user',$1,$2)`,[userId,JSON.stringify({from,to:body.provider})]);
+        await c.query('COMMIT');
+      }catch(error){await safeRollback(c);throw error;}
+    });
+    return voiceProviderStatus(db,config,userId);
+  });
+  /** S137 决策 5: a boolean, last write wins, so no version check; only calls arriving later are affected. */
+  app.put('/api/v1/ai/contact-instant-ai',async request=>{
+    const {userId}=dependencies.requireUser(request);
+    dependencies.mutationOrigin(request);
+    const body=z.object({enabled:z.boolean()}).parse(request.body);
+    await withClient(db,async c=>{
+      try{
+        await c.query('BEGIN');
+        const current=await c.query(`SELECT contact_instant_ai FROM users WHERE id=$1 FOR UPDATE`,[userId]);
+        if(!current.rowCount){await c.query('COMMIT');dependencies.fail(401,'UNAUTHENTICATED','Authentication required');}
+        await c.query(`UPDATE users SET contact_instant_ai=$2 WHERE id=$1`,[userId,body.enabled]);
+        await c.query(`INSERT INTO audit_events(actor_user_id,action,resource_type,resource_id,details)
+          VALUES($1,'ai.contact_instant_ai.update','user',$1,$2)`,[userId,JSON.stringify({from:current.rows[0].contact_instant_ai===true,to:body.enabled})]);
         await c.query('COMMIT');
       }catch(error){await safeRollback(c);throw error;}
     });

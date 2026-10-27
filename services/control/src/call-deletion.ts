@@ -1,4 +1,4 @@
-import { lstat, readdir, rm } from 'node:fs/promises';
+import { lstat, readdir, rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { safeRollback, withClient, type Db } from './db.js';
 import { recordingRequestHeaders } from './recording-store.js';
@@ -54,6 +54,8 @@ export interface CallDeletionDeps {
   pixelArchiveRoot?: string | null;
   /** S39 §5: parent of the per-node recording mirrors, `<root>/<nodeId>/<callId>`. */
   recordingBackupRoot?: string | null;
+  /** RECORDING_MP3_CACHE_DIR: flat `<callId>-<source>-<track>.mp3` exports and their temp files. */
+  mp3CacheDir?: string | null;
   nodes?: CallDeletionRecordingNodes | null;
   log?: CallDeletionLog | null;
   fetchImpl?: typeof fetch;
@@ -118,6 +120,7 @@ async function reclaimCallFiles(deps: CallDeletionDeps, callId: string, mediaNod
     if (!root) continue;
     if (await removeCallDirectory(deps, root, callId)) localRemoved += 1;
   }
+  await removeCachedMp3s(deps, callId);
   return { localRemoved, remote: await deleteRemoteRecording(deps, callId, mediaNodeId) };
 }
 
@@ -165,6 +168,41 @@ async function removeCallDirectory(deps: CallDeletionDeps, root: string, callId:
   } catch (error) {
     deps.log?.warn({ callId, dir, code: (error as NodeJS.ErrnoException)?.code }, 'call deletion could not remove a recording directory');
     return false;
+  }
+}
+
+/**
+ * Drops every cached export of the call. `callId` is a validated uuid, so the `<id>-` prefix can
+ * never match another call. Not counted in `localRemoved`, which stays a count of directories.
+ * ponytail: a transcode still running when the row dies can rename its temp into place afterwards;
+ * retention's mp3 cache sweep collects it.
+ */
+async function removeCachedMp3s(deps: CallDeletionDeps, callId: string): Promise<void> {
+  const dir = deps.mp3CacheDir;
+  if (!dir) return;
+  let names: string[];
+  try {
+    const top = await lstat(dir);
+    if (!top.isDirectory() || top.isSymbolicLink()) {
+      deps.log?.warn({ callId, dir }, 'call deletion refused an unsafe mp3 cache dir');
+      return;
+    }
+    // Dirent.isFile() is false for symlinks, so a link is never followed or removed.
+    names = (await readdir(dir, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.startsWith(`${callId}-`))
+      .map((entry) => entry.name);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT')
+      deps.log?.warn({ callId, dir, code: (error as NodeJS.ErrnoException)?.code }, 'call deletion could not list the mp3 cache dir');
+    return;
+  }
+  for (const name of names) {
+    try {
+      await unlink(join(dir, name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT')
+        deps.log?.warn({ callId, file: name, code: (error as NodeJS.ErrnoException)?.code }, 'call deletion could not remove a cached mp3');
+    }
   }
 }
 

@@ -1684,6 +1684,37 @@ test('unknown call lock survives heartbeat and an incomplete snapshot until exec
   const allowed=await app.inject({method:'POST',url:'/api/v1/calls/outbound',headers:{...auth(token1),'idempotency-key':'unknown-now-cleared'},payload:{simId:fixture.simId,remoteNumber:'+15554003'}});assert.equal(allowed.statusCode,202,allowed.body);
 });
 
+// S140: a CellDock command ledger kept per Mac can reopen at reportedFloor 0 within one generation.
+async function regressedLedgerFixture(label:string,gapStatus:string){
+  const fixture=await gatewayFixture(user1,label);
+  await db.query(`UPDATE gateways SET command_sequence=3 WHERE id=$1`,[fixture.gatewayId]);
+  await db.query(
+    `INSERT INTO commands(gateway_id,generation,sequence,kind,payload,expires_at,status) VALUES
+       ($1,$2,1,'hangup','{}',now()-interval '1 minute','acked'),($1,$2,2,'hangup','{}',now()-interval '1 minute',$3),
+       ($1,$2,3,'hangup','{}',now()-interval '1 minute','acked')`,
+    [fixture.gatewayId,fixture.deviceEpoch,gapStatus],
+  );
+  await db.query(`UPDATE gateway_telecom_snapshots SET snapshot_sequence=1,reported_sequence=3 WHERE gateway_id=$1`,[fixture.gatewayId]);
+  const post=()=>app.inject({method:'POST',url:'/api/v1/gateway/telecom/snapshot',headers:auth(fixture.deviceToken),payload:{snapshotId:crypto.randomUUID(),snapshotSequence:2,generation:fixture.deviceEpoch,reportedSequence:0,localBusy:false,confirmedAbsentCallIds:[],calls:[],observedAt:new Date().toISOString()}});
+  const row=async()=>(await db.query(`SELECT snapshot_sequence::int,reported_sequence::int FROM gateway_telecom_snapshots WHERE gateway_id=$1`,[fixture.gatewayId])).rows[0];
+  return {fixture,post,row};
+}
+
+test('S140: a regressed gateway ledger is accepted when every command in the gap is terminal',async()=>{
+  const {fixture,post,row}=await regressedLedgerFixture('ledger-regressed','acked');
+  const accepted=await post();assert.equal(accepted.statusCode,200,accepted.body);
+  assert.deepEqual(await row(),{snapshot_sequence:2,reported_sequence:0});
+  const diagRows=await untilRows(`SELECT fields FROM diag_events WHERE event='gateway.snapshot_ledger_regressed' AND fields->>'gatewayId'=$1`,[fixture.gatewayId],'the ledger regression row');
+  assert.equal(diagRows.length,1);
+  assert.deepEqual(diagRows[0].fields,{gatewayId:fixture.gatewayId,storedReported:3,reported:0,generation:fixture.deviceEpoch});
+});
+
+test('S140: a lower reportedSequence is still stale while a command in the gap is pending',async()=>{
+  const {post,row}=await regressedLedgerFixture('ledger-pending','pending');
+  const rejected=await post();assert.equal(rejected.statusCode,409,rejected.body);assert.equal(rejected.json().error.code,'STALE_SNAPSHOT');
+  assert.deepEqual(await row(),{snapshot_sequence:1,reported_sequence:3});
+});
+
 test('fresh idle snapshot converges a never-bound outgoing call after its proven non-executing commands expire',async()=>{
   const fixture=await gatewayFixture(user1,'never-bound-idle');
   const token=await login('one@example.test','correct horse battery staple');

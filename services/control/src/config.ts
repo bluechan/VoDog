@@ -90,14 +90,23 @@ const schema = z.object({
   // call. Off = the pre-S38 `local_only` behaviour, which is also the rollback.
   BUSY_CONFLICT_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S86: a call a third-party screening app (拦截猫 etc.) blocked adds its number to the owner's call
-  // blocklist. Off = only the call record is kept, which is also the rollback.
-  SCREENING_APP_AUTO_BLOCK_ENABLED: z.enum(['true','false']).default('true').transform(v=>v==='true'),
+  // blocklist. Off = only the call record is kept. S136 turned it off by default: a screened call is
+  // handed to AI instead (SCREENED_CALL_AI_ANSWER_ENABLED).
+  SCREENING_APP_AUTO_BLOCK_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S56: let an unanswered VoDog outgoing call open its media leg without a capture identity
   // so clients hear carrier ringback/busy tones; rides the heartbeat as `earlyMedia`. Off = rollback.
   EARLY_MEDIA_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S123 决策 6/7: let an AI-answered incoming call's gateway leg open without a capture identity
   // while the phone still rings; rides the heartbeat as `aiEarlyLeg`. Off = rollback (new calls only).
   AI_EARLY_LEG_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  // S134: a Pixel-answered incoming call gets a passive capture binding like an S38 phone-dialed call.
+  PIXEL_LOCAL_ANSWER_RECORDING_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  // S136: an incoming call the Pixel's call-screening app silenced (`screened:true` in /gateway/calls/incoming)
+  // is answered by AI at once instead of ringing the clients; off = the field is ignored.
+  SCREENED_CALL_AI_ANSWER_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
+  // S137: a contact's call that would be AI 即接 rings CONTACT_DEFERRED_AI_SECONDS first, then AI answers
+  // with the leave-message greeting, unless the owner set users.contact_instant_ai. Off = rollback.
+  CONTACT_DEFERRED_AI_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),
   // S38: record and archive calls the user dials on the Pixel itself. Off = the gateway's
   // outgoing-observed reports are acknowledged but never become call records.
   PIXEL_ORIGINATED_CALLS_ENABLED: z.enum(['true','false']).default('false').transform(v=>v==='true'),

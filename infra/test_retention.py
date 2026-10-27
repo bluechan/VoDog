@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -349,6 +350,58 @@ class SignatureTests(unittest.TestCase):
         self.assertEqual(retention.configured_remote_nodes({}, "relay-primary"), [])
 
 
+class Mp3CacheSweepTests(unittest.TestCase):
+    def layout(self, base):
+        live, dead = str(uuid.uuid4()), str(uuid.uuid4())
+        aged = time.time() - 2 * retention.ORPHAN_MIN_AGE_SECONDS
+        files = {
+            "live": (f"{live}-pixel-conversation.mp3", aged),
+            "dead_aged": (f"{dead}-media_node-remote_original.mp3", aged),
+            "dead_fresh": (f"{dead}-pixel-conversation.mp3", None),
+            "temp_aged": (f"{live}-pixel-uplink.mp3.abcd.part", aged),
+            "caller_aged": (f"{live}-pixel-conversation.mp3.abcd.caller", aged),
+            "temp_fresh": (f"{live}-pixel-uplink.mp3.efgh.part", None),
+            "not_uuid": ("notes.mp3", aged),
+        }
+        for name, mtime in files.values():
+            path = write_tree(base, name, b"12345")
+            if mtime is not None:
+                os.utime(path, (mtime, mtime))
+        os.symlink(os.path.join(base, files["dead_aged"][0]), os.path.join(base, f"{dead}-link.mp3"))
+        return live, {key: os.path.join(base, name) for key, (name, _mtime) in files.items()}
+
+    def test_dry_run_counts_without_deleting(self):
+        with tempfile.TemporaryDirectory() as base:
+            live, files = self.layout(base)
+            report = retention.Report("report")
+            retention.run_mp3_cache(FakeDatabase([live]), report, {"mp3_cache": base}, True)
+            self.assertEqual(report.mp3_cache, {"candidates": 3, "deleted": 0, "bytes": 15})
+            self.assertTrue(all(os.path.exists(path) for path in files.values()))
+
+    def test_apply_removes_dead_and_temp_files_and_keeps_the_live_call(self):
+        with tempfile.TemporaryDirectory() as base:
+            live, files = self.layout(base)
+            report = retention.Report("apply")
+            retention.run_mp3_cache(FakeDatabase([live]), report, {"mp3_cache": base}, False)
+            self.assertEqual(report.mp3_cache, {"candidates": 3, "deleted": 3, "bytes": 15})
+            gone = {"dead_aged", "temp_aged", "caller_aged"}
+            for key, path in files.items():
+                self.assertEqual(os.path.exists(path), key not in gone, key)
+            self.assertTrue(os.path.islink(next(Path(base).glob("*-link.mp3"))))
+            self.assertEqual(report.errors, [])
+
+    def test_unset_or_missing_cache_dir_is_a_no_op(self):
+        report = retention.Report("apply")
+        retention.run_mp3_cache(None, report, {"mp3_cache": None}, False)
+        retention.run_mp3_cache(None, report, {"mp3_cache": "/nonexistent/vodog/mp3"}, False)
+        self.assertEqual(report.mp3_cache, {"candidates": 0, "deleted": 0, "bytes": 0})
+
+    def test_the_cache_dir_comes_from_the_env_file_key(self):
+        paths = retention.resolved_paths({"RECORDING_MP3_CACHE_DIR": "/opt/vodog/data/mp3-cache"}, "/l")
+        self.assertEqual(paths["mp3_cache"], "/opt/vodog/data/mp3-cache")
+        self.assertIsNone(retention.resolved_paths({}, "/l")["mp3_cache"])
+
+
 class FakeDatabase:
     """Returns a fixed candidate list; every delete claims to have removed one row."""
 
@@ -673,11 +726,12 @@ class ReportShapeTests(unittest.TestCase):
         report = retention.Report("report")
         document = report.document()
         self.assertEqual(set(document), {"ok", "action", "dryRun", "calls", "remoteRetries", "sms", "orphans",
-                                         "housekeeping", "errors"})
+                                         "mp3Cache", "housekeeping", "errors"})
         self.assertEqual(set(document["calls"]), {"candidates", "deleted", "failed", "remoteDeleteUnsupported", "files"})
         self.assertEqual(set(document["remoteRetries"]), {"candidates", "deleted", "unsupported", "failed", "retried"})
         self.assertEqual(set(document["calls"]["files"]), {"bytes", "dirs"})
         self.assertEqual(set(document["orphans"]), {"candidates", "deleted", "files"})
+        self.assertEqual(set(document["mp3Cache"]), {"candidates", "deleted", "bytes"})
         self.assertTrue(document["ok"])
         self.assertTrue(document["dryRun"])
         self.assertEqual(document["action"], "report")

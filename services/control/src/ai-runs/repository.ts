@@ -75,6 +75,8 @@ export async function createAiRunForIncoming(c:PoolClient,input:{enabled:boolean
    * shorter than the 10 s floor `timeout_seconds_snapshot` is allowed to hold. That column keeps the
    * SIM's own frozen setting, exactly like every other run; `trigger_at` is what actually governs. */
   triggerSeconds?:number;
+  /** S137 决策 4: the greeting is frozen per run; the worker reads it as `greetingKind`. */
+  greetingKind?:'leave_message';
   /** S24 决策 3: rung when the owner's provider has no live worker, so the caller can log the skip. */
   onProviderUnavailable?:(info:{provider:string})=>void}){
   if(!input.enabled||!['ai','timeout_ai'].includes(input.mode))return null;
@@ -87,13 +89,13 @@ export async function createAiRunForIncoming(c:PoolClient,input:{enabled:boolean
     return null;
   }
   const run=(await c.query(`INSERT INTO ai_call_runs(call_id,gateway_id,snapshot_owner_id,device_generation,media_epoch,mode_snapshot,
-      settings_version_snapshot,assignment_version_snapshot,timeout_seconds_snapshot,trigger_at,voice_provider)
+      settings_version_snapshot,assignment_version_snapshot,timeout_seconds_snapshot,trigger_at,voice_provider,greeting_kind)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,
       CASE WHEN $6='ai' THEN now() WHEN $12::int IS NOT NULL THEN now()+$12::int*interval '1 second'
-        ELSE LEAST(now(),$10::timestamptz)+$9::int*interval '1 second' END,$11)
+        ELSE LEAST(now(),$10::timestamptz)+$9::int*interval '1 second' END,$11,$13)
     ON CONFLICT(call_id) DO NOTHING RETURNING *`,[
       input.callId,input.gatewayId,input.ownerId,input.deviceGeneration,input.mediaEpoch,input.mode,input.settingsVersion,
-      input.assignmentVersion,input.timeoutSeconds,input.observedAt,provider,input.triggerSeconds??null,
+      input.assignmentVersion,input.timeoutSeconds,input.observedAt,provider,input.triggerSeconds??null,input.greetingKind??null,
     ])).rows[0];
   if(!run)return null;
   await c.query(`UPDATE call_records SET settings_version_snapshot=$2,assignment_version_snapshot=$3,
@@ -232,8 +234,10 @@ async function commitAiAnswerOnce(db:Db,input:{runId:string;instanceId:string;bo
 }
 
 export async function markHumanWinner(c:PoolClient,callId:string){
-  await c.query(`UPDATE ai_call_runs SET state='lost_race',lease_hash=NULL,lease_until=NULL,lease_owner=NULL,lease_boot_id=NULL,updated_at=now()
+  const lost=await c.query(`UPDATE ai_call_runs SET state='lost_race',lease_hash=NULL,lease_until=NULL,lease_owner=NULL,lease_boot_id=NULL,updated_at=now()
     WHERE call_id=$1 AND state IN ('pending','preparing') AND answer_command_id IS NULL`,[callId]);
+  // S137 决策 2: a human beat a deferred screened run, so the call is no 拦截转 AI 接听; a run AI already won keeps it.
+  if(lost.rowCount)await c.query(`UPDATE call_records SET conflict_disposition=NULL WHERE id=$1 AND conflict_disposition='screened_ai'`,[callId]);
 }
 
 export async function observeAiCallState(c:PoolClient,callId:string,state:'active'|'ended'|'failed'|'unknown'){
@@ -379,4 +383,6 @@ function runDto(row:any){return{id:row.id,callId:row.call_id,mode:row.mode_snaps
   // S24 决策 3: the worker instantiates this adapter, so the claim/read response must carry the run's
   // frozen choice rather than whatever the owner has selected right now.
   voiceProvider:(row.voice_provider as string|undefined)??DEFAULT_VOICE_PROVIDER,
-  mediaNodeId:row.media_node_id??row.call_media_node_id??undefined};}
+  mediaNodeId:row.media_node_id??row.call_media_node_id??undefined,
+  // S137 决策 4: absent for the default greeting, so an older worker sees an unchanged DTO.
+  ...(row.greeting_kind?{greetingKind:row.greeting_kind as string}:{})};}

@@ -41,6 +41,8 @@ ROWS_CEILING = 500000
 # its manifest yet, so only aged directories are reclaimed.
 ORPHAN_MIN_AGE_SECONDS = 3600
 ORPHAN_CHUNK = 500
+# Leftovers of an interrupted transcode/mix in RECORDING_MP3_CACHE_DIR (app.ts mixMp3/transcodeMp3).
+MP3_TEMP_SUFFIXES = (".part", ".caller", ".remote")
 REMOTE_TIMEOUT_SECONDS = 15
 # S39 §4: Control tries the remote delete once; this job carries the retries.
 REMOTE_RETRY_LIMIT = 100
@@ -383,6 +385,26 @@ def remove_directory(path, dry_run):
     return used, 1
 
 
+def remove_file(path, dry_run):
+    """remove_directory's sibling for flat cache files: regular files only, never a symlink."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        fail("filesystem", "path_unreadable")
+    if not stat.S_ISREG(info.st_mode):
+        fail("filesystem", "path_not_file")
+    if not dry_run:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            fail("filesystem", "remove_failed")
+    return info.st_size
+
+
 class FileTally:
     def __init__(self):
         self.bytes = 0
@@ -559,6 +581,7 @@ class Report:
         self.sms = {}
         self.orphans = {"candidates": 0, "deleted": 0}
         self.orphan_files = FileTally()
+        self.mp3_cache = {"candidates": 0, "deleted": 0, "bytes": 0}
         self.housekeeping = {}
         self.errors = []
 
@@ -581,6 +604,7 @@ class Report:
             "remoteRetries": self.remote_retries,
             "sms": self.sms,
             "orphans": {**self.orphans, "files": self.orphan_files.document()},
+            "mp3Cache": self.mp3_cache,
             "housekeeping": self.housekeeping,
             "errors": self.errors,
         }
@@ -928,6 +952,55 @@ def run_orphans(db, report, paths, dry_run, reference=None, deadline=None):
             report.orphans["deleted"] += 1
 
 
+def mp3_cache_files(root):
+    """(call_id, path, mtime) for regular files under `root` whose name starts with `<uuid>-`."""
+    if not root:
+        return []
+    try:
+        names = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return []
+    except OSError:
+        fail("filesystem", "directory_unreadable")
+    result = []
+    for name in names:
+        if len(name) < 37 or name[36] != "-" or not UUID.fullmatch(name[:36]):
+            continue
+        path = os.path.join(root, name)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            result.append((name[:36].lower(), path, info.st_mtime))
+    return result
+
+
+def run_mp3_cache(db, report, paths, dry_run, reference=None, deadline=None):
+    """An aged cache file goes when its call row is gone, or when it is a transcode temp."""
+    files = mp3_cache_files(paths.get("mp3_cache"))
+    if not files:
+        return
+    known = known_call_ids(db, {call_id for call_id, _path, _mtime in files})
+    reference = time.time() if reference is None else reference
+    for call_id, path, mtime in files:
+        if deadline is not None and deadline.expired():
+            report.error("runtime", "runtime_limit")
+            return
+        if reference - mtime <= ORPHAN_MIN_AGE_SECONDS:
+            continue
+        if call_id in known and not path.endswith(MP3_TEMP_SUFFIXES):
+            continue
+        report.mp3_cache["candidates"] += 1
+        try:
+            report.mp3_cache["bytes"] += remove_file(path, dry_run)
+        except RetentionError as error:
+            report.error(error.failure_type, error.code)
+            continue
+        if not dry_run:
+            report.mp3_cache["deleted"] += 1
+
+
 # ------------------------------------------------------------------------- main
 
 
@@ -956,6 +1029,7 @@ def resolved_paths(values, ledger_root):
         "recording": values.get("RECORDING_ROOT") or None,
         "pixel": values.get("PIXEL_ARCHIVE_ROOT") or None,
         "ledger": ledger_root,
+        "mp3_cache": values.get("RECORDING_MP3_CACHE_DIR") or None,
     }
 
 
@@ -999,6 +1073,7 @@ def execute(args, report):
         if not args.skip_housekeeping:
             run_housekeeping(db, report, values, reference, args.max_rows, dry_run)
         run_orphans(db, report, paths, dry_run, deadline=deadline)
+        run_mp3_cache(db, report, paths, dry_run, deadline=deadline)
 
     if dry_run:
         phases()

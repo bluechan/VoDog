@@ -53,6 +53,21 @@ export function providerConfig({ provider, env = {} } = {}) {
   return found.config(env);
 }
 
+/** S137: the per-run greeting (VoDog keeps the AI disclosure upstream omits) for a contact whose call rang 15 s before the AI took it. */
+export const LEAVE_MESSAGE_GREETING = '不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢';
+
+/**
+ * S137: the greeting override for a run's `greetingKind`, or undefined to keep the provider's own.
+ * Doubao speaks `greeting` verbatim; xAI model mode treats it as an instruction (Space agent mode
+ * ignores it and plays the agent's own opener — known limit).
+ */
+export function greetingFor(provider, kind) {
+  if (kind !== 'leave_message') return undefined;
+  if (provider === 'doubao') return LEAVE_MESSAGE_GREETING;
+  if (provider === 'xai') return `请只说这一句话：${LEAVE_MESSAGE_GREETING}`;
+  return undefined;
+}
+
 /**
  * `config` is the already-parsed startup configuration (it is what crosses into the provider
  * thread); `env` is the fallback for callers that hold only the environment. `overrides` exists

@@ -473,6 +473,35 @@ test('S39 deletion reclaims every per-node directory under the recording backup 
   }
 });
 
+test('deletion removes every cached mp3 of the call and nothing of another call', async () => {
+  const cacheDir = await mkdtemp(join(tmpdir(), 'cc-mp3-cache-'));
+  const cacheApp = await buildApp(db, { ...config, RECORDING_MP3_CACHE_DIR: cacheDir } as never);
+  try {
+    const callId = await makeCall();
+    const neighbour = await makeCall();
+    const mine = [`${callId}-pixel-conversation.mp3`, `${callId}-media_node-remote_original.mp3`, `${callId}-pixel-conversation.mp3.abcd.part`];
+    const theirs = [`${neighbour}-pixel-conversation.mp3`, 'unrelated.mp3'];
+    for (const name of [...mine, ...theirs]) await writeFile(join(cacheDir, name), 'mp3');
+
+    const deleted = await cacheApp.inject({ method: 'DELETE', url: `/api/v1/calls/${callId}`, headers: auth(ownerToken) });
+    assert.equal(deleted.statusCode, 204, deleted.body);
+    for (const name of mine)
+      await assert.rejects(() => stat(join(cacheDir, name)), (error: NodeJS.ErrnoException) => error.code === 'ENOENT');
+    for (const name of theirs) assert.ok((await stat(join(cacheDir, name))).isFile(), `${name} must survive`);
+
+    // The cache dir is created lazily on first export; its absence is not a deletion failure.
+    const missingApp = await buildApp(db, { ...config, RECORDING_MP3_CACHE_DIR: join(cacheDir, 'absent') } as never);
+    try {
+      const other = await makeCall();
+      const second = await missingApp.inject({ method: 'DELETE', url: `/api/v1/calls/${other}`, headers: auth(ownerToken) });
+      assert.equal(second.statusCode, 204, second.body);
+    } finally { await missingApp.close(); }
+  } finally {
+    await cacheApp.close();
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
 const snapshotPayload = (f: Fixture, sequence: number) => ({
   snapshotId: crypto.randomUUID(), snapshotSequence: sequence, generation: f.deviceEpoch,
   reportedSequence: 0, localBusy: false, confirmedAbsentCallIds: [], calls: [],

@@ -614,7 +614,7 @@ CREATE INDEX IF NOT EXISTS call_records_owner_blocked_idx ON call_records(snapsh
 -- ---------------------------------------------------------------------------
 ALTER TABLE call_records ADD COLUMN IF NOT EXISTS conflict_disposition text;
 ALTER TABLE call_records DROP CONSTRAINT IF EXISTS call_records_conflict_disposition_check;
-ALTER TABLE call_records ADD CONSTRAINT call_records_conflict_disposition_check CHECK (conflict_disposition IS NULL OR conflict_disposition IN ('rejected','ai_answered'));
+ALTER TABLE call_records ADD CONSTRAINT call_records_conflict_disposition_check CHECK (conflict_disposition IS NULL OR conflict_disposition IN ('rejected','ai_answered','screened_ai'));
 ALTER TABLE call_records DROP CONSTRAINT IF EXISTS call_records_originating_platform_check;
 ALTER TABLE call_records ADD CONSTRAINT call_records_originating_platform_check CHECK (originating_platform IS NULL OR originating_platform IN ('web','ios','android','macos','pixel','watchos'));
 -- S54: native macOS client (CellDock). Sessions gain 'macos' the same way; the list above
@@ -807,3 +807,8 @@ CREATE TABLE IF NOT EXISTS watchos_push_deliveries (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (registration_id, call_id, event)
 );
+
+-- S137: per-account 「通讯录用户启用AI即接」 and the per-run frozen greeting.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS contact_instant_ai boolean NOT NULL DEFAULT false;
+ALTER TABLE ai_call_runs ADD COLUMN IF NOT EXISTS greeting_kind text;
+DO $$ BEGIN ALTER TABLE ai_call_runs ADD CONSTRAINT ai_call_runs_greeting_kind_check CHECK(greeting_kind IS NULL OR greeting_kind IN ('leave_message')); EXCEPTION WHEN duplicate_object THEN NULL; END $$;

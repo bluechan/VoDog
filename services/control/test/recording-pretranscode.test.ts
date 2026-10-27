@@ -43,6 +43,28 @@ test("a completed Pixel archive pre-builds each track's mp3 into the route's cac
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("S141: a completed Pixel archive also pre-builds the conversation mix, with the uplink as the caller half", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cc-mp3-"));
+  try {
+    const { db, diags } = fakeDb();
+    const opened: string[] = [], mixes: string[] = [];
+    const full = {
+      manifest: async () => ({ tracks: [{ track: "caller_original", bytes: 9 }, { track: "remote_original", bytes: 9 }], uplinkTracks: [{ track: "caller_uplink", bytes: 9 }] }) as any,
+      openTrack: async (_id: string, track: string) => { opened.push(track); return { stream: Readable.from([]) } as any; },
+    };
+    const transcode = async (_db: Db, _dir: string, target: string) => { await writeFile(target, "mp3"); };
+    const mix = async (_db: Db, _dir: string, target: string, open: (track: any) => Promise<unknown>, offset: number | null) => {
+      mixes.push(target); assert.equal(offset, null);
+      await open("caller_original"); await open("remote_original"); await writeFile(target, "mp3");
+    };
+    await pretranscodePixelRecording(db, full, dir, callId, transcode, {}, mix);
+    await pretranscodePixelRecording(db, full, dir, callId, transcode, {}, mix);
+    assert.deepEqual(mixes, [join(dir, `${callId}-pixel-conversation.mp3`)], "the route's cache path, built once");
+    assert.deepEqual(opened, ["caller_uplink", "remote_original"]);
+    assert.equal(diags.length, 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("a failed pre-transcode is one warn diag row and never throws", async () => {
   const dir = await mkdtemp(join(tmpdir(), "cc-mp3-"));
   try {
