@@ -86,8 +86,8 @@ Bundled runtime size/hash checks, payload construction and app payload decoding 
 
 ## Bundled sounds
 
-`Resources/Sounds/bleeps.wav` (SMS chime) and `Resources/Sounds/ring.mp3` (ringtone) are not
-committed (git-ignored); they are synthesized from scratch with NumPy by `scripts/sounds/chime.py` and `scripts/sounds/ring.py`
+`Resources/Sounds/bleeps.wav` (SMS chime) and `Resources/Sounds/ring.mp3` (ringtone) are
+committed; they are synthesized from scratch with NumPy by `scripts/sounds/chime.py` and `scripts/sounds/ring.py`
 (sine tones, original phrases, no third-party samples), ported from upstream CellDock. They
 reproduce byte-for-byte: `python3 scripts/sounds/chime.py OUT` gives `OUT/dewdrop.wav` =
 `bleeps.wav`; `python3 scripts/sounds/ring.py OUT` then

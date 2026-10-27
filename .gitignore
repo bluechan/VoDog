@@ -44,6 +44,9 @@ recordings/
 *.log
 *.wav
 *.mp3
+# Synthesized alert tones (apps/macos/scripts/sounds), not recordings.
+!apps/macos/Resources/Sounds/bleeps.wav
+!apps/macos/Resources/Sounds/ring.mp3
 *.pcm
 # Local tools
 .DS_Store

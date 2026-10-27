@@ -20,8 +20,8 @@ done
 VODOG_SIGNING_MODE=development VODOG_CODESIGN_IDENTITY="Apple Development: <your identity>" scripts/build_app.sh
 ```
 
-build_app.sh needs the alert sounds, which are generated rather than committed (NumPy and
-FFmpeg, see docs/THIRD_PARTY_NOTICES.md):
+The alert sounds in Resources/Sounds are committed. They are synthesized, and this reproduces them
+byte for byte (NumPy and FFmpeg, see docs/THIRD_PARTY_NOTICES.md):
 
 ```sh
 python3 scripts/sounds/chime.py /tmp/vodog-sounds && python3 scripts/sounds/ring.py /tmp/vodog-sounds
