@@ -340,6 +340,8 @@ final class S20ClientPolicyTests: XCTestCase {
         XCTAssertEqual(callStateTitle("ending"), "正在结束")
         XCTAssertEqual(callStateTitle("ended"), "已结束")
         XCTAssertEqual(callStateTitle("failed"), "失败")
+        XCTAssertEqual(callStateTitle("failed", failureReason: "number_blocked"), "已拦截")
+        XCTAssertEqual(callStateTitle("failed", failureReason: "remoteHangup"), "失败")
         XCTAssertEqual(callStateTitle(nil), "状态待确认")
         XCTAssertEqual(callStateTitle("unknown"), "状态待确认")
         XCTAssertEqual(callPlatformTitle("ios"), "iPhone 端")

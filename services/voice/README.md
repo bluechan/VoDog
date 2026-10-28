@@ -17,12 +17,12 @@ Run `npm ci`, `npm test`, then configure the following before `node server.mjs`:
 | `XAI_API_KEY` | Required for xAI. |
 | `XAI_AGENT_ID` / `XAI_REALTIME_MODEL` | Supply your own agent ID or public realtime model. Hosted agent personas belong to your provider account; none are included. |
 | `XAI_REALTIME_PORT` | Optional 1–65535 endpoint port override; TLS hostname verification remains enabled. |
-| `XAI_VOICE`, `XAI_GREETING` | Optional model-mode voice and greeting instruction; hosted agents use their own opener. |
+| `XAI_VOICE`, `XAI_GREETING` | Optional model-mode voice and greeting instruction; hosted agents use their own opener. A run claimed with `greetingKind='leave_message'` instructs the model to say only the fixed leave-message sentence (hosted agents still play their own opener). |
 | `XAI_AGENT_IDLE_TIMEOUT_MS` | Agent mode only; 5000–60000, default 15000. |
 | `XAI_TRANSCRIPTION_MODEL`, `XAI_TRANSCRIPTION_LANGUAGE` | Optional transcription settings. |
 | `VOICE_VAD_THRESHOLD`, `VOICE_VAD_PREFIX_MS`, `VOICE_VAD_SILENCE_MS` | Optional endpoint detection controls; validated by the xAI adapter. |
 | `DOUBAO_API_KEY` | Required to announce Doubao. |
-| `DOUBAO_VOICE`, `DOUBAO_GREETING` | Optional voice and literal opening sentence. The default identifies VoDog as an AI assistant. |
+| `DOUBAO_VOICE`, `DOUBAO_GREETING` | Optional voice and literal opening sentence. The default identifies VoDog as an AI assistant. A run claimed with `greetingKind='leave_message'` (a contact's call that rang unanswered first) speaks `LEAVE_MESSAGE_GREETING` from `providers/index.mjs` instead; no extra env key. |
 | `DOUBAO_INSTRUCTIONS_FILE` | Optional absolute or service-relative persona file; default `prompts/doubao-persona.zh.md`, nonempty and at most 20,000 characters. |
 | `DOUBAO_OUTPUT_FORMAT` | `f32le` (default) or `s16le`. |
 | `DOUBAO_MAX_CALL_SECONDS` | 60–3600, default 180. |

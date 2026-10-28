@@ -1555,6 +1555,9 @@
 "服务器暂时不可用" = "Server temporarily unavailable";
 "网关请求失败" = "Gateway request failed";
 "配对失败：%@" = "Pairing failed: %@";
+"该配对码所属网关已绑定模组 %@，与当前模组不符；请在 Web 选对应行，或用『更换模组配对码』" = "The gateway this pairing code belongs to is bound to module %@, which does not match the current module. In the Web app, pick the matching row or use 「更换模组配对码」 (Change module pairing code).";
+"该配对码所属网关已绑定模组 %@，配对需要当前模组标识；请在 Web 选对应行，或用『更换模组配对码』" = "The gateway this pairing code belongs to is bound to module %@; pairing requires the current module’s identifier. In the Web app, pick the matching row or use 「更换模组配对码」 (Change module pairing code).";
+"当前模组已绑定在网关「%@」上，该配对码属于另一网关；请在 Web 选对应行，或用『更换模组配对码』" = "The current module is already bound to gateway “%@”, and this pairing code belongs to a different gateway. In the Web app, pick the matching row or use 「更换模组配对码」 (Change module pairing code).";
 
 /* S54 VoDog macOS client and multi-module gateway */
 "未检测到模组" = "No module detected";
@@ -1744,6 +1747,7 @@
 "服务器按时间轴混合双方原声" = "Both original tracks mixed on the server timeline";
 "派生听取轨，可能含补偿帧" = "Derived listening track; may contain concealed frames";
 "尚未生成录音" = "No recording yet";
+"本次通话没有录音" = "No recording for this call";
 "导出 MP3" = "Export MP3";
 "通话仍在进行或处理中，稍后再删除。" = "The call is still in progress or being processed. Try deleting it later.";
 "这条记录已不存在或尚未生成。" = "This record no longer exists or isn’t ready yet.";
@@ -1764,6 +1768,7 @@
 "iPhone 端" = "iPhone";
 "Android 端" = "Android";
 "Mac 端" = "Mac";
+"手表端" = "Apple Watch";
 "网页端" = "Web";
 "AI 接听" = "Answered by AI";
 "通过手机拨打" = "Dialed on the phone";
@@ -1892,6 +1897,11 @@
 "通话中 · 由 %@ 接听 · 自 %@" = "In call · answered on %@ · since %@";
 "同一设备上的两张卡不能互打" = "Two SIMs on the same device can't call each other";
 "这是你正在拨出的通话" = "This is the call you are placing";
+"打开链接？" = "Open link?";
+"多选" = "Select Multiple";
+"删除会话" = "Delete Conversation";
+"这条短信会被彻底删除，无法恢复。" = "This message will be permanently deleted. This can't be undone.";
+"登录 VoDog 后，短信的删除与多选会与其他端同步" = "Sign in to VoDog to sync message deletion and multi-select with your other devices";
 
 /* S95 Signal UI */
 "SIM 与 eSIM" = "SIM & eSIM";
@@ -1912,14 +1922,12 @@
 "网络" = "Network";
 "网络与代理" = "Network & Proxy";
 "设备" = "Devices";
-"设置版本" = "Settings version";
 "输入号码或姓名" = "Enter a number or name";
 "通信" = "Communication";
 "通信服务" = "Communication services";
 "通话" = "Calls";
 "通过 %@ 接收" = "Received via %@";
 "配对状态" = "Pairing";
-"删除会话" = "Delete Conversation";
 "VoDog 会在%@中更改接收来电设置并回读校验，成功后再重启模块。蜂窝网络将短暂中断。" = "VoDog will change the incoming-call setting on %@ and read it back to verify, then restart the module. Cellular service will be briefly interrupted.";
 "AI 代接" = "AI answers";
 "AI · %lld 秒后" = "AI · after %lld s";
@@ -1927,5 +1935,53 @@
 "AI 代接已开启，立即由 AI 接听" = "AI answering is on: AI picks up immediately";
 "AI 代接已开启，响铃 %lld 秒无人接听后由 AI 接听" = "AI answering is on: AI picks up after %lld seconds of unanswered ringing";
 "AI 代接已开启，响铃无人接听后由 AI 接听" = "AI answering is on: AI picks up when a call goes unanswered";
+"设置版本" = "Settings version";
 "v%lld 已应用" = "v%lld applied";
 "v%lld 待设备应用" = "v%lld pending on device";
+"归属地 %@" = "location %@";
+"时间为估算" = "Times are estimates";
+"重命名网关" = "Rename Gateway";
+"已有同名网关" = "A gateway with this name already exists";
+"需要管理员权限" = "Administrator permission required";
+"通讯录用户启用AI即接" = "Instant AI answer for contacts";
+"关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。" = "When off, calls from contacts ring for 15 seconds first; if unanswered, AI answers with the greeting “Sorry, the owner is busy. This is the VoDog AI assistant. Please leave a message, thank you.”";
+
+/* S139 shared */
+"转录报告" = "Transcripts & Reports";
+"拦截" = "Intercepted";
+"本机录音" = "Local Recordings";
+"这台 Mac" = "This Mac";
+"全部 SIM 卡" = "All SIM Cards";
+"网关设备" = "Gateway Devices";
+"隐私与安全" = "Privacy & Security";
+"通知与声音" = "Notifications & Sounds";
+"设备与连接" = "Device & Connections";
+"记录" = "Records";
+"返回通话" = "Return to Call";
+
+/* S139 W3 */
+"主题与应用语言" = "Theme and app language";
+"语音服务与通讯录来电" = "Voice service and calls from contacts";
+"号码备注与接听方式" = "Number notes and answer mode";
+"账号下的网关与这台 Mac" = "Account gateways and this Mac";
+"已屏蔽号码 · 通行密钥 · 验证码" = "Blocked numbers · Passkeys · Codes";
+"系统通知 · 提示音与铃声" = "Notifications · Alert sounds and ringtone";
+"权限 · 登录时启动 · 菜单栏" = "Permissions · Open at login · Menu bar";
+"账号信息与当前会话" = "Account info and current session";
+"我自己接" = "I answer myself";
+"来电在你的设备上响铃，由你接听。" = "Calls ring on your devices and you answer.";
+"先响铃，无人接听再交给 AI" = "Ring first, then hand to AI if unanswered";
+"等待 %lld 秒无人接听，由 AI 代接。" = "If unanswered after %lld s, AI answers.";
+"AI 立即代接" = "AI answers immediately";
+"来电立即由 AI 接听。" = "Calls are answered by AI right away.";
+"等待时间" = "Wait time";
+"三种方式是同一项设置；保存后由网关设备确认应用才生效。" = "The three modes are one setting; it takes effect once the gateway device confirms it after saving.";
+"已接入 VoDog · %@" = "Connected to VoDog · %@";
+"配对、暂停与模组状态都在 设置 › 网关设备" = "Pairing, pause and module status are in Settings › Gateway Devices";
+"被屏蔽号码的短信会记录在「记录 › 拦截」中。" = "Texts from blocked numbers are logged in Records › Intercepted.";
+"被屏蔽号码的来电会被直接挂断，并记录在「记录 › 拦截」中。" = "Calls from blocked numbers are hung up and logged in Records › Intercepted.";
+
+/* S139 W1 */
+"只显示这台 Mac 的本机通话。登录后可使用全部 VoDog 线路，记录会在各端同步。" = "Showing only this Mac's local calls. Sign in to use every VoDog line and sync records across devices.";
+"打开 设置 › 账号" = "Opens Settings › Account";
+"账号：%@" = "Account: %@";

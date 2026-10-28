@@ -1,151 +1,95 @@
 import Foundation
-import Observation
 
-/// S26. 记录 asks the server for one page at a time instead of a `limit`-capped prefix, so a busy line's older
-/// calls stop falling off the end of the list. Everything the pager decides — which page is reachable, when a
-/// content change starts over at page 1, when the bar is worth showing at all — lives here as pure functions so
-/// Android and Web mirror one rule set rather than re-deriving three.
-///
-/// The page sizes are the server's own allow-list: `GET calls`, `GET reports/calls` and
-/// `GET blocklist/interceptions` accept `pageSize` ∈ {50, 100, 200} and default to 50.
-enum RecordsPagingPolicy {
-    static let pageSizes = [50, 100, 200]
-    static let defaultPageSize = 50
-    static let firstPage = 1
+/// S133. 全部通话 is no longer paged: the newest `chunk` rows first, then the next `chunk` behind a keyset cursor
+/// as the list nears its end. What a head refresh keeps, where the next chunk starts and when the list is
+/// known to be complete are pure functions here so the poll can never throw a scrolled user back to 50 rows.
+enum CallsScrollPolicy {
+    /// One request's `limit`, and therefore also the row count below which an answer is the end of the list.
+    static let chunk = 50
+    /// A row this close to the end appearing asks for the next chunk.
+    static let prefetchDistance = 10
 
-    /// A page number the list can actually ask for. `totalPages` is nil until the first paged answer arrives —
-    /// the page is then only floored, never capped, so the first request still goes out as asked.
-    static func clampPage(_ page: Int, totalPages: Int?) -> Int {
-        let floored = max(firstPage, page)
-        guard let totalPages else { return floored }
-        return min(floored, max(firstPage, totalPages))
-    }
-
-    static func nextPage(_ page: Int, totalPages: Int?) -> Int {
-        clampPage(page + 1, totalPages: totalPages)
-    }
-
-    static func previousPage(_ page: Int) -> Int {
-        clampPage(page - 1, totalPages: nil)
-    }
-
-    static func canGoPrevious(page: Int) -> Bool { page > firstPage }
-
-    static func canGoNext(page: Int, totalPages: Int?) -> Bool {
-        guard let totalPages else { return false }
-        return page < totalPages
-    }
-
-    /// Whether a change of *what* is being listed — the search text, the report window, the SIM filter — makes
-    /// the current page number meaningless. It always does: page 7 of the old result set is not page 7 of the
-    /// new one, so any content change starts over at page 1 while a page or page-size change does not.
-    static func resetsPage(oldKey: String, newKey: String) -> Bool { oldKey != newKey }
-
-    /// A page size the server accepts; anything else falls back to the default rather than being rejected.
-    static func normalizedPageSize(_ pageSize: Int) -> Int {
-        pageSizes.contains(pageSize) ? pageSize : defaultPageSize
-    }
-
-    /// The bar is hidden on a Control that does not page (`supported == false`) and on a single short page at
-    /// the default size, where it would only state that there is nothing to page through.
-    ///
-    /// The page size is deliberately part of the test rather than just the row count: with 160 rows at 每页 200
-    /// 条 there is one page, but hiding the bar would stand the user in a size they chose with no control left
-    /// to change it back. A size other than the default therefore keeps the bar on screen.
-    static func showsPager(supported: Bool, totalPages: Int?, total: Int?, pageSize: Int) -> Bool {
-        guard supported, let totalPages else { return false }
-        if totalPages > 1 { return true }
-        if pageSize != defaultPageSize { return true }
-        return (total ?? 0) > defaultPageSize
-    }
-
-    static func pageLabel(page: Int, totalPages: Int?) -> String {
-        "第 \(page) / \(totalPages ?? page) 页"
-    }
-
-    static func totalLabel(total: Int?) -> String { "共 \(total ?? 0) 条" }
-
-    static func pageSizeLabel(_ pageSize: Int) -> String { "每页 \(pageSize) 条" }
-
-    static let pageSizeAccessibilitySuffix = "，点击更改"
-    static let previousLabel = "上一页"
-    static let nextLabel = "下一页"
-    static let jumpLabel = "跳转到指定页"
-    static let jumpFieldPrompt = "页码"
-    static let jumpConfirm = "跳转"
-    static let jumpCancel = "取消"
-
-    static func pageSizeAccessibilityLabel(_ pageSize: Int) -> String {
-        pageSizeLabel(pageSize) + pageSizeAccessibilitySuffix
-    }
-}
-
-/// The paging state of one 记录 segment.
-///
-/// It is a reference type on purpose: 拦截记录 is re-instantiated on every segment switch (its `@State` is
-/// lost), so the store is owned by `RecordsView` and handed down — leaving the segment and coming back keeps
-/// the page instead of silently snapping to the first one. 全部通话 and 报告 use the same type so `PagerBar`
-/// has exactly one signature.
-#if !os(watchOS) // S104: needs InterceptionKindFilter (iOS only).
-@MainActor @Observable
-final class RecordsPagingStore {
-    var page: Int
-    var pageSize: Int
-    var total: Int?
-    var totalPages: Int?
-    /// 拦截记录's 类型 filter. It lives here for the same reason the page does — the segment loses its own state.
-    var kind: InterceptionKindFilter
-
-    init(
-        page: Int = RecordsPagingPolicy.firstPage,
-        pageSize: Int = RecordsPagingPolicy.defaultPageSize,
-        total: Int? = nil,
-        totalPages: Int? = nil,
-        kind: InterceptionKindFilter = .all
-    ) {
-        self.page = page
-        self.pageSize = pageSize
-        self.total = total
-        self.totalPages = totalPages
-        self.kind = kind
-    }
-
-    /// Nil `totalPages` — an older Control, or a failed request — means "not paged", which hides the bar.
-    var supported: Bool { totalPages != nil }
-
-    /// What the 每页 menu writes to. Page 7 at 50 a page is not page 7 at 200, so the size and the page move in
-    /// one state change: the list then asks for page 1 at the new size once instead of fetching the old page at
-    /// the new size first and correcting itself.
-    var pageSizeSelection: Int {
-        get { pageSize }
-        set {
-            guard newValue != pageSize else { return }
-            pageSize = RecordsPagingPolicy.normalizedPageSize(newValue)
-            page = RecordsPagingPolicy.firstPage
+    /// A fresh head merged over what is already loaded: the head, then the loaded rows that are not in it and
+    /// not newer than its last row. A loaded row that is newer than that and still absent from the head was
+    /// deleted elsewhere. A short head is the whole list, and so is a full one with no row in common with
+    /// `loaded`. `loaded` must be in list order (newest first) — pass `[]` when it belongs to another search
+    /// or account.
+    static func afterHead(
+        _ head: [CallRecord], loaded: [CallRecord], reachedEnd: Bool
+    ) -> (calls: [CallRecord], reachedEnd: Bool) {
+        guard head.count >= chunk, let floor = head.last?.startedAt.flatMap(GatewayTimeDisplay.parseISO) else {
+            return (head, head.count < chunk)
         }
+        // A full head that shares no row with what is loaded leaves a gap of unknown size between the two
+        // (50+ calls arrived while backgrounded): the head replaces the list and scrolling refills it.
+        let loadedIDs = Set(loaded.map(\.id))
+        guard head.contains(where: { loadedIDs.contains($0.id) }) else { return (head, false) }
+        let ids = Set(head.map(\.id))
+        // Dates rather than strings: "…:00Z" and "…:00.000Z" are the same instant. `loaded` is newest first, so
+        // only its leading rows are parsed; one there whose time cannot be read counts as newer and goes too.
+        let tail = loaded.drop { row in
+            guard let startedAt = row.startedAt.flatMap(GatewayTimeDisplay.parseISO) else { return true }
+            return startedAt > floor
+        }.filter { !ids.contains($0.id) }
+        let calls = head + tail
+        // The end stays known only while the list still ends on the row it was learnt at.
+        return (calls, reachedEnd && calls.last?.id == loaded.last?.id)
     }
 
-    var showsPager: Bool {
-        RecordsPagingPolicy.showsPager(
-            supported: supported, totalPages: totalPages, total: total, pageSize: pageSize
-        )
+    /// The next chunk appended, de-duplicated by id. Fewer than `chunk` rows means there is nothing older.
+    static func afterChunk(_ rows: [CallRecord], loaded: [CallRecord]) -> (calls: [CallRecord], reachedEnd: Bool) {
+        let ids = Set(loaded.map(\.id))
+        return (loaded + rows.filter { !ids.contains($0.id) }, rows.count < chunk)
     }
 
-    /// What the server said it actually returned. The page is re-clamped because asking for page 9 of a result
-    /// that shrank to 3 pages must land on 3 rather than leave the bar claiming a page that does not exist.
-    func apply(page: Int?, total: Int?, totalPages: Int?, requestedPage: Int) {
-        self.total = total
-        self.totalPages = totalPages
-        let resolved = RecordsPagingPolicy.clampPage(page ?? requestedPage, totalPages: totalPages)
-        if self.page != resolved { self.page = resolved }
+    /// `before` is the last row's `startedAt` untouched — the server compares it at the precision it sent.
+    static func cursor(after loaded: [CallRecord]) -> SMSPageCursor? {
+        guard let last = loaded.last, let before = last.startedAt else { return nil }
+        return SMSPageCursor(before: before, beforeId: last.id)
     }
 
-    /// A request that failed or answered `{items}`: no page count, so no bar.
-    func clearPaging() {
-        total = nil
-        totalPages = nil
+    static func isNearEnd(_ id: String, in loaded: [CallRecord]) -> Bool {
+        loaded.suffix(prefetchDistance).contains { $0.id == id }
     }
-
-    func goToFirstPage() { page = RecordsPagingPolicy.firstPage }
 }
-#endif
+
+/// S133. 报告 and 拦截记录 scroll too, but their routes only page by offset (`page`/`pageSize`, no cursor), so
+/// the rules are order-key-free and shared by both lists: the head is page 1, the next chunk is the page
+/// after the rows already loaded, and the envelope's `total` says when to stop.
+enum RecordsScrollPolicy {
+    static let chunk = CallsScrollPolicy.chunk
+
+    /// A fresh head merged over what is already loaded. A short head is the whole list; a full one with no row
+    /// in common with `loaded` leaves a gap of unknown size — both replace. Otherwise the head is followed by
+    /// the loaded rows after the deepest one it also carries: nothing after that row can be in the head, and a
+    /// loaded row before it that the head lacks was deleted elsewhere.
+    static func afterHead<Row: Identifiable>(_ head: [Row], loaded: [Row]) -> [Row] {
+        let ids = Set(head.map(\.id))
+        guard head.count >= chunk, let deepest = loaded.lastIndex(where: { ids.contains($0.id) }) else { return head }
+        return head + loaded[(deepest + 1)...]
+    }
+
+    /// The next chunk appended, de-duplicated by id.
+    static func afterChunk<Row: Identifiable>(_ rows: [Row], loaded: [Row]) -> [Row] {
+        let ids = Set(loaded.map(\.id))
+        return loaded + rows.filter { !ids.contains($0.id) }
+    }
+
+    /// Derived from the rows on screen rather than counted, so a locally deleted row makes the next request
+    /// overlap instead of skip.
+    // ponytail: offset paging — a row deleted on another device inside the loaded range can make one row be
+    // skipped until 下拉刷新; a Control keyset cursor on these two routes is the upgrade path.
+    static func nextPage(loadedCount: Int) -> Int { loadedCount / chunk + 1 }
+
+    /// Nothing older to ask for. `total` is nil when a Control that predates paging answered its one unpaged
+    /// page, which is then the whole list; `answered` is the row count of the response just applied.
+    static func reachedEnd(loadedCount: Int, total: Int?, answered: Int) -> Bool {
+        guard let total, answered > 0 else { return true }
+        return loadedCount >= total
+    }
+
+    /// A row this close to the end appearing asks for the next chunk.
+    static func isNearEnd<Row: Identifiable>(_ id: Row.ID, in loaded: [Row]) -> Bool {
+        loaded.suffix(CallsScrollPolicy.prefetchDistance).contains { $0.id == id }
+    }
+}

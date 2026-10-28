@@ -2,7 +2,7 @@ import XCTest
 @testable import VoDog
 
 /// S30 三端删除. Everything the delete surfaces decide — may this row go, what the confirmation says, what the
-/// list and the pager look like afterwards, which ids the request carries — is a pure function, and this is
+/// lists look like afterwards, which ids the request carries — is a pure function, and this is
 /// where it is pinned.
 final class S30ClientPolicyTests: XCTestCase {
 
@@ -81,50 +81,68 @@ final class S30ClientPolicyTests: XCTestCase {
         XCTAssertEqual(RecordDeletePolicy.reportItemsAfterDelete(items, callID: "c1").map(\.callId), ["c2"])
     }
 
-    func testRecordDeleteDecrementsTheTotalAndRewindsOffAnEmptiedLastPage() {
-        // 51 rows at 50 a page is two pages; deleting the only row on page 2 leaves one page and rewinds.
-        let total = RecordDeletePolicy.totalAfterDelete(51)
-        XCTAssertEqual(total, 50)
-        let pages = RecordDeletePolicy.totalPagesAfterDelete(total: total, totalPages: 2, pageSize: 50)
-        XCTAssertEqual(pages, 1)
-        XCTAssertEqual(RecordDeletePolicy.pageAfterDelete(page: 2, totalPages: pages), 1)
+    /// S133: 全部通话 no longer has a total or a page to rewind — a delete takes the row and nothing else.
+    func testRecordDeleteOnlyRemovesTheRowAndTheNextChunkStartsAfterTheNewLastRow() throws {
+        let calls = try (1...51).map {
+            try decodeCall(#"{"id":"c\#($0)","startedAt":"2026-09-13T00:00:\#(String(format: "%02d", 60 - $0)).000Z"}"#)
+        }
+        // A row in the middle: order and the cursor are untouched.
+        let middle = RecordDeletePolicy.callsAfterDelete(calls, id: "c7")
+        XCTAssertEqual(middle.map(\.id), calls.map(\.id).filter { $0 != "c7" })
+        XCTAssertEqual(CallsScrollPolicy.cursor(after: middle), CallsScrollPolicy.cursor(after: calls))
 
-        // A page that keeps rows stays where it is.
-        let stillFour = RecordDeletePolicy.totalPagesAfterDelete(total: 187, totalPages: 4, pageSize: 50)
-        XCTAssertEqual(stillFour, 4)
-        XCTAssertEqual(RecordDeletePolicy.pageAfterDelete(page: 2, totalPages: stillFour), 2)
+        // The last loaded row: the next chunk is asked for from the row that is now last.
+        let last = RecordDeletePolicy.callsAfterDelete(calls, id: "c51")
+        XCTAssertEqual(
+            CallsScrollPolicy.cursor(after: last),
+            SMSPageCursor(before: "2026-09-13T00:00:10.000Z", beforeId: "c50")
+        )
 
-        // The last row of the whole list: zero rows still has a first page, and the total never goes negative.
-        XCTAssertEqual(RecordDeletePolicy.totalAfterDelete(1), 0)
-        XCTAssertEqual(RecordDeletePolicy.totalAfterDelete(0), 0)
-        XCTAssertEqual(RecordDeletePolicy.totalPagesAfterDelete(total: 0, totalPages: 1, pageSize: 50), 1)
-        XCTAssertEqual(RecordDeletePolicy.pageAfterDelete(page: 1, totalPages: 1), 1)
-
-        // A Control that does not page must stay unpaged: nil is what hides the bar, 0 would show it.
-        XCTAssertNil(RecordDeletePolicy.totalAfterDelete(nil))
-        XCTAssertNil(RecordDeletePolicy.totalPagesAfterDelete(total: nil, totalPages: nil, pageSize: 50))
-        XCTAssertEqual(RecordDeletePolicy.totalPagesAfterDelete(total: nil, totalPages: 3, pageSize: 50), 3)
-
-        // A page size the server would reject falls back to the default before the arithmetic, never to 0.
-        XCTAssertEqual(RecordDeletePolicy.totalPagesAfterDelete(total: 120, totalPages: 3, pageSize: 7), 3)
-        XCTAssertEqual(RecordDeletePolicy.totalPagesAfterDelete(total: 201, totalPages: 2, pageSize: 200), 2)
+        // The only row: an empty list has no cursor, so nothing more is asked for.
+        XCTAssertNil(CallsScrollPolicy.cursor(after: RecordDeletePolicy.callsAfterDelete([calls[0]], id: "c1")))
     }
 
-    @MainActor
-    func testRecordDeleteAppliesToTheRealPagingStore() {
-        let store = RecordsPagingStore(page: 2, pageSize: 50, total: 51, totalPages: 2)
-        let total = RecordDeletePolicy.totalAfterDelete(store.total)
-        let pages = RecordDeletePolicy.totalPagesAfterDelete(
-            total: total, totalPages: store.totalPages, pageSize: store.pageSize
+    /// S133: the poll's head merge must not bring a deleted row back, in the head window or behind it.
+    func testRecordDeleteSurvivesTheNextHeadMerge() throws {
+        let calls = try (1...59).map {
+            try decodeCall(#"{"id":"c\#($0)","startedAt":"2026-09-13T00:00:\#(String(format: "%02d", 60 - $0)).000Z"}"#)
+        }
+        // Deleted behind the head: the server's head is unchanged and the local tail no longer has the row.
+        let tail = CallsScrollPolicy.afterHead(
+            Array(calls.prefix(50)), loaded: RecordDeletePolicy.callsAfterDelete(calls, id: "c55"), reachedEnd: true
         )
-        store.apply(
-            page: RecordDeletePolicy.pageAfterDelete(page: store.page, totalPages: pages),
-            total: total, totalPages: pages, requestedPage: store.page
+        XCTAssertEqual(tail.calls.map(\.id), calls.map(\.id).filter { $0 != "c55" })
+        XCTAssertTrue(tail.reachedEnd, "A delete does not reopen a list that already reached its end")
+
+        // Deleted inside the head: the server's head slides up by one and the merge keeps the rest.
+        let head = CallsScrollPolicy.afterHead(
+            calls.prefix(51).filter { $0.id != "c7" },
+            loaded: RecordDeletePolicy.callsAfterDelete(calls, id: "c7"), reachedEnd: true
         )
-        XCTAssertEqual(store.total, 50)
-        XCTAssertEqual(store.totalPages, 1)
-        XCTAssertEqual(store.page, 1, "The emptied page 2 must rewind rather than stay on a page that is gone")
-        XCTAssertFalse(store.showsPager, "One default-size page has nothing left to page through")
+        XCTAssertEqual(head.calls.map(\.id), calls.map(\.id).filter { $0 != "c7" })
+    }
+
+    /// S133: 报告 scrolls by offset. After a local delete the next request is computed from the cards left, so
+    /// it overlaps the loaded range instead of skipping the card that slid up, and the head merge that follows
+    /// the delete neither restores the card nor throws the appended ones away.
+    func testReportDeleteKeepsTheScrollAndTheNextPageOverlapsInsteadOfSkipping() throws {
+        let body = (1...101).map {
+            #"{"callId":"c\#($0)","startedAt":"2026-09-13T00:00:00Z","sim":{"id":"sim-a"}}"#
+        }.joined(separator: ",")
+        let server = try decodeReportItems("{\"items\":[\(body)]}")
+        let loaded = RecordDeletePolicy.reportItemsAfterDelete(Array(server.prefix(100)), callID: "c7")
+        XCTAssertEqual(loaded.count, 99)
+        XCTAssertEqual(RecordsScrollPolicy.nextPage(loadedCount: loaded.count), 2, "不是第 3 页：第 2 页与已加载的重叠")
+
+        // The reload after the delete: the server's page 1 is now c1…c6, c8…c51.
+        let remaining = server.filter { $0.callId != "c7" }
+        let merged = RecordsScrollPolicy.afterHead(Array(remaining.prefix(50)), loaded: loaded)
+        XCTAssertEqual(merged.map(\.callId), loaded.map(\.callId))
+
+        // Page 2 is now c52…c101: only c101 is new, and nothing was skipped.
+        let next = RecordsScrollPolicy.afterChunk(Array(remaining[50..<100]), loaded: merged)
+        XCTAssertEqual(next.map(\.callId), remaining.map(\.callId))
+        XCTAssertTrue(RecordsScrollPolicy.reachedEnd(loadedCount: next.count, total: 100, answered: 50))
     }
 
     // MARK: - MessageSelectionPolicy

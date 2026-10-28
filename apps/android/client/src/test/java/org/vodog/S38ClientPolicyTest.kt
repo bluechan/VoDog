@@ -43,6 +43,10 @@ class S38ClientPolicyTest {
         assertEquals("忙线 AI 代接", s38CallBadgeLabel(call(conflictDisposition = "ai_answered")))
     }
 
+    @Test fun screenedAiAnswerIsItsOwnBadge() {
+        assertEquals("拦截转 AI 接听", s38CallBadgeLabel(call(conflictDisposition = "screened_ai")))
+    }
+
     @Test fun anOrdinaryCallGetsNoExtraLine() {
         assertNull(s38CallBadgeLabel(call(originatingPlatform = "android")))
         // JSON null must not leak as the string "null" through optString.
@@ -79,7 +83,7 @@ class S38ClientPolicyTest {
     /** 记录页的 `/calls` 请求必须显式要拦截行，否则服务端默认把它们藏起来。 */
     @Test fun theRecordsCallsRouteAsksForBlockedRows() {
         assertTrue(ClientApiRoutes.callsPage().contains("includeBlocked=true"))
-        assertTrue(ClientApiRoutes.callsPage("189", "sim-1", 2, 100).contains("includeBlocked=true"))
+        assertTrue(ClientApiRoutes.callsPage("189", "sim-1", "2026-09-12T01:02:03.456Z", "call-1").contains("includeBlocked=true"))
     }
 
     // ---- 失败原因 ----------------------------------------------------------------------------

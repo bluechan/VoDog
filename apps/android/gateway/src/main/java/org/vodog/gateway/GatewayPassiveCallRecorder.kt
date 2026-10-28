@@ -12,10 +12,11 @@ import org.vodog.gateway.media.parseCaptureBinding
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * S38 §4 被动录音 — the recording leg of a call the user dialled on the Pixel itself.
+ * S38 §4 被动录音 — the recording leg of a call with no remote media leg: one the user dialled on the
+ * Pixel itself, or (S134) an incoming call the owner answered on the Pixel with no Control ANSWER.
  *
- * Such a call has no remote VoDog party, so [isExactNonTerminalCall] deliberately skips it
- * and no WebRTC media session is ever built: nothing else would record it. This captures VOICE_DOWNLINK
+ * Such a call has no remote VoDog party ([needsRemoteMedia] is false), so no WebRTC media
+ * session is ever built: nothing else would record it. This captures VOICE_DOWNLINK
  * (the far end, the same source [BcpTelephonyAudioEndpoint] already proves on this Pixel) into
  * `remote_original` and, when the HAL grants it, VOICE_UPLINK (the user's own voice) into
  * `caller_original`, straight into the ordinary recording directory so [GatewayRecordingArchiveOwner]
@@ -73,16 +74,13 @@ internal object GatewayPassiveCallRecorder {
         start(context, api, startable)
     }
 
-    /** Every precondition of S38 §4, read fresh: any of them dropping also stops a running capture. */
+    /** Every precondition of S38 §4 / S134, read fresh: any of them dropping also stops a running capture. */
     private fun passiveTarget(context: Context): DeviceCallRecord? {
         if (!GatewayRecordingArchiveApproval.APPROVED) return null
         if (!GatewayRuntimeStore(context).enabled) return null
         if (GatewayActiveAudioSession.current() != null) return null
         if (DeviceProtectedAudioHandoffJournal(context).read().phase != AudioHandoffPhase.ACQUIRED) return null
-        return DeviceCallJournal(context).recordsForSnapshot().singleOrNull {
-            it.deviceOriginated && it.state == DeviceCallState.ACTIVE &&
-                it.serverCallId != null && it.creationTimeMillis != null
-        }
+        return passiveRecordingCall(DeviceCallJournal(context).recordsForSnapshot())
     }
 
     /** One capture-binding request per call per 10 s: a refusing control service is not retried hard. */
@@ -369,4 +367,13 @@ internal class AudioRecordUplinkSource(private val context: Context, private val
         runCatching { record.stop() }
         runCatching { record.release() }
     }
+}
+
+/**
+ * S38 §4 + S134: the single ACTIVE, server-bound call without a remote media leg - a Pixel-dialled call or
+ * an incoming call answered on the Pixel. Client-bridged and AI calls (remoteAnswered) record on the media node.
+ */
+internal fun passiveRecordingCall(records: List<DeviceCallRecord>): DeviceCallRecord? = records.singleOrNull {
+    !needsRemoteMedia(it) && it.state == DeviceCallState.ACTIVE &&
+        it.serverCallId != null && it.creationTimeMillis != null
 }

@@ -26,9 +26,8 @@ struct VoDogMessagesView: View {
     @State private var selectedMessageIDs: Set<String> = []
     @State private var confirmingSelectionDelete = false
     @State private var deletingSelection = false
+    @State private var pendingMessageDelete: VoDogSMSMessage?  // S88 bubble 删除
     @State private var searchText = ""
-
-    private struct SMSList: Decodable { var items: [VoDogSMSMessage] }
 
     /// 通话记录「发短信」留下的号码；短信页读完第一页后打开它的对话，没有就新建。
     @MainActor static var pendingRecipient: String?
@@ -68,7 +67,7 @@ struct VoDogMessagesView: View {
                 .communicationDetailColumnStyle()
         }
         .task {
-            // ponytail: 5 s poll of the latest 100 while the page is on screen; no push on macOS.
+            // ponytail: 5 s poll of the full list (S89 paging) while the page is on screen; no push on macOS.
             while !Task.isCancelled, account.user != nil {
                 await load()
                 openPendingRecipient()
@@ -88,7 +87,7 @@ struct VoDogMessagesView: View {
             HStack(spacing: 8) {
                 Text(L10n.tr("短信")).font(.headline)
                 Spacer(minLength: 6)
-                VoDogSIMMenu(account: account, selection: selection)
+                VoDogLineMenu(account: account)
                 Button {
                     composing = true
                     selectedThread = nil
@@ -130,6 +129,9 @@ struct VoDogMessagesView: View {
                                     HStack(alignment: .firstTextBaseline) {
                                         Text(thread.contactName ?? thread.displayNumber)
                                             .font(.body.weight(unread ? .bold : .semibold)).lineLimit(1)
+                                        if let location = VoDogLocation.short(thread.location) {
+                                            Text(verbatim: location).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                        }
                                         Spacer(minLength: 6)
                                         if let date = CCTime.parseISO(thread.latest?.statusDateString) {
                                             Text(CommunicationUI.listTimestamp(date)).font(.caption).foregroundStyle(.secondary)
@@ -145,7 +147,8 @@ struct VoDogMessagesView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel((unread ? L10n.tr("未读") + "，" : "")
-                            + (thread.contactName.map { "\($0)，\(thread.displayNumber)" } ?? thread.displayNumber))
+                            + (thread.contactName.map { "\($0)，\(thread.displayNumber)" } ?? thread.displayNumber)
+                            + VoDogLocation.accessibilitySuffix(thread.location))
                         .accessibilityAddTraits(selected ? .isSelected : [])
                     }
                     .contextMenu {
@@ -225,6 +228,7 @@ struct VoDogMessagesView: View {
                             selectedMessageIDs = []
                         }
                     } else {
+                        // S88: same actions and dialogs as the thread row's right-click menu.
                         if VoDogContactsLogic.canBlock(thread.blockNumber) {
                             Button { pendingThreadBlockDelete = thread } label: {
                                 Image(systemName: "nosign").frame(width: 28, height: 28)
@@ -261,6 +265,7 @@ struct VoDogMessagesView: View {
                         }
                         .padding(16)
                     }
+                    .smsLinkConfirmHost()
                     .defaultScrollAnchor(.bottom)
                     .onAppear { if let id = thread.latest?.id { proxy.scrollTo(id, anchor: .bottom) } }
                     .onChange(of: thread.latest?.id) { _, id in if let id { proxy.scrollTo(id, anchor: .bottom) } }
@@ -290,9 +295,24 @@ struct VoDogMessagesView: View {
                     Text(L10n.tr("这个发件人不能回复")).font(.caption).foregroundStyle(.secondary).padding(12)
                 }
             }
+            .confirmationDialog(L10n.tr("删除这条短信？"),
+                                isPresented: Binding(get: { pendingMessageDelete != nil },
+                                                     set: { if !$0 { pendingMessageDelete = nil } }),
+                                titleVisibility: .visible, presenting: pendingMessageDelete) { message in
+                Button(L10n.tr("删除"), role: .destructive) {
+                    Task { await deleteSelected(VoDogSMSDeletePolicy.singleDeleteIDs(message.id)) }
+                }
+                Button(L10n.tr("取消"), role: .cancel) {}
+            } message: { _ in
+                Text(L10n.tr("这条短信会被彻底删除，无法恢复。"))
+            }
         } else {
-            ContentUnavailableView(L10n.tr("选择一段对话"), systemImage: "message",
-                                   description: Text(L10n.tr("选择左侧会话，或新建短信。")))
+            ContentUnavailableView {
+                VoDogIllustration("sms-empty", width: 140, fallbackSystemImage: "message")
+                Text(L10n.tr("选择一段对话")).font(.headline)
+            } description: {
+                Text(L10n.tr("选择左侧会话，或新建短信。"))
+            }
         }
     }
 
@@ -341,15 +361,34 @@ struct VoDogMessagesView: View {
             .onTapGesture { selectedMessageIDs = VoDogSMSDeletePolicy.toggle(message.id, in: selectedMessageIDs) }
             .accessibilityAddTraits(chosen ? [.isButton, .isSelected] : .isButton)
         } else {
-            bubble(message)
+            bubble(message).contextMenu {
+                ForEach(VoDogSMSDeletePolicy.bubbleMenu(body: message.body, id: message.id), id: \.self) { item in
+                    switch item {
+                    case .copy:
+                        Button(L10n.tr("复制"), systemImage: "doc.on.doc") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(message.body ?? "", forType: .string)
+                        }
+                        .accessibilityLabel(L10n.tr("复制"))
+                    case .select:
+                        Button(L10n.tr("多选"), systemImage: "checkmark.circle") {
+                            selecting = true
+                            selectedMessageIDs = [message.id]
+                        }
+                        .accessibilityLabel(L10n.tr("多选"))
+                    case .delete:
+                        Button(L10n.tr("删除"), systemImage: "trash", role: .destructive) { pendingMessageDelete = message }
+                            .accessibilityLabel(L10n.tr("删除"))
+                    }
+                }
+            }
         }
     }
 
     private func bubble(_ message: VoDogSMSMessage) -> some View {
         let outgoing = message.direction == "outgoing"
         return VStack(alignment: outgoing ? .trailing : .leading, spacing: 3) {
-            Text(message.body ?? "")
-                .textSelection(.enabled)
+            SMSBodyText(text: message.body ?? "", color: outgoing ? Color.white : Signal.ink, linked: !selecting)
                 .signalBubble(outgoing: outgoing)
             if !outgoing, !selecting, let code = SMSVerificationCodeExtractor.extract(from: message.body ?? "") {
                 CopyCodeButton(code: code)
@@ -369,10 +408,11 @@ struct VoDogMessagesView: View {
         .frame(maxWidth: .infinity, alignment: outgoing ? .trailing : .leading)
     }
 
-    /// 「号码 · 通过 <SIM> 接收」 (number only when a contact name is the title).
+    /// 「号码 · 归属地 · 通过 <SIM> 接收」 (number only when a contact name is the title).
     private func sourceLine(_ thread: VoDogConversation) -> String {
         let sim = account.sims.first { $0.id == thread.latest?.simId }?.displayName
-        return [thread.contactName != nil ? thread.displayNumber : nil, sim.map { L10n.tr("通过 %@ 接收", $0) }]
+        return [thread.contactName != nil ? thread.displayNumber : nil, VoDogLocation.full(thread.location),
+                sim.map { L10n.tr("通过 %@ 接收", $0) }]
             .compactMap { $0 }.joined(separator: " · ")
     }
 
@@ -391,7 +431,10 @@ struct VoDogMessagesView: View {
 
     private func load() async {
         do {
-            let list = try await account.decode(SMSList.self, "GET", "/sms", query: ["limit": "100"])
+            let list = try await VoDogSMSPaging.fetchAll { query in
+                try await account.decode(VoDogSMSPage.self, "GET", "/sms", query: query)
+            }
+            if list.capped { account.diag("sms.list_capped", level: "warn", fields: ["count": list.items.count]) }
             messages = list.items
             loadError = nil
         } catch is CancellationError {

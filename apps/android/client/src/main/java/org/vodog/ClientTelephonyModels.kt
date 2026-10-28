@@ -292,6 +292,7 @@ internal fun isPixelOriginatedCall(call: JSONObject): Boolean =
  * explain why the call has no audio at all; `null` means the row stays exactly as it was.
  */
 internal fun s38CallBadgeLabel(call: JSONObject): String? = blockedCallSourceLabel(call) ?: when {
+    call.nullableText("conflictDisposition") == "screened_ai" -> "拦截转 AI 接听"
     call.nullableText("failureReason") == "busy_auto_rejected" -> "忙线未接"
     call.nullableText("conflictDisposition") == "ai_answered" -> "忙线 AI 代接"
     isPixelOriginatedCall(call) -> call.gatewayKind().directDialLabel
@@ -629,8 +630,12 @@ data class ClientInterception(
     val remoteLocation: String? = null,
 )
 
+/** 拦截记录一行的唯一键：列表的 key 和滚动加载的去重认的是同一个。 */
+internal fun JSONObject.interceptionId(): String =
+    optString("id").ifBlank { optString("occurredAt") + optString("remoteNumber") }
+
 internal fun JSONObject.toClientInterception(): ClientInterception = ClientInterception(
-    id = optString("id").ifBlank { optString("occurredAt") + optString("remoteNumber") },
+    id = interceptionId(),
     kind = optString("kind").ifBlank { "call" },
     simId = nullableText("simId"),
     remoteNumber = optString("remoteNumber").ifBlank { "号码未知" },

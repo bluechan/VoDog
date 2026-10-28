@@ -4,8 +4,10 @@ import Foundation
 // Components.swift, MessagesView.swift and ContactCardView.swift.
 
 /// S20 decision 8: shared by the dialer, the call list and the records list, which used to print the raw state.
-func callStateTitle(_ state: String?) -> String {
-    switch state {
+/// S143: a blocked incoming call is stored as `failed` + `number_blocked`; it reads 已拦截, never 失败.
+func callStateTitle(_ state: String?, failureReason: String? = nil) -> String {
+    if state == "failed", failureReason == "number_blocked" { return "已拦截" }
+    return switch state {
     case "incoming_ringing": "来电响铃"
     case "outgoing_pending": "等待拨号"
     case "connecting": "连接中"

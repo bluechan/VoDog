@@ -188,7 +188,7 @@ export class VoiceWorker {
       try {
         const run = heartbeatReady ? await this.control.claim(signal) : null;
         if (heartbeatReady) this.controlHealth('claim');
-        if (run) { phase = 'execute'; this.log({ event: 'run_claimed', runId: run.id, callId: run.callId, triggerAt: run.triggerAt, provider: providerOf(run, this.defaultProvider) }); await this.execute(run); this.controlHealth('execute'); lastIdleReport = Date.now(); }
+        if (run) { phase = 'execute'; this.log({ event: 'run_claimed', runId: run.id, callId: run.callId, triggerAt: run.triggerAt, provider: providerOf(run, this.defaultProvider), greetingKind: run.greetingKind ?? null }); await this.execute(run); this.controlHealth('execute'); lastIdleReport = Date.now(); }
         else if (Date.now() - lastIdleReport >= this.idleReportMs) { lastIdleReport = Date.now(); this.logIdle(); }
       } catch (error) { if (!signal.aborted) this.controlHealth(phase, error); }
       // Checked after every run and on every idle pass, so a quiet worker heals too.
@@ -447,14 +447,14 @@ export class VoiceWorker {
       // Control fall back to an ordinary ring (S22 决策 5).
       providerId = providerOf(run, this.defaultProvider);
       if (!providerId) throw providerUnavailable();
-      agent = this.createAgent({ provider: providerId }); agent.on('fault', onProviderFault); agent.on('closed', onProviderClosed); agent.on('notice', onProviderNotice);
+      agent = this.createAgent({ provider: providerId, greetingKind: run.greetingKind }); agent.on('fault', onProviderFault); agent.on('closed', onProviderClosed); agent.on('notice', onProviderNotice);
       agent.on('completed', onAgentCompleted); agent.on('speechStarted', onSpeechStarted); agent.on('transcript', onAgentTranscript); agent.on('response', onAgentResponse);
       // S27 决策 6 (a)/(b): the already-parsed startup configuration is on the proxy synchronously —
       // no thread round trip. A provider that carries no limits of its own keeps the worker's.
       maxCallSecondsForRun = agent.config?.maxCallSeconds ?? this.maxCallSeconds;
       silenceHangupSeconds = agent.config?.silenceHangupSeconds ?? 0;
       // Claim may prewarm 30 seconds before timeout_ai. No answer or media IO yet.
-      const trigger = Date.parse(run.triggerAt); if (!Number.isFinite(trigger)) throw fault('invalid_trigger');
+      let trigger = Date.parse(run.triggerAt); if (!Number.isFinite(trigger)) throw fault('invalid_trigger');
       // S27 决策 14 (2026-09-12 in-image A/B): a provider may refuse to hold an idle session open
       // for the whole prewarm. xAI kills a Space-agent session that receives no uplink audio after
       // ~17 s — its idle turn calls the Space agent's own `end_call` and the server closes the
@@ -477,7 +477,24 @@ export class VoiceWorker {
         // S127: the bridge is built later; until then nothing has been queued.
         playout: () => bridge?.playout?.() ?? { enqueued: 0, played: 0, cleared: 0 } });
       collector.attach(agent); collector.start();
-      await wait(Math.max(0, trigger - Date.now()), signal);
+      // S137: Control may move `trigger_at` earlier after the claim (S42 owner-busy → now+5 s), so the
+      // prewarm wait re-reads the run at most every second and adopts an earlier trigger. A failed
+      // read never ends the run — it keeps the known trigger. A trigger already due reads nothing.
+      let triggerReadFailed = false;
+      while (trigger > Date.now()) {
+        await wait(Math.min(1_000, trigger - Date.now()), signal);
+        if (trigger <= Date.now()) break;
+        try {
+          const state = await this.control.read(run, signal); signal.throwIfAborted();
+          lastState = state;
+          if (terminal.has(state.run?.state) || ['ended', 'failed'].includes(state.callState)) { stop('call_terminal'); signal.throwIfAborted(); }
+          const next = Date.parse(state.run?.triggerAt);
+          if (Number.isFinite(next) && next < trigger) { this.log({ event: 'trigger_advanced', runId: run.id, fromMs: trigger, toMs: next }); trigger = next; }
+        } catch (error) {
+          if (signal.aborted) throw error;
+          if (!triggerReadFailed) { triggerReadFailed = true; this.log({ event: 'trigger_read_failed', runId: run.id, ...errorFields(error) }); }
+        }
+      }
       await this.control.commit(run, signal); signal.throwIfAborted();
       this.log({ event: 'answer_committed', runId: run.id, callId: run.callId });
       activationTimer = setTimeout(() => stop('telecom_active_timeout'), this.activationTimeoutMs);

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -140,7 +141,7 @@ internal fun HistoryDetailPage(
                         sims.firstOrNull { it.id == item.sim.id }?.let { LineBlock(simColor(it, sims)) }
                         Text(item.sim.label, style = MaterialTheme.typography.bodyMedium, color = signal.ink2)
                     }
-                    if (item.answeredByPlatform == "ai" || call.optString("conflictDisposition") == "ai_answered") {
+                    if (item.answeredByPlatform == "ai" || call.optString("conflictDisposition") in setOf("ai_answered", "screened_ai")) {
                         Box(tag.background(signal.aiSoft, MaterialTheme.shapes.extraSmall).padding(horizontal = 10.dp), contentAlignment = Alignment.Center) {
                             Text("AI 代接", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = signal.ai)
                         }
@@ -233,7 +234,7 @@ internal fun HistoryDetailPage(
                     item.remoteLocation?.let { DetailFact("归属地", it) }
                     DetailFact("号码线路", item.sim.label)
                     DetailFact("方向", directionLabel(item.direction))
-                    DetailFact("状态", callStateLabel(call.optString("state")))
+                    DetailFact("状态", callStateLabel(call.optString("state"), call.optString("failureReason")))
                     DetailFact("开始", formatGatewayDateTime(item.startedAt, item.gatewayTimeZone))
                     item.answeredAt?.let { DetailFact("接通", formatGatewayDateTime(it, item.gatewayTimeZone)) }
                     item.endedAt?.let { DetailFact("结束", formatGatewayDateTime(it, item.gatewayTimeZone)) }
@@ -243,6 +244,7 @@ internal fun HistoryDetailPage(
                     if (item.answeredByPlatform == "device") DetailFact("接听方", "网关本机")
                     if (isPixelOriginatedCall(call)) DetailFact("拨打方式", call.gatewayKind().directDialLabel)
                     if (call.optString("conflictDisposition") == "ai_answered") DetailFact("接听方式", "忙线 AI 代接")
+                    if (call.optString("conflictDisposition") == "screened_ai") DetailFact("接听方式", "拦截转 AI 接听")
                     blockedCallSourceLabel(call)?.let { DetailFact("拦截来源", it) }
                     failureReasonLabel(call.optString("failureReason"))?.let {
                         DetailFact("失败原因", it)
@@ -392,7 +394,7 @@ private fun DetailFact(label: String, value: String) {
  * inbox. Tapping a row opens the same contact card, where 解除屏蔽 lives.
  */
 @Composable
-internal fun InterceptionList(state: ClientUiState, model: ClientViewModel) {
+internal fun InterceptionList(state: ClientUiState, model: ClientViewModel, listState: LazyListState) {
     val page = (state.interceptionsPage as? RemoteResource.Loaded)?.value
     val items = page?.items.orEmpty().mapNotNull { runCatching { it.toClientInterception() }.getOrNull() }
     val sims = (state.sims as? RemoteList.Loaded)?.items.orEmpty().mapNotNull {
@@ -401,9 +403,11 @@ internal fun InterceptionList(state: ClientUiState, model: ClientViewModel) {
     LaunchedEffect(state.session?.username, state.networkAvailable) {
         if (state.session != null && state.networkAvailable) model.refreshInterceptions()
     }
+    LoadMoreOnNearEnd(listState, page?.items?.size ?: 0, model::loadMoreInterceptions)
     Column(Modifier.fillMaxSize()) {
         LazyColumn(
             Modifier.fillMaxWidth().weight(1f),
+            state = listState,
             contentPadding = PaddingValues(ScreenPadding),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
@@ -424,22 +428,16 @@ internal fun InterceptionList(state: ClientUiState, model: ClientViewModel) {
                 }
                 is RemoteResource.Loaded -> if (items.isEmpty()) item {
                     EmptyStateCard(Icons.Filled.Block, "暂无拦截记录", "屏蔽号码后，被拒接的来电和被拦下的短信会出现在这里。")
-                } else items(items, key = ClientInterception::id) { interception ->
-                    InterceptionRow(interception, sims[interception.simId]) {
-                        model.openContactCard(interceptionContactCardTarget(interception))
+                } else {
+                    items(items, key = ClientInterception::id) { interception ->
+                        InterceptionRow(interception, sims[interception.simId]) {
+                            model.openContactCard(interceptionContactCardTarget(interception))
+                        }
                     }
+                    // 一直在的一项，见 [LoadMoreOnNearEnd]。
+                    item(key = "loading-more") { if (state.interceptionsLoadingMore) LoadingRow("正在加载更多…") }
                 }
             }
-        }
-        page?.takeIf(RecordsPagingPolicy::pagerVisible)?.let {
-            PagerBar(
-                page = it.page,
-                pageSize = it.pageSize,
-                total = it.total,
-                totalPages = it.totalPages,
-                onPage = model::setInterceptionsPage,
-                onPageSize = model::setInterceptionsPageSize,
-            )
         }
     }
 }

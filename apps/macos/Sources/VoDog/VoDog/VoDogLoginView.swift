@@ -28,9 +28,7 @@ struct VoDogLoginView: View {
         ScrollView {
             VStack(spacing: 22) {
                 VStack(spacing: 8) {
-                    Image(systemName: "person.crop.circle.badge.checkmark")
-                        .font(.system(size: 44, weight: .light))
-                        .foregroundStyle(Color.accentColor)
+                    VoDogIllustration("hero-login", width: 260, fallbackSystemImage: "person.crop.circle.badge.checkmark")
                     Text(L10n.tr("登录 VoDog"))
                         .font(.largeTitle.bold())
                     Text(L10n.tr("登录后可在这台 Mac 上管理通讯录、屏蔽名单、通话记录与接听设置。"))

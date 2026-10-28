@@ -1,63 +1,64 @@
 import SwiftUI
 
-// VoDog 屏蔽与拦截 (spec S54, owner C2): blocked numbers on the left, the interception
-// feed (`GET /blocklist/interceptions`) on the right. Unblock always confirms; 404 on DELETE means
-// it was already removed elsewhere; emergency numbers (112/911) are never offered for blocking.
+// VoDog blocklist (spec S54, owner C2; S139 split): 已屏蔽号码 lives in 设置 › 隐私与安全, the
+// interception feed (`GET /blocklist/interceptions`) in 记录 › 拦截. Unblock always confirms; 404 on DELETE
+// means it was already removed elsewhere; emergency numbers (112/911) are never offered for blocking.
+// Neither view gates on login; the host does.
 
-struct VoDogBlocklistView: View {
-    @ObservedObject var account: VoDogAccount
+struct VoDogPendingUnblock: Identifiable {
+    let id: String          // blocklist entry id
+    let number: String
+    let scope: String
+}
 
-    @State private var sidebarWidth: CGFloat = 300
-    @State private var scope = "call"      // S66: 来电 / 短信 lists
-    @State private var numbers: [VoDogBlockedNumber] = []
-    @State private var numberSearch = ""
-    @State private var numbersError: String?
-    @State private var numbersLoaded = false
-
-    @State private var kind = "all"
-    @State private var page = 1
-    @State private var totalPages: Int?
-    @State private var interceptions: [VoDogInterception] = []
-    @State private var feedError: String?
-    @State private var feedLoaded = false
-    @State private var feedGeneration = 0
-
-    @State private var busy = false
-    @State private var pendingUnblock: PendingUnblock?
-    @State private var adding = false
-    @State private var newNumber = ""
-    @State private var addError: String?
-
-    struct PendingUnblock: Identifiable {
-        let id: String          // blocklist entry id
-        let number: String
-        let scope: String
-    }
-
-    var body: some View {
-        ResizableCommunicationSplit(sidebarWidth: $sidebarWidth) {
-            blockedPane.communicationSidebarColumnStyle()
-        } detail: {
-            feedPane.communicationDetailColumnStyle()
+enum VoDogUnblock {
+    /// DELETE /blocklist/:id; nil on success (404 = already removed), else the error text.
+    @MainActor
+    static func run(account: VoDogAccount, entryID: String) async -> String? {
+        do {
+            _ = try await account.json("DELETE", "/blocklist/\(entryID)")
+            return nil
+        } catch where VoDogContactsUI.status(error) == 404 {
+            return nil
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return VoDogContactsUI.errorText(error)
         }
-        .task(id: scope) { await loadNumbers() }
-        .task(id: "\(kind):\(page)") { await loadFeed() }
-        .confirmationDialog(
+    }
+}
+
+private extension View {
+    func unblockConfirmation(_ pending: Binding<VoDogPendingUnblock?>,
+                             perform: @escaping (String) async -> Void) -> some View {
+        confirmationDialog(
             L10n.tr("解除屏蔽这个号码？"),
-            isPresented: Binding(get: { pendingUnblock != nil }, set: { if !$0 { pendingUnblock = nil } }),
+            isPresented: Binding(get: { pending.wrappedValue != nil }, set: { if !$0 { pending.wrappedValue = nil } }),
             titleVisibility: .visible,
-            presenting: pendingUnblock
+            presenting: pending.wrappedValue
         ) { item in
-            Button(L10n.tr("解除屏蔽")) { Task { await unblock(item.id) } }
+            Button(L10n.tr("解除屏蔽")) { Task { await perform(item.id) } }
             Button(L10n.tr("取消"), role: .cancel) {}
         } message: { item in
             Text(item.scope == "sms" ? L10n.tr("解除后，%@ 的短信会恢复正常接收。", item.number)
                  : L10n.tr("解除后，%@ 的来电会恢复正常接收。", item.number))
         }
-        .sheet(isPresented: $adding) { addSheet }
     }
+}
 
-    // MARK: Blocked numbers
+struct VoDogBlockedNumbersView: View {
+    @ObservedObject var account: VoDogAccount
+
+    @State private var scope = "call"      // S66: 来电 / 短信 lists
+    @State private var numbers: [VoDogBlockedNumber] = []
+    @State private var numberSearch = ""
+    @State private var numbersError: String?
+    @State private var numbersLoaded = false
+    @State private var busy = false
+    @State private var pendingUnblock: VoDogPendingUnblock?
+    @State private var adding = false
+    @State private var newNumber = ""
+    @State private var addError: String?
 
     private var filteredNumbers: [VoDogBlockedNumber] {
         let query = numberSearch.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -70,7 +71,7 @@ struct VoDogBlocklistView: View {
         }
     }
 
-    private var blockedPane: some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text(L10n.tr("已屏蔽号码")).font(.headline)
@@ -115,7 +116,7 @@ struct VoDogBlocklistView: View {
                         }
                         Spacer(minLength: 0)
                         Button(L10n.tr("解除屏蔽")) {
-                            pendingUnblock = PendingUnblock(id: item.id, number: item.remoteNumber, scope: item.scope ?? scope)
+                            pendingUnblock = VoDogPendingUnblock(id: item.id, number: item.remoteNumber, scope: item.scope ?? scope)
                         }
                         .buttonStyle(.borderless)
                     }
@@ -129,14 +130,18 @@ struct VoDogBlocklistView: View {
             .overlay {
                 if numbersLoaded && filteredNumbers.isEmpty && numbersError == nil {
                     PhoneEmptyState(title: numbers.isEmpty ? "没有屏蔽的号码" : "没有匹配的号码",
-                                    detail: scope == "sms" ? "被屏蔽号码的短信会记录在右侧拦截记录中。"
-                                        : "被屏蔽号码的来电会被直接挂断，并记录在右侧拦截记录中。",
-                                    systemImage: "hand.raised")
+                                    detail: scope == "sms" ? "被屏蔽号码的短信会记录在「记录 › 拦截」中。"
+                                        : "被屏蔽号码的来电会被直接挂断，并记录在「记录 › 拦截」中。",
+                                    systemImage: "hand.raised",
+                                    illustration: numbers.isEmpty ? "blocked-empty" : "search-empty")
                 } else if !numbersLoaded {
                     ProgressView()
                 }
             }
         }
+        .task(id: scope) { await loadNumbers() }
+        .unblockConfirmation($pendingUnblock) { await unblock($0) }
+        .sheet(isPresented: $adding) { addSheet }
     }
 
     private var addSheet: some View {
@@ -163,15 +168,83 @@ struct VoDogBlocklistView: View {
         .frame(width: 340)
     }
 
-    // MARK: Interceptions
+    private func localTime(_ iso: String) -> String {
+        guard let date = VoDogContactsLogic.parseISO(iso) else { return "" }
+        return CommunicationUI.listTimestamp(date)
+    }
 
-    private var feedPane: some View {
+    // MARK: Actions
+
+    private func loadNumbers() async {
+        do {
+            let requested = scope
+            let object = try await account.json("GET", "/blocklist", query: ["scope": requested])
+            guard requested == scope else { return }
+            numbers = try VoDogContactsLogic.decode(VoDogPage<VoDogBlockedNumber>.self, from: object).items
+            numbersError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            numbersError = VoDogContactsUI.errorText(error)
+        }
+        numbersLoaded = true
+    }
+
+    private func unblock(_ entryID: String) async {
+        busy = true
+        defer { busy = false }
+        if let error = await VoDogUnblock.run(account: account, entryID: entryID) {
+            numbersError = error
+            return
+        }
+        numbersError = nil
+        numbers.removeAll { $0.id == entryID }
+        await loadNumbers()
+    }
+
+    private func addNumber() async {
+        let number = newNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard VoDogContactsLogic.canBlock(number) else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            _ = try await account.json("POST", "/blocklist", body: ["remoteNumber": String(number.prefix(64)), "scope": scope])
+            adding = false
+            await loadNumbers()
+        } catch where VoDogContactsUI.status(error) == 400 {
+            addError = VoDogErrorText.shown(L10n.tr("这个号码不能屏蔽。"), error: error)
+        } catch is CancellationError {
+            return
+        } catch {
+            addError = VoDogContactsUI.errorText(error)
+        }
+    }
+}
+
+struct VoDogInterceptionsView: View {
+    @ObservedObject var account: VoDogAccount
+    /// S139: 记录 › 拦截 already names the page, so the host hides this title (刷新 stays).
+    var showsTitle = true
+
+    @State private var kind = "all"
+    @State private var page = 1
+    @State private var totalPages: Int?
+    @State private var interceptions: [VoDogInterception] = []
+    @State private var feedError: String?
+    @State private var feedLoaded = false
+    @State private var feedGeneration = 0
+    @State private var pendingUnblock: VoDogPendingUnblock?
+    @State private var busy = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(L10n.tr("拦截记录")).font(.title2.weight(.semibold))
+                if showsTitle {
+                    Text(L10n.tr("拦截记录")).font(.title2.weight(.semibold))
+                }
                 Spacer()
                 Button {
-                    Task { await loadFeed(); await loadNumbers() }
+                    Task { await loadFeed() }
                 } label: {
                     Label(L10n.tr("刷新"), systemImage: "arrow.clockwise")
                 }
@@ -186,7 +259,7 @@ struct VoDogBlocklistView: View {
             }
             if feedLoaded && interceptions.isEmpty && feedError == nil {
                 PhoneEmptyState(title: "没有拦截记录", detail: "被屏蔽号码的来电和短信会显示在这里。",
-                                systemImage: "shield.lefthalf.filled")
+                                systemImage: "shield.lefthalf.filled", illustration: "blocked-empty")
             } else if !feedLoaded {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -210,6 +283,18 @@ struct VoDogBlocklistView: View {
             }
         }
         .padding(20)
+        .task(id: "\(kind):\(page)") { await loadFeed() }
+        .unblockConfirmation($pendingUnblock) { await unblock($0) }
+    }
+
+    private func unblock(_ entryID: String) async {
+        busy = true
+        defer { busy = false }
+        if let error = await VoDogUnblock.run(account: account, entryID: entryID) {
+            feedError = error
+            return
+        }
+        await loadFeed()
     }
 
     private func interceptionRow(_ item: VoDogInterception) -> some View {
@@ -217,6 +302,7 @@ struct VoDogBlocklistView: View {
         let title = item.contactName.map { "\($0) · \(number)" } ?? number
         let context = [
             L10n.tr(item.isSMS ? "短信" : "来电"),
+            VoDogLocation.short(item.remoteLocation),
             VoDogContactsLogic.sourceTitleKey(item.source).map { L10n.tr($0) },
             item.simLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
             VoDogContactsLogic.gatewayTime(item.occurredAt, timeZone: item.gatewayTimeZone)
@@ -235,7 +321,7 @@ struct VoDogBlocklistView: View {
             Spacer(minLength: 0)
             if let entryID = item.blockedEntryId {
                 Button(L10n.tr("解除屏蔽")) {
-                    pendingUnblock = PendingUnblock(id: entryID, number: number, scope: item.isSMS ? "sms" : "call")
+                    pendingUnblock = VoDogPendingUnblock(id: entryID, number: number, scope: item.isSMS ? "sms" : "call")
                 }
                 .buttonStyle(.borderless)
                 .disabled(busy)
@@ -243,28 +329,6 @@ struct VoDogBlocklistView: View {
         }
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
-    }
-
-    private func localTime(_ iso: String) -> String {
-        guard let date = VoDogContactsLogic.parseISO(iso) else { return "" }
-        return CommunicationUI.listTimestamp(date)
-    }
-
-    // MARK: Actions
-
-    private func loadNumbers() async {
-        do {
-            let requested = scope
-            let object = try await account.json("GET", "/blocklist", query: ["scope": requested])
-            guard requested == scope else { return }
-            numbers = try VoDogContactsLogic.decode(VoDogPage<VoDogBlockedNumber>.self, from: object).items
-            numbersError = nil
-        } catch is CancellationError {
-            return
-        } catch {
-            numbersError = VoDogContactsUI.errorText(error)
-        }
-        numbersLoaded = true
     }
 
     private func loadFeed() async {
@@ -288,43 +352,5 @@ struct VoDogBlocklistView: View {
             feedError = VoDogContactsUI.errorText(error)
         }
         feedLoaded = true
-    }
-
-    private func unblock(_ entryID: String) async {
-        busy = true
-        defer { busy = false }
-        do {
-            _ = try await account.json("DELETE", "/blocklist/\(entryID)")
-            numbersError = nil
-        } catch where VoDogContactsUI.status(error) == 404 {
-            numbersError = nil      // already removed elsewhere
-        } catch is CancellationError {
-            return
-        } catch {
-            numbersError = VoDogContactsUI.errorText(error)
-            return
-        }
-        numbers.removeAll { $0.id == entryID }
-        await loadNumbers()
-        await loadFeed()
-    }
-
-    private func addNumber() async {
-        let number = newNumber.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard VoDogContactsLogic.canBlock(number) else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            _ = try await account.json("POST", "/blocklist", body: ["remoteNumber": String(number.prefix(64)), "scope": scope])
-            adding = false
-            await loadNumbers()
-            await loadFeed()
-        } catch where VoDogContactsUI.status(error) == 400 {
-            addError = VoDogErrorText.shown(L10n.tr("这个号码不能屏蔽。"), error: error)
-        } catch is CancellationError {
-            return
-        } catch {
-            addError = VoDogContactsUI.errorText(error)
-        }
     }
 }

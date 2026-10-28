@@ -3,6 +3,7 @@ package org.vodog
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,6 +51,12 @@ class S24ClientPolicyTest {
         assertEquals(VoiceProviderAvailability.NOT_CONFIGURED, voiceProviderAvailability(list.items.single()))
     }
 
+    @Test fun contactInstantAiDecodesTrueFalseAndAbsent() {
+        assertEquals(true, JSONObject("""{"contactInstantAi":true}""").toClientVoiceProviderList().contactInstantAi)
+        assertEquals(false, JSONObject("""{"contactInstantAi":false}""").toClientVoiceProviderList().contactInstantAi)
+        assertNull(contract.toClientVoiceProviderList().contactInstantAi)
+    }
+
     @Test fun anEmptyResponseDecodesToAnEmptyList() {
         val list = JSONObject("{}").toClientVoiceProviderList()
         assertTrue(list.items.isEmpty())
@@ -64,6 +71,7 @@ class S24ClientPolicyTest {
     @Test fun theSwitchRoutesAreTheContractPaths() {
         assertEquals("/ai/voice-providers", ClientApiRoutes.AI_VOICE_PROVIDERS)
         assertEquals("/ai/voice-provider", ClientApiRoutes.AI_VOICE_PROVIDER)
+        assertEquals("/ai/contact-instant-ai", ClientApiRoutes.AI_CONTACT_INSTANT_AI)
     }
 
     // ---- 状态映射 -----------------------------------------------------------------------------

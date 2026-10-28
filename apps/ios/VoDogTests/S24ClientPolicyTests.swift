@@ -40,6 +40,18 @@ final class S24ClientPolicyTests: XCTestCase {
         XCTAssertEqual(try decodeList("{}").configVersion, 1)
     }
 
+    // S137: `contactInstantAi` is optional so an older Control (field absent) hides the toggle.
+    func testDecodesContactInstantAi() throws {
+        XCTAssertEqual(try decodeList(#"{"items":[],"contactInstantAi":true}"#).contactInstantAi, true)
+        XCTAssertEqual(try decodeList(#"{"items":[],"contactInstantAi":false}"#).contactInstantAi, false)
+        XCTAssertNil(try decodeList(#"{"items":[]}"#).contactInstantAi)
+    }
+
+    func testContactInstantAiBodyEncodesEnabled() throws {
+        let encoded = try JSONEncoder().encode(ContactInstantAiBody(enabled: true))
+        XCTAssertEqual(String(decoding: encoded, as: UTF8.self), #"{"enabled":true}"#)
+    }
+
     func testTheSwitchBodyCarriesTheObservedConfigurationVersion() throws {
         let encoded = try JSONEncoder().encode(VoiceProviderBody(provider: "xai", expectedVersion: 7))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])

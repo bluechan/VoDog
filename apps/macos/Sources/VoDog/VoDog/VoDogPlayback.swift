@@ -3,7 +3,10 @@ import AVFoundation
 import Foundation
 import UniformTypeIdentifiers
 
-/// 单一播放器：先用 `account.data` 把整轨下载到临时文件再交给 AVPlayer。
+/// 单一播放器：先用 `account.data` 把整轨下载到本地缓存（`VoDogAccount.recordingCacheDirectory`）再交给 AVPlayer；
+/// 缓存命中直接播放，不再下载。
+/// shortcut: 缓存只按 callId/source/track 命名（Mac 清单没有 sha256），服务器重建同一轨（如归档修复）后仍播旧文件，
+/// 直到本机删除该通话或被淘汰；清单带上 sha256 时再像 iOS RecordingPlaybackCache 那样校验。
 /// ponytail: 整轨下载而非流式；15 分钟令牌 + AVPlayer 的 Range 续传才是不可靠的那条路。
 /// 录音很大、首播太慢时再改为 AVURLAsset + `AVURLAssetHTTPHeaderFieldsKey`（authorizedRequest 已备好）。
 @MainActor
@@ -20,7 +23,6 @@ final class VoDogRecordingPlayer: ObservableObject {
     private var player: AVPlayer?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
-    private var fileURL: URL?
     private var loadTask: Task<Void, Never>?
 
     func isCurrent(_ key: Key) -> Bool { current == key }
@@ -42,24 +44,25 @@ final class VoDogRecordingPlayer: ObservableObject {
         loadTask = Task { [weak self] in
             var bytes = 0
             var result = "ok"
+            var cached = false
             defer {
                 account.diag("records.play", callId: key.callId, fields: [
                     "track": key.track, "source": key.source, "result": result,
-                    "ms": Int(Date().timeIntervalSince(started) * 1_000), "bytes": bytes,
+                    "ms": Int(Date().timeIntervalSince(started) * 1_000), "bytes": bytes, "cached": cached,
                 ])
             }
             do {
-                // 整段加载（下载 + 可播检查 + mp3 回退）受 30 s 看门狗约束：蜂窝网络卡住时给出错误而不是无限转圈。
+                // 整段加载（下载 + 可播检查 + mp3 回退）受看门狗约束（混音 90 s、单轨 30 s）：蜂窝网络卡住时给出错误而不是无限转圈。
                 let fetch: @Sendable (Bool) async throws -> Data = { mp3 in
                     try await Self.fetch(key, mp3: mp3, account: account)
                 }
-                let (url, size) = try await CCAsync.withTimeout(CCPlaybackPolicy.loadTimeoutSeconds) {
+                let (url, size, hit) = try await CCAsync.withTimeout(CCPlaybackPolicy.loadTimeoutSeconds(track: key.track)) {
                     try await Self.load(key, fetch: fetch)
                 }
                 bytes = size
-                guard let self, !Task.isCancelled, self.current == key else {
-                    result = "cancelled"; try? FileManager.default.removeItem(at: url); return
-                }
+                cached = hit
+                // 已写入缓存的文件留着下次用，不删。
+                guard let self, !Task.isCancelled, self.current == key else { result = "cancelled"; return }
                 self.start(url)
             } catch {
                 if error is CancellationError || Task.isCancelled { result = "cancelled"; return }
@@ -86,13 +89,10 @@ final class VoDogRecordingPlayer: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         timeObserver = nil; endObserver = nil
         player?.pause(); player = nil
-        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
-        fileURL = nil
         current = nil; loading = false; isPlaying = false; currentTime = 0; duration = 0
     }
 
     private func start(_ url: URL) {
-        fileURL = url
         let item = AVPlayerItem(url: url)
         let player = AVPlayer(playerItem: item)
         self.player = player
@@ -127,24 +127,62 @@ final class VoDogRecordingPlayer: ObservableObject {
         return try await account.data("GET", "/calls/\(key.callId)/recordings/\(key.track)", query: query)
     }
 
-    /// 下载到临时文件；原格式不可播时退到服务器转码的 mp3（`conversation` 本来就是 mp3）。
-    nonisolated static func load(_ key: Key, fetch: @Sendable (Bool) async throws -> Data) async throws -> (URL, Int) {
-        let mp3First = key.track == "conversation"
+    /// 缓存命中直接返回；否则下载写入缓存。原格式不可播时退到服务器转码的 mp3（`conversation` 只有 mp3，Pixel 单轨先要 mp3）。
+    /// shortcut: Pixel 单轨的 mp3 请求失败不再退回 WAV（服务器已预转码）；出现 mp3 缺失时再加。
+    nonisolated static func load(_ key: Key, fetch: @Sendable (Bool) async throws -> Data) async throws -> (URL, Int, Bool) {
+        let mp3First = CCPlaybackPolicy.mp3First(track: key.track, source: key.source)
+        let original = mp3First ? "mp3" : (key.source == "pixel" ? "wav" : "ogg")
+        // 原格式不可播时退成的 mp3 也存在同一 stem 下，一并查找。
+        for ext in Set([original, "mp3"]).sorted() {
+            let url = cacheURL(key, ext: ext)
+            if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0 {
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+                return (url, size, true)
+            }
+        }
         var data = try await fetch(mp3First)
-        var url = try write(data, ext: mp3First ? "mp3" : (key.source == "pixel" ? "wav" : "ogg"))
+        var url = try write(data, to: cacheURL(key, ext: original))
         if !mp3First, !(try await AVURLAsset(url: url).load(.isPlayable)) {
             try? FileManager.default.removeItem(at: url)
             data = try await fetch(true)
-            url = try write(data, ext: "mp3")
+            url = try write(data, to: cacheURL(key, ext: "mp3"))
         }
-        return (url, data.count)
+        prune(keeping: url)
+        return (url, data.count, false)
     }
 
-    nonisolated private static func write(_ data: Data, ext: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("vodog-\(UUID().uuidString).\(ext)")
+    /// 本机删除通话后清掉它的全部缓存录音。
+    nonisolated static func removeCached(callId: String) {
+        let dir = VoDogAccount.recordingCacheDirectory
+        let prefix = CCRecordingCacheNaming.callPrefix(callId)
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [] where name.hasPrefix(prefix) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
+    nonisolated private static func cacheURL(_ key: Key, ext: String) -> URL {
+        VoDogAccount.recordingCacheDirectory.appendingPathComponent(
+            CCRecordingCacheNaming.fileName(callId: key.callId, source: key.source, track: key.track, ext: ext))
+    }
+
+    nonisolated private static func write(_ data: Data, to url: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
         return url
+    }
+
+    /// 超出上限按修改时间删旧文件；刚写入、即将播放的那个不删。
+    nonisolated private static func prune(keeping current: URL) {
+        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: VoDogAccount.recordingCacheDirectory, includingPropertiesForKeys: keys)) ?? []
+        let files = urls.compactMap { url -> (url: URL, size: Int, mtime: Date)? in
+            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
+            return (url, values.fileSize ?? 0, values.contentModificationDate ?? .distantPast)
+        }
+        for url in CCRecordingCacheNaming.pruneSelection(files) where url.standardizedFileURL != current.standardizedFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }
 

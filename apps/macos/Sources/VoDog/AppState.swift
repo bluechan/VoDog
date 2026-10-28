@@ -66,8 +66,6 @@ final class AppState: ObservableObject {
     @Published var isExecutingAT = false
     @Published private(set) var transientMessage: String?
     @Published private(set) var transientIsError = false
-    @Published private(set) var messageDetailRequestSerial = 0
-    @Published private(set) var requestedMessageDetailID: SMSMessage.ID?
     @Published private(set) var hideMenuBarIconWhenDisconnected: Bool
     @Published private(set) var autoDeleteReadVerificationMessages: Bool
     @Published private(set) var isMenuBarStatusItemVisible: Bool
@@ -83,6 +81,7 @@ final class AppState: ObservableObject {
     private let modemService = ModemService()
     private let modemInventoryService = ModemInventoryService()
     private var secondaryModemServices: [UInt32: ModemService] = [:]
+    private var dataSMSDeleteAttempts: [String: Date] = [:]
     private var secondaryEUICCServices: [UInt32: EUICCService] = [:]
     private var secondaryEUICCProbeIdentities: [UInt32: String] = [:]
     private var moduleCallSnapshots: [CellularModuleID: CallSnapshot] = [:]
@@ -481,7 +480,6 @@ final class AppState: ObservableObject {
             self.refreshPendingNetworkModuleRestart()
         }
         modemInventoryService.start()
-        MainWindowController.shared.configure(appState: self)
         StandaloneFlowWindowController.shared.configure(appState: self)
         CommunicationWindowController.shared.configure(appState: self)
         InitialSetupWindowController.shared.configure(appState: self)
@@ -545,7 +543,7 @@ final class AppState: ObservableObject {
             },
             onOpenMissedCall: { [weak self] callRecordID in
                 self?.showPhoneWindow(
-                    section: .recents,
+                    section: .phone,
                     callRecordID: callRecordID
                 )
             },
@@ -962,7 +960,9 @@ final class AppState: ObservableObject {
         moduleID: CellularModuleID,
         isInitialSync: Bool
     ) {
-        let taggedMessages = incoming.map { message in
+        let dataMessages = incoming.filter(\.isApplicationDataSMS)
+        clearApplicationDataSMS(dataMessages, moduleID: moduleID)
+        let taggedMessages = incoming.filter { !$0.isApplicationDataSMS }.map { message in
             var tagged = message
             tagged.assignModule(moduleID)
             return tagged
@@ -995,6 +995,20 @@ final class AppState: ObservableObject {
                 message,
                 displayName: SystemContactStore.shared.displayName(for: message.sender)
             )
+        }
+    }
+
+    /// Data SMS never reach the inbox or VoDog; only their module slots are freed.
+    private func clearApplicationDataSMS(_ dataMessages: [SMSMessage], moduleID: CellularModuleID) {
+        let now = Date()
+        dataSMSDeleteAttempts = dataSMSDeleteAttempts.filter { now.timeIntervalSince($0.value) < 3_600 }
+        guard let service = modemService(for: moduleID) else { return }
+        for message in dataMessages where !message.awaitingParts {
+            let references = message.effectiveModemReferences
+            guard !references.isEmpty,
+                  now.timeIntervalSince(dataSMSDeleteAttempts[message.id] ?? .distantPast) >= 60 else { continue }
+            dataSMSDeleteAttempts[message.id] = now
+            service.deleteMessage(references: references) { _ in }
         }
     }
 
@@ -1101,7 +1115,9 @@ final class AppState: ObservableObject {
             // S81: name the called SIM so a hidden window still shows which card is ringing.
             let sim = voDog.sims.first { $0.id == panelCall.simId }?.displayName ?? panelCall.simLabel
             NotificationService.shared.postIncomingCall(number: nil, displayName: panelCall.ringTitle,
-                                                        subtitle: [L10n.tr("VoDog 来电"), sim].compactMap { $0 }.joined(separator: " · "))
+                                                        subtitle: [L10n.tr("VoDog 来电"), sim,
+                                                                   VoDogLocation.full(panelCall.remoteLocation)]
+                                                            .compactMap { $0 }.joined(separator: " · "))
         }
     }
 
@@ -2520,10 +2536,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    func showMainWindow() {
-        MainWindowController.shared.show()
-    }
-
     func showPhoneWindow(
         number: String? = nil,
         section: PhoneWindowSection? = nil,
@@ -2577,23 +2589,12 @@ final class AppState: ObservableObject {
         InitialSetupWindowController.shared.show()
     }
 
-    func showMainWindowAndMessageDetail(_ message: SMSMessage) {
-        markRead(message)
-        requestedMessageDetailID = message.id
-        MainWindowController.shared.showForPresentedFlow()
-        messageDetailRequestSerial &+= 1
-    }
-
     func completeInitialSetup() {
         recordInitialSetupSuccess()
     }
 
     func initialSetupDidDismiss() {
         initialSetupPresentationIsActive = false
-    }
-
-    func presentedFlowDidDismiss() {
-        MainWindowController.shared.presentedFlowDidDismiss()
     }
 
     func markRead(_ message: SMSMessage) {

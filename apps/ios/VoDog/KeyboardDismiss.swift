@@ -66,7 +66,7 @@ enum KeyboardDismisser {
 /// One tap recogniser on the key `UIWindow`, installed once from `RootView`.
 ///
 /// It has to be the window rather than a SwiftUI modifier because sheets (`ContactEditView`,
-/// `ComposeMessageView`, `PageJumpSheet`, `ContactCardView`) and `NavigationStack` destinations are separate
+/// `ComposeMessageView`, `ContactCardView`) and `NavigationStack` destinations are separate
 /// view hierarchies — a `.onTapGesture` on `RootView` would never see a tap inside any of them. They all live in
 /// the same window, so one recogniser there covers the whole app including screens written later.
 ///

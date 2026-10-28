@@ -641,6 +641,8 @@ struct DecodedPDU {
     let body: String
     let timestamp: Date?
     let concatenation: ConcatenationInfo?
+    /// Set for a data SMS addressed to an app port; a phone hands these to that app, never to the inbox.
+    let applicationPort: Int?
     let dataCodingScheme: UInt8
     let rawPDU: String
 }
@@ -1063,6 +1065,10 @@ struct SMSMessage: Identifiable, Codable, Equatable {
 
     var isOutgoing: Bool {
         direction == .outgoing
+    }
+
+    var isApplicationDataSMS: Bool {
+        rawPDUs.contains { (try? SMSPDUDecoder.decode($0))?.applicationPort != nil }
     }
 
     /// The body still has "［第 N/M 段未收到］" placeholders (awaiting or given up).

@@ -178,7 +178,9 @@ final class MessageStore: ObservableObject {
             messages = []
             return
         }
-        messages = SMSPDUDecoder.reassembleSplitParts(decoded).filter { !deletedMessages.contains($0.id) }.map { message in
+        messages = SMSPDUDecoder.reassembleSplitParts(decoded).filter {
+            !deletedMessages.contains($0.id) && !$0.isApplicationDataSMS
+        }.map { message in
             var detached = message
             detached.clearModemReferences()
             if detached.deliveryState == .sending {

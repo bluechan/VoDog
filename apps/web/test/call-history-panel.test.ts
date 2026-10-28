@@ -311,6 +311,7 @@ test('S38：手机直拨与忙线冲突的行有自己的文字，手机通话�
     {...outgoing,id:'call-pixel',state:'active',originatingPlatform:'pixel'},
     {...outgoing,id:'call-rejected',direction:'incoming',state:'failed',failureReason:'busy_auto_rejected',conflictDisposition:'rejected'},
     {...outgoing,id:'call-ai',direction:'incoming',answeredByPlatform:'ai',conflictDisposition:'ai_answered'},
+    {...outgoing,id:'call-screened',direction:'incoming',answeredByPlatform:'ai',conflictDisposition:'screened_ai'},
     {...outgoing,id:'call-web',state:'active',claimedByCurrentSession:true},
   ];
   let renderer:ReactTestRenderer|undefined;
@@ -322,6 +323,7 @@ test('S38：手机直拨与忙线冲突的行有自己的文字，手机通话�
     assert.match(text,/发起：通过手机拨打/);
     assert.match(text,/呼入 · 忙线未接/);
     assert.match(text,/忙线 AI 代接/);
+    assert.match(text,/拦截转 AI 接听/);
     const endButtons=renderer!.root.findAll(node=>node.type==='button'&&collectText(node).includes('结束通话'));
     assert.equal(endButtons.length,1,'只有本会话的网页通话可结束；手机直拨的通话没有结束按钮');
   }finally{renderer?.unmount();}

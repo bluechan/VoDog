@@ -94,4 +94,21 @@ final class S58GatewayKindTests: XCTestCase {
         XCTAssertEqual(call.ownerJoinedLocal, true)
         XCTAssertNotEqual(try JSONDecoder().decode(CallRecord.self, from: Data(#"{"id":"c1"}"#.utf8)).ownerJoinedLocal, true)
     }
+
+    /// S134b: Pixel 本机接听的来电（originatingPlatform 为空）默认打开设备归档；其它接听方仍默认服务器录音。
+    func testDeviceAnsweredIncomingCallsOpenTheDeviceArchiveByDefault() throws {
+        XCTAssertEqual(RecordingSource.defaultSource(originatingPlatform: nil, answeredByPlatform: "device"), .pixel)
+        for platform in ["ios", "android", "web", "ai", "watchos"] {
+            XCTAssertEqual(RecordingSource.defaultSource(originatingPlatform: nil, answeredByPlatform: platform), .mediaNode)
+        }
+        XCTAssertEqual(RecordingSource.defaultSource(originatingPlatform: "pixel", answeredByPlatform: "ios"), .pixel)
+        XCTAssertEqual(RecordingSource.defaultSource(originatingPlatform: nil, ownerJoinedLocal: true,
+                                                     answeredByPlatform: "ios"), .pixel)
+        let report = try JSONDecoder().decode(CallReportItem.self, from: Data(#"""
+        {"callId":"c1","startedAt":"t","sim":{"id":"s1","label":"SIM","slotIndex":0},"answeredByPlatform":"device"}
+        """#.utf8))
+        XCTAssertEqual(RecordingSource.defaultSource(originatingPlatform: report.originatingPlatform,
+                                                     ownerJoinedLocal: report.ownerJoinedLocal,
+                                                     answeredByPlatform: report.answeredByPlatform), .pixel)
+    }
 }

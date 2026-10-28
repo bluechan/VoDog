@@ -83,4 +83,19 @@ class S58GatewayKindTest {
                 .put("sim", JSONObject().put("id", "s").put("label", "SIM")).put("ownerJoinedLocal", true)))
         assertEquals(RecordingSource.PIXEL, parseCallReport(report).items.single().defaultRecordingSource)
     }
+
+    @Test fun deviceAnsweredInboundOpensDeviceArchiveByDefault() {
+        fun answered(by: String) = JSONObject().put("id", "c").put("direction", "inbound").put("answeredByPlatform", by)
+        assertEquals(RecordingSource.PIXEL, parseCallHistoryItem(answered("device"), null).defaultRecordingSource)
+        for (by in listOf("ios", "android", "web", "ai")) {
+            assertEquals(by, RecordingSource.MEDIA_NODE, parseCallHistoryItem(answered(by), null).defaultRecordingSource)
+        }
+        assertEquals(RecordingSource.PIXEL, parseCallHistoryItem(answered("ai").put("ownerJoinedLocal", true), null).defaultRecordingSource)
+        assertEquals(RecordingSource.PIXEL, parseCallHistoryItem(answered("ios").put("originatingPlatform", "pixel"), null).defaultRecordingSource)
+        val report = JSONObject()
+            .put("window", JSONObject().put("timeZone", "Asia/Shanghai").put("fromInclusive", "a").put("toExclusive", "b"))
+            .put("items", org.json.JSONArray().put(JSONObject().put("callId", "c").put("startedAt", "t").put("direction", "inbound")
+                .put("sim", JSONObject().put("id", "s").put("label", "SIM")).put("answeredByPlatform", "device")))
+        assertEquals(RecordingSource.PIXEL, parseCallReport(report).items.single().defaultRecordingSource)
+    }
 }

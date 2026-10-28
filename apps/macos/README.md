@@ -20,6 +20,15 @@ done
 VODOG_SIGNING_MODE=development VODOG_CODESIGN_IDENTITY="Apple Development: <your identity>" scripts/build_app.sh
 ```
 
+The alert sounds in Resources/Sounds are committed. They are synthesized, and this reproduces them
+byte for byte (NumPy and FFmpeg, see docs/THIRD_PARTY_NOTICES.md):
+
+```sh
+python3 scripts/sounds/chime.py /tmp/vodog-sounds && python3 scripts/sounds/ring.py /tmp/vodog-sounds
+cp /tmp/vodog-sounds/dewdrop.wav Resources/Sounds/bleeps.wav
+ffmpeg -i /tmp/vodog-sounds/ring-lullaby.wav -c:a libmp3lame -b:a 192k Resources/Sounds/ring.mp3
+```
+
 Output: outputs/VoDog-<version>-arm64-development.zip. Packaging requires a stable
 certificate-backed identity; ad-hoc signing is rejected. Release mode requires Developer
 ID. No certificate or team is supplied. VODOG_BUILD_VERSION overrides build-number

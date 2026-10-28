@@ -9,6 +9,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ClientTelephonyModelsTest {
+    @Test fun `S143 a blocked failed call reads 已拦截 and other failures still read 失败`() {
+        assertEquals("已拦截", callStateLabel("failed", "number_blocked"))
+        assertEquals("失败", callStateLabel("failed", "remoteHangup"))
+        assertEquals("失败", callStateLabel("failed"))
+        assertEquals("已结束", callStateLabel("ended", "number_blocked"))
+    }
+
     @Test fun `conversation identity uses stable SIM and server canonical address`() {
         val incoming = sms("sim-a", "+8613812345678", "13812345678")
         val outgoing = sms("sim-a", "13812345678", "13812345678")

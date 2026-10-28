@@ -192,7 +192,7 @@ final class ExpandedUIUITests: XCTestCase {
 
         selectTab("设置", in: app)
         XCTAssertTrue(app.navigationBars["设置"].waitForExistence(timeout: 8))
-        XCTAssertTrue(app.staticTexts["SIM 与接听模式"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts["SIM 卡"].waitForExistence(timeout: 8))
         attachScreenshot(app, name: "reference-07-settings")
         persistPrivateScreenshot(app, name: "07-settings")
         let sim = app.staticTexts["SIM 1"].firstMatch

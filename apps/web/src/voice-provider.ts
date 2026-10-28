@@ -21,6 +21,8 @@ export type VoiceProviderListDto = {
   items?: VoiceProviderDto[];
   selected?: string | null;
   configVersion?: number;
+  /** S137: 通讯录来电是否立即 AI 接听。旧 Control 不发这个字段 → 不显示开关。 */
+  contactInstantAi?: boolean;
 };
 
 export type VoiceProviderAvailability = 'available' | 'not_configured' | 'offline';
@@ -73,6 +75,7 @@ export function voiceProviderList(payload: VoiceProviderListDto | null | undefin
   items: VoiceProviderDto[];
   selected: string;
   configVersion: number;
+  contactInstantAi: boolean | null;
 } {
   return {
     items: Array.isArray(payload?.items) ? payload.items.filter(item => typeof item?.id === 'string' && item.id) : [],
@@ -81,8 +84,13 @@ export function voiceProviderList(payload: VoiceProviderListDto | null | undefin
       Number.isInteger(payload?.configVersion) && Number(payload?.configVersion) > 0
         ? Number(payload?.configVersion)
         : 1,
+    contactInstantAi: typeof payload?.contactInstantAi === 'boolean' ? payload.contactInstantAi : null,
   };
 }
+
+export const CONTACT_INSTANT_AI_TITLE = '通讯录用户启用AI即接';
+export const CONTACT_INSTANT_AI_HINT =
+  '关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。';
 
 /** 409 的兜底文案。服务器的 `message` 优先，这里只在 message 为空时用——与 iOS/Android 一致。 */
 export function voiceProviderErrorMessage(

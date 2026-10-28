@@ -1552,6 +1552,9 @@
 "服务器暂时不可用" = "Serveur temporairement indisponible";
 "网关请求失败" = "Échec de la requête de la passerelle";
 "配对失败：%@" = "Échec de l’association : %@";
+"该配对码所属网关已绑定模组 %@，与当前模组不符；请在 Web 选对应行，或用『更换模组配对码』" = "La passerelle de ce code d’association est liée au module %@, qui ne correspond pas au module actuel. Sur le Web, choisissez la ligne correspondante ou utilisez « 更换模组配对码 » (changer le code d’association du module).";
+"该配对码所属网关已绑定模组 %@，配对需要当前模组标识；请在 Web 选对应行，或用『更换模组配对码』" = "La passerelle de ce code d’association est liée au module %@ ; l’association exige l’identifiant du module actuel. Sur le Web, choisissez la ligne correspondante ou utilisez « 更换模组配对码 » (changer le code d’association du module).";
+"当前模组已绑定在网关「%@」上，该配对码属于另一网关；请在 Web 选对应行，或用『更换模组配对码』" = "Le module actuel est déjà lié à la passerelle « %@ », et ce code d’association appartient à une autre passerelle. Sur le Web, choisissez la ligne correspondante ou utilisez « 更换模组配对码 » (changer le code d’association du module).";
 
 /* S54 VoDog macOS client and multi-module gateway */
 "未检测到模组" = "Aucun module détecté";
@@ -1741,6 +1744,7 @@
 "服务器按时间轴混合双方原声" = "Les deux pistes d’origine mixées sur la chronologie du serveur";
 "派生听取轨，可能含补偿帧" = "Piste d’écoute dérivée ; peut contenir des trames compensées";
 "尚未生成录音" = "Aucun enregistrement pour l’instant";
+"本次通话没有录音" = "Aucun enregistrement pour cet appel";
 "导出 MP3" = "Exporter en MP3";
 "通话仍在进行或处理中，稍后再删除。" = "L’appel est encore en cours ou en traitement. Réessayez plus tard.";
 "这条记录已不存在或尚未生成。" = "Cet élément n’existe plus ou n’est pas encore prêt.";
@@ -1761,6 +1765,7 @@
 "iPhone 端" = "iPhone";
 "Android 端" = "Android";
 "Mac 端" = "Mac";
+"手表端" = "Apple Watch";
 "网页端" = "Web";
 "AI 接听" = "Réponse par l’IA";
 "通过手机拨打" = "Composé sur le téléphone";
@@ -1889,6 +1894,11 @@
 "通话中 · 由 %@ 接听 · 自 %@" = "En appel · répondu sur %@ · depuis %@";
 "同一设备上的两张卡不能互打" = "Deux SIM du même appareil ne peuvent pas s'appeler";
 "这是你正在拨出的通话" = "C'est l'appel que vous passez";
+"打开链接？" = "Ouvrir le lien ?";
+"多选" = "Sélection multiple";
+"删除会话" = "Supprimer la conversation";
+"这条短信会被彻底删除，无法恢复。" = "Ce message sera supprimé définitivement. Action irréversible.";
+"登录 VoDog 后，短信的删除与多选会与其他端同步" = "Connectez-vous à VoDog pour synchroniser la suppression et la sélection multiple des messages avec vos autres appareils";
 
 /* S95 Signal UI */
 "SIM 与 eSIM" = "SIM et eSIM";
@@ -1909,14 +1919,12 @@
 "网络" = "Réseau";
 "网络与代理" = "Réseau et proxy";
 "设备" = "Appareils";
-"设置版本" = "Version des réglages";
 "输入号码或姓名" = "Saisir un numéro ou un nom";
 "通信" = "Communication";
 "通信服务" = "Services de communication";
 "通话" = "Appels";
 "通过 %@ 接收" = "Reçu via %@";
 "配对状态" = "Association";
-"删除会话" = "Supprimer la conversation";
 "VoDog 会在%@中更改接收来电设置并回读校验，成功后再重启模块。蜂窝网络将短暂中断。" = "VoDog modifiera le réglage des appels entrants sur %@ et le relira pour le vérifier, puis redémarrera le module. Le réseau cellulaire sera brièvement interrompu.";
 "AI 代接" = "Réponse IA";
 "AI · %lld 秒后" = "IA · après %lld s";
@@ -1924,5 +1932,53 @@
 "AI 代接已开启，立即由 AI 接听" = "Réponse IA activée : l’IA décroche immédiatement";
 "AI 代接已开启，响铃 %lld 秒无人接听后由 AI 接听" = "Réponse IA activée : l’IA décroche après %lld secondes de sonnerie sans réponse";
 "AI 代接已开启，响铃无人接听后由 AI 接听" = "Réponse IA activée : l’IA décroche si personne ne répond";
+"设置版本" = "Version des réglages";
 "v%lld 已应用" = "v%lld appliquée";
 "v%lld 待设备应用" = "v%lld en attente sur l’appareil";
+"归属地 %@" = "localisation %@";
+"时间为估算" = "Heures estimées";
+"重命名网关" = "Renommer la passerelle";
+"已有同名网关" = "Une passerelle porte déjà ce nom";
+"需要管理员权限" = "Autorisation d’administrateur requise";
+"通讯录用户启用AI即接" = "Réponse IA immédiate pour les contacts";
+"关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。" = "Si désactivé, les appels des contacts sonnent d’abord 15 secondes ; sans réponse, l’IA décroche avec l’accueil « Désolé, le titulaire est occupé. Ici l’assistant IA de VoDog. Veuillez laisser un message, merci. »";
+
+/* S139 shared */
+"转录报告" = "Transcriptions et rapports";
+"拦截" = "Interceptés";
+"本机录音" = "Enregistrements locaux";
+"这台 Mac" = "Ce Mac";
+"全部 SIM 卡" = "Toutes les cartes SIM";
+"网关设备" = "Passerelles";
+"隐私与安全" = "Confidentialité et sécurité";
+"通知与声音" = "Notifications et sons";
+"设备与连接" = "Appareil et connexions";
+"记录" = "Historique";
+"返回通话" = "Revenir à l’appel";
+
+/* S139 W3 */
+"主题与应用语言" = "Thème et langue de l’app";
+"语音服务与通讯录来电" = "Service vocal et appels des contacts";
+"号码备注与接听方式" = "Notes du numéro et mode de réponse";
+"账号下的网关与这台 Mac" = "Passerelles du compte et ce Mac";
+"已屏蔽号码 · 通行密钥 · 验证码" = "Numéros bloqués · Clés d’accès · Codes";
+"系统通知 · 提示音与铃声" = "Notifications · Sons d’alerte et sonnerie";
+"权限 · 登录时启动 · 菜单栏" = "Autorisations · Ouverture à la connexion · Barre des menus";
+"账号信息与当前会话" = "Infos du compte et session actuelle";
+"我自己接" = "Je réponds moi-même";
+"来电在你的设备上响铃，由你接听。" = "Les appels sonnent sur vos appareils et vous répondez.";
+"先响铃，无人接听再交给 AI" = "Sonner d’abord, puis l’IA si sans réponse";
+"等待 %lld 秒无人接听，由 AI 代接。" = "Sans réponse après %lld s, l’IA répond.";
+"AI 立即代接" = "L’IA répond immédiatement";
+"来电立即由 AI 接听。" = "Les appels sont pris par l’IA immédiatement.";
+"等待时间" = "Délai d’attente";
+"三种方式是同一项设置；保存后由网关设备确认应用才生效。" = "Les trois modes sont un seul réglage ; il s’applique une fois confirmé par la passerelle après l’enregistrement.";
+"已接入 VoDog · %@" = "Connecté à VoDog · %@";
+"配对、暂停与模组状态都在 设置 › 网关设备" = "Jumelage, pause et état des modules sont dans Réglages › Passerelles";
+"被屏蔽号码的短信会记录在「记录 › 拦截」中。" = "Les SMS des numéros bloqués sont consignés dans Historique › Interceptés.";
+"被屏蔽号码的来电会被直接挂断，并记录在「记录 › 拦截」中。" = "Les appels des numéros bloqués sont raccrochés et consignés dans Historique › Interceptés.";
+
+/* S139 W1 */
+"只显示这台 Mac 的本机通话。登录后可使用全部 VoDog 线路，记录会在各端同步。" = "Seuls les appels locaux de ce Mac sont affichés. Connectez-vous pour utiliser toutes les lignes VoDog et synchroniser l’historique sur vos appareils.";
+"打开 设置 › 账号" = "Ouvre Réglages › Compte";
+"账号：%@" = "Compte : %@";

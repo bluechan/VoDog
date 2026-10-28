@@ -136,22 +136,15 @@ final class S33BusinessUITests: XCTestCase {
         selectTab("记录", in: app)
         XCTAssertTrue(app.navigationBars["记录"].waitForExistence(timeout: 8))
 
-        // 129 calls exceed the native 50-row page. Move to page two and back through the real pager before
-        // narrowing to the recorded fixture call.
-        // SwiftUI exposes the PagerBar container identifier on its children on this OS. Use the stable spoken
-        // labels and scroll the real Records list until the pinned pager is mounted and hittable.
-        let callsPage = app.buttons["跳转到指定页"]
-        let callsNext = app.buttons["下一页"]
-        revealPagerControl(callsNext, in: app)
-        XCTAssertTrue((callsPage.value as? String)?.contains("第 1 /") == true)
-        callsNext.tap()
-        XCTAssertTrue(waitUntil(timeout: 12) { (callsPage.value as? String)?.contains("第 2 /") == true })
+        // S133: 全部通话 has no pager. 129 calls exceed the first 50-row chunk; scrolling keeps loading older
+        // rows, so the list never runs dry and no page control is mounted on the way down.
+        XCTAssertTrue(app.buttons["records.callDetail"].firstMatch.waitForExistence(timeout: 12))
+        let recordsList = app.collectionViews.firstMatch
+        for _ in 0..<12 { recordsList.swipeUp() }
+        XCTAssertFalse(app.buttons["下一页"].exists, "全部通话 must not show a pager")
+        XCTAssertFalse(app.buttons["跳转到指定页"].exists, "全部通话 must not show a pager")
         XCTAssertTrue(app.buttons["records.callDetail"].firstMatch.waitForExistence(timeout: 8))
-        attachScreenshot(app, name: "s33-calls-second-page")
-        let callsPrevious = app.buttons["上一页"]
-        revealPagerControl(callsPrevious, in: app)
-        callsPrevious.tap()
-        XCTAssertTrue(waitUntil(timeout: 12) { (callsPage.value as? String)?.contains("第 1 /") == true })
+        attachScreenshot(app, name: "s133-calls-scrolled")
 
         // The recorded call proves detail, server transcript and generated loopback audio playback.
         replaceText(revealSearchField(in: app), with: "2025550111")
@@ -291,16 +284,14 @@ final class S33BusinessUITests: XCTestCase {
             XCTAssertTrue(row.exists && row.isHittable, "Interception context for \(label) was not visible")
             attachScreenshot(app, name: "s33-10-interception-sim-context-\(evidenceName)")
         }
-        let interceptionsPage = app.buttons["跳转到指定页"]
-        let interceptionsNext = app.buttons["下一页"]
-        revealPagerControl(interceptionsNext, in: app)
-        XCTAssertTrue((interceptionsPage.value as? String)?.contains("第 1 /") == true)
-        interceptionsNext.tap()
-        XCTAssertTrue(waitUntil(timeout: 12) { (interceptionsPage.value as? String)?.contains("第 2 /") == true })
-        let secondPageRow = app.buttons["interceptions.row"].firstMatch
-        reveal(secondPageRow, in: app, maxSwipes: 10)
-        XCTAssertTrue(secondPageRow.exists && secondPageRow.isHittable, "Second interception page had no visible row")
-        attachScreenshot(app, name: "s33-interceptions-second-page")
+        // S133: 拦截记录 has no pager either. Scrolling keeps loading older rows; no page control is mounted.
+        let interceptionsList = app.collectionViews.firstMatch
+        for _ in 0..<12 { interceptionsList.swipeUp() }
+        XCTAssertFalse(app.buttons["下一页"].exists, "拦截记录 must not show a pager")
+        XCTAssertFalse(app.buttons["跳转到指定页"].exists, "拦截记录 must not show a pager")
+        XCTAssertTrue(app.buttons["interceptions.row"].firstMatch.waitForExistence(timeout: 8),
+                      "Scrolled interception list had no visible row")
+        attachScreenshot(app, name: "s133-interceptions-scrolled")
     }
 
     @MainActor
@@ -443,10 +434,9 @@ final class S33BusinessUITests: XCTestCase {
 
         // Keep a local mode draft while a peer advances the settings version. The draft stays until an explicit
         // reload, then a fresh save remains pending until the virtual Pixel acknowledges the actual command.
-        let mode = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "模式")).firstMatch
+        let mode = app.buttons["settings.sim.mode.ai"]
         XCTAssertTrue(mode.waitForExistence(timeout: 5))
         mode.tap()
-        app.buttons["AI 即接"].tap()
         _ = try await fixture.peer(
             action: "sim.settings", id: fixture.state.ids.sims.primary,
             payload: ["mode": "timeout_ai", "timeoutSeconds": 60]
@@ -457,7 +447,6 @@ final class S33BusinessUITests: XCTestCase {
         app.buttons["simSettings.reloadSettingsConflict"].tap()
         XCTAssertTrue(waitUntil(timeout: 8) { !app.buttons["simSettings.reloadSettingsConflict"].exists })
         mode.tap()
-        app.buttons["AI 即接"].tap()
         app.buttons["保存设置"].tap()
         let applyStatus = app.staticTexts.matching(identifier: "simSettings.applyStatus").firstMatch
         XCTAssertTrue(app.staticTexts["正在应用中…"].waitForExistence(timeout: 8))
@@ -1485,20 +1474,6 @@ final class S33BusinessUITests: XCTestCase {
 
         guard maxY > minY else { return base }
         return CGRect(x: base.minX, y: minY, width: base.width, height: maxY - minY)
-    }
-
-    @MainActor
-    private func revealPagerControl(_ element: XCUIElement, in app: XCUIApplication, maxSwipes: Int = 55) {
-        if element.exists, element.isHittable { return }
-        let recordsList = app.collectionViews.firstMatch.exists
-            ? app.collectionViews.firstMatch : app.scrollViews.firstMatch
-        XCTAssertTrue(recordsList.waitForExistence(timeout: 5), "Records list was not mounted")
-        for _ in 0..<maxSwipes {
-            if element.exists, element.isHittable { return }
-            recordsList.swipeUp()
-        }
-        XCTAssertTrue(element.waitForExistence(timeout: 3), "Records pager control was not mounted")
-        XCTAssertTrue(element.isHittable, "Records pager control remained off screen")
     }
 
     @MainActor

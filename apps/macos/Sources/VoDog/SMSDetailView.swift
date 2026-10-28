@@ -39,15 +39,16 @@ struct SMSDetailView: View {
                                 appState.markRead(message)
                             }
                         }
-                        Text(verbatim: (message.body.isEmpty ? L10n.tr("（空短信）") : message.body))
+                        SMSBodyText(text: message.body.isEmpty ? L10n.tr("（空短信）") : message.body,
+                                    color: .primary, linked: true)
                             .font(.body)
                             .lineSpacing(4)
-                            .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                     .padding(16)
                 }
+                .smsLinkConfirmHost()
                 .adaptiveGlassSurface(cornerRadius: 16, treatment: .clear)
 
                 HStack(spacing: 10) {

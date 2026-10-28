@@ -44,6 +44,8 @@ struct CCCallRecord: Decodable, Identifiable, Equatable {
     var `internal`: Bool?
     var peerSimId: String?
     var peerSimLabel: String?
+    /// S96: home location of `remoteNumber`.
+    var remoteLocation: String?
 
     var isIncoming: Bool { direction == "incoming" }
     /// S67c row dot: server says unseen and this session has not opened it yet (optimistic removal).
@@ -58,7 +60,7 @@ struct CCCallRecord: Decodable, Identifiable, Equatable {
     /// the optimistic −1; `GET /badges` stays authoritative.
     var isBadgeCandidate: Bool {
         isMissedIncoming || (isIncoming && (state == "ended" || state == "failed") && failureReason != "number_blocked"
-            && (aiHandling == true || conflictDisposition == "ai_answered"))
+            && (aiHandling == true || conflictDisposition == "ai_answered" || conflictDisposition == "screened_ai"))
     }
 }
 
@@ -141,6 +143,7 @@ struct CCReportItem: Decodable, Identifiable {
     var `internal`: Bool?
     var peerSimId: String?
     var peerSimLabel: String?
+    var remoteLocation: String?
 
     func showsUnseenDot(seen: Set<String>) -> Bool { asCallRecord.showsUnseenDot(seen: seen) }
 
@@ -153,7 +156,8 @@ struct CCReportItem: Decodable, Identifiable {
             originatingPlatform: originatingPlatform, failureReason: nil, recordingStatus: nil,
             gatewayTimeZone: gatewayTimeZone, contactName: contactName, blocked: blocked,
             answerMode: answerMode, aiHandling: nil, conflictDisposition: conflictDisposition, blockedSource: nil,
-            unseen: unseen, internal: `internal`, peerSimId: peerSimId, peerSimLabel: peerSimLabel
+            unseen: unseen, internal: `internal`, peerSimId: peerSimId, peerSimLabel: peerSimLabel,
+            remoteLocation: remoteLocation
         )
     }
 }
@@ -209,6 +213,65 @@ struct CCTranscriptJob: Decodable {
     var nextAttemptAt: String?
     var error: CCTranscriptFailure?
     var result: CCTranscriptResult?
+    /// S101: Control-merged conversation; absent on older Control → flat blocks.
+    var dialog: CCTranscriptDialog?
+}
+
+/// S101 `transcript.dialog`: both sides ordered on one call clock (ms since call start).
+struct CCTranscriptDialog: Decodable, Equatable {
+    var timebase: String?
+    var maxSkewMs: Double?
+    var turns: [CCTranscriptTurn]
+}
+
+struct CCTranscriptTurn: Decodable, Equatable {
+    var role: String  // remote | me | ai
+    var text: String
+    var atMs: Double
+    var endAtMs: Double?
+    var source: String?
+    var track: String?
+}
+
+/// S101 bubble layout: remote left on surface3, me right on bubbleOut, ai right on aiSoft with a 「✦ AI」 label.
+enum CCTranscriptDialogLayout {
+    enum Style: Equatable { case incoming, outgoing, ai }
+
+    static let estimateThresholdMs = 1500.0
+
+    static func style(_ role: String) -> Style {
+        switch role {
+        case "me": return .outgoing
+        case "ai": return .ai
+        default: return .incoming  // remote and unknown roles stay on the left
+        }
+    }
+
+    static func trailing(_ role: String) -> Bool { style(role) != .incoming }
+
+    static func label(_ role: String) -> String? { style(role) == .ai ? "✦ AI" : nil }
+
+    /// Zero-padded mm:ss from call start; minutes keep counting past 59.
+    static func clock(_ ms: Double) -> String {
+        let total = ms.isFinite && ms > 0 ? Int(ms / 1000) : 0
+        return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
+    /// Gap above turn `index`: 4 within a same-role run, 12 when the speaker changes.
+    static func spacing(before index: Int, in turns: [CCTranscriptTurn]) -> Double {
+        guard index > 0, index < turns.count else { return 0 }
+        return turns[index - 1].role == turns[index].role ? 4 : 12
+    }
+
+    static func showsEstimateNote(_ dialog: CCTranscriptDialog) -> Bool {
+        (dialog.maxSkewMs ?? 0) > estimateThresholdMs
+    }
+
+    /// Turns to render as bubbles, or nil to fall back to the flat blocks.
+    static func turns(_ dialog: CCTranscriptDialog?) -> [CCTranscriptTurn]? {
+        let turns = (dialog?.turns ?? []).filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return turns.isEmpty ? nil : turns
+    }
 }
 
 struct CCTranscriptEnvelope: Decodable { let transcript: CCTranscriptJob? }
@@ -309,7 +372,17 @@ struct CCRecordingEnvelope: Decodable { let recording: CCRecordingManifest? }
 // MARK: - 标签（返回中文键）
 
 enum CCRecordLabels {
-    static func state(_ state: String?) -> String {
+    /// S120 (caller-center S118, iOS `RecordingAvailabilityPolicy.hasNoRecording`): an ended/failed call whose
+    /// `recordingStatus` is nil / empty / `none` has no recording; `pending` / `ready` keep the fetch path.
+    static func hasNoRecording(_ status: String?, state: String?) -> Bool {
+        guard state == "ended" || state == "failed" else { return false }
+        let trimmed = (status ?? "").trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty || trimmed == "none"
+    }
+
+    /// S143：被拦截的来电存为 `failed` + `number_blocked`，显示「已拦截」而不是「失败」。
+    static func state(_ state: String?, failureReason: String? = nil) -> String {
+        if state == "failed", failureReason == "number_blocked" { return "已拦截" }
         switch state {
         case "incoming_ringing": return "来电响铃"
         case "outgoing_pending": return "等待拨号"
@@ -334,6 +407,7 @@ enum CCRecordLabels {
     static func platform(_ platform: String?, gatewayKind: String? = nil) -> String? {
         switch platform {
         case "ios": return "iPhone 端"
+        case "watchos": return "手表端"   // S105: the watch dials/answers through its iPhone session
         case "android": return "Android 端"
         case "macos": return "Mac 端"
         case "web": return "网页端"
@@ -357,6 +431,7 @@ enum CCRecordLabels {
     static func badge(failureReason: String?, blockedSource: String?, conflictDisposition: String?,
                       originatingPlatform: String?, gatewayKind: String? = nil) -> String? {
         if failureReason == "number_blocked" { return self.blockedSource(blockedSource) ?? "已拦截" }
+        if conflictDisposition == "screened_ai" { return "拦截转 AI 接听" }  // S136
         if conflictDisposition == "rejected" || failureReason == "busy_auto_rejected" { return "忙线未接" }
         if conflictDisposition == "ai_answered" { return "忙线 AI 代接" }
         return originatingPlatform == "pixel" ? directDial(gatewayKind) : nil
@@ -518,7 +593,43 @@ enum CCPlaybackPolicy {
         return isPlaying ? .pause : .resume
     }
 
-    static let loadTimeoutSeconds: Double = 30
+    /// `conversation` 是服务器混音，通话刚结束时可能仍在生成（客户端放弃后服务器继续做完），给 90 s；单轨 30 s。
+    static func loadTimeoutSeconds(track: String) -> Double { track == "conversation" ? 90 : 30 }
+
+    /// 先要 mp3：`conversation` 只有 mp3；Pixel 单轨服务器已预转码 mp3（比 WAV 小约 8 倍）。媒体节点 Ogg Opus 原样播放。
+    static func mp3First(track: String, source: String) -> Bool { track == "conversation" || source == "pixel" }
+}
+
+// MARK: - 本地回放缓存（命名与淘汰；目录与文件读写在 VoDogPlayback.swift）
+
+enum CCRecordingCacheNaming {
+    static let maxFiles = 100
+    static let maxBytes = 300 << 20
+
+    /// 只留 `[A-Za-z0-9_-]`，其余换成 `_`；uuid 的 `-` 保留。
+    static func sanitize(_ part: String) -> String {
+        String(part.unicodeScalars.map { scalar -> Character in
+            let ok = scalar.isASCII && (CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_")
+            return ok ? Character(scalar) : "_"
+        })
+    }
+
+    /// 同一通话的全部缓存文件都以它开头（删除通话时按前缀清理）。
+    static func callPrefix(_ callId: String) -> String { sanitize(callId) + "." }
+
+    static func fileName(callId: String, source: String, track: String, ext: String) -> String {
+        callPrefix(callId) + sanitize(source) + "." + sanitize(track) + "." + sanitize(ext)
+    }
+
+    /// 按修改时间从新到旧保留，直到超过文件数或总字节上限；返回要删除的文件。
+    static func pruneSelection(_ files: [(url: URL, size: Int, mtime: Date)],
+                               maxFiles: Int = maxFiles, maxBytes: Int = maxBytes) -> [URL] {
+        var kept = 0, bytes = 0
+        return files.sorted { $0.mtime > $1.mtime }.compactMap { file in
+            if kept < maxFiles, bytes + file.size <= maxBytes { kept += 1; bytes += file.size; return nil }
+            return file.url
+        }
+    }
 }
 
 struct CCTimeoutError: Error, Equatable {}

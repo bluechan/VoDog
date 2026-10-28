@@ -59,10 +59,9 @@ final class WalkthroughDisplayPolicyTests: XCTestCase {
     }
 
     func testSnapshotCaptionOnlyWhenInformative() {
-        XCTAssertFalse(RecordSearchPolicy.showsSnapshotCaption(query: "", page: 1, stale: false))
-        XCTAssertFalse(RecordSearchPolicy.showsSnapshotCaption(query: "  ", page: 1, stale: false))
-        XCTAssertTrue(RecordSearchPolicy.showsSnapshotCaption(query: "159", page: 1, stale: false))
-        XCTAssertTrue(RecordSearchPolicy.showsSnapshotCaption(query: "", page: 2, stale: false))
-        XCTAssertTrue(RecordSearchPolicy.showsSnapshotCaption(query: "", page: 1, stale: true))
+        XCTAssertFalse(RecordSearchPolicy.showsSnapshotCaption(query: "", stale: false))
+        XCTAssertFalse(RecordSearchPolicy.showsSnapshotCaption(query: "  ", stale: false))
+        XCTAssertTrue(RecordSearchPolicy.showsSnapshotCaption(query: "159", stale: false))
+        XCTAssertTrue(RecordSearchPolicy.showsSnapshotCaption(query: "", stale: true))
     }
 }

@@ -411,3 +411,83 @@ test('S47 availability check follows availability, not the selected radio', asyn
     await act(async () => renderer?.unmount());
   }
 });
+
+const contactSwitch = (renderer: ReactTestRenderer) =>
+  renderer.root.findAll(node => node.type === 'button' && node.props?.role === 'switch');
+
+test('S137 旧 Control 没有 contactInstantAi 字段时不显示开关', async () => {
+  const {VoiceProviderPanel} = await harness();
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    const request = async <T,>(): Promise<T> => listed as T;
+    await act(async () => {
+      renderer = create(React.createElement(VoiceProviderPanel, {busy: false, run, request}));
+    });
+    await act(async () => { await flush(); });
+    assert.equal(contactSwitch(renderer!).length, 0);
+    assert.doesNotMatch(collectText(renderer!.toJSON()), /通讯录用户启用AI即接/);
+  } finally {
+    renderer?.unmount();
+  }
+});
+
+test('S137 开关按字段显示；点击 PUT，返回值为准；忙时禁用', async () => {
+  const {VoiceProviderPanel} = await harness();
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    const calls: {path: string; body?: unknown; method?: string}[] = [];
+    let resolvePut!: (value: VoiceProviderListDto) => void;
+    const request = async <T,>(requestPath: string, body?: unknown, method?: string): Promise<T> => {
+      calls.push({path: requestPath, body, method});
+      if (requestPath === '/ai/contact-instant-ai') return new Promise<VoiceProviderListDto>(resolve => { resolvePut = resolve; }) as Promise<T>;
+      return {...listed, contactInstantAi: false} as T;
+    };
+    await act(async () => {
+      renderer = create(React.createElement(VoiceProviderPanel, {busy: false, run, request}));
+    });
+    await act(async () => { await flush(); });
+    const text = collectText(renderer!.toJSON());
+    assert.match(text, /通讯录用户启用AI即接/);
+    assert.match(text, /关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。/);
+    assert.equal(contactSwitch(renderer!)[0]!.props['aria-checked'], false);
+    assert.equal(contactSwitch(renderer!)[0]!.props.disabled, false);
+
+    await act(async () => { contactSwitch(renderer!)[0]!.props.onClick(); });
+    assert.deepEqual(calls.at(-1), {path: '/ai/contact-instant-ai', body: {enabled: true}, method: 'PUT'});
+    assert.equal(contactSwitch(renderer!)[0]!.props['aria-checked'], true, 'optimistic flip');
+    assert.equal(contactSwitch(renderer!)[0]!.props.disabled, true, 'disabled while in flight');
+    assert.ok(radios(renderer!).every(node => node.props.disabled), 'provider radios also wait');
+
+    // Server answers false (e.g. another device flipped it back): the response wins.
+    await act(async () => { resolvePut({...listed, contactInstantAi: false}); await flush(); });
+    assert.equal(contactSwitch(renderer!)[0]!.props['aria-checked'], false);
+    assert.equal(contactSwitch(renderer!)[0]!.props.disabled, false);
+
+    await act(async () => { renderer!.update(React.createElement(VoiceProviderPanel, {busy: true, run, request})); });
+    assert.equal(contactSwitch(renderer!)[0]!.props.disabled, true, 'page busy disables the switch');
+  } finally {
+    renderer?.unmount();
+  }
+});
+
+test('S137 PUT 失败回弹到服务器值并显示错误', async () => {
+  const {VoiceProviderPanel} = await harness();
+  let renderer: ReactTestRenderer | undefined;
+  try {
+    const request = async <T,>(requestPath: string): Promise<T> => {
+      if (requestPath === '/ai/contact-instant-ai') throw Object.assign(new Error('请求失败 (503)'), {status: 503, code: 'HTTP_503'});
+      return {...listed, contactInstantAi: true} as T;
+    };
+    await act(async () => {
+      renderer = create(React.createElement(VoiceProviderPanel, {busy: false, run, request}));
+    });
+    await act(async () => { await flush(); });
+    assert.equal(contactSwitch(renderer!)[0]!.props['aria-checked'], true);
+    await act(async () => { contactSwitch(renderer!)[0]!.props.onClick(); await flush(); });
+    assert.equal(contactSwitch(renderer!)[0]!.props['aria-checked'], true, 'reverted');
+    assert.equal(contactSwitch(renderer!)[0]!.props.disabled, false);
+    assert.match(collectText(renderer!.toJSON()), /请求失败 \(503\)/);
+  } finally {
+    renderer?.unmount();
+  }
+});

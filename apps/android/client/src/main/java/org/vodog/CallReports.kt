@@ -159,9 +159,13 @@ data class CallReportItem(
     val internalTitle: String?
         get() = internalCallTitle(internal, direction, sim.label, peerSimLabel)
 
-    /** 设备上直拨的通话没有服务器录音，只有设备原始归档（`source=pixel`），默认直接打开它。 */
+    /** 设备上直拨、S134 本机接听的来电没有服务器录音，只有设备原始归档（`source=pixel`），默认直接打开它。 */
     val defaultRecordingSource: RecordingSource
-        get() = if (originatingPlatform == "pixel" || ownerJoinedLocal) RecordingSource.PIXEL else RecordingSource.MEDIA_NODE
+        get() = if (originatingPlatform == "pixel" || ownerJoinedLocal || answeredByPlatform == "device") {
+            RecordingSource.PIXEL
+        } else {
+            RecordingSource.MEDIA_NODE
+        }
 }
 
 internal const val TRANSCRIPT_STATE_NONE = "none"
@@ -197,8 +201,8 @@ internal fun reportSummaryPlaceholder(transcriptState: String): String? = when (
 /** 未分类 caption: the classifier never ran on this row (historical rows keep `blockRecommended = null`). */
 internal fun reportClassificationUnknown(item: CallReportItem): Boolean = item.blockRecommended == null
 /**
- * 报告页的一页。S28 之后它带上了分页信封 [paging]；不带 `page` 的旧请求（和旧 Control）落在
- * [Page.unpaged] 上，`items` 的读法一个字都没变。
+ * 报告页已经滚出来的行。S28 之后它带上了分页信封 [paging]（`total` 用来判断到没到底）；不带 `page`
+ * 的旧请求（和旧 Control）落在 [Page.unpaged] 上，`items` 的读法一个字都没变。
  */
 data class CallReportPage(val window: ReportWindow, val paging: Page<CallReportItem>) {
     constructor(window: ReportWindow, items: List<CallReportItem>) : this(window, Page.unpaged(items))
@@ -682,11 +686,11 @@ private val GATEWAY_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm
  *
  * S28: the pager envelope is *additive* — the paged response still carries `window` and `items`, so
  * one decoder serves both routes. A body without `totalPages` (the unpaged route, or a Control that
- * predates S28) decodes to [Page.unpaged] and the pager hides itself.
+ * predates S28) decodes to [Page.unpaged], which is the whole list.
  */
 internal fun parseCallReport(
     json: JSONObject,
-    requestedPageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
+    requestedPageSize: Int = RecordsPagingPolicy.CHUNK,
 ): CallReportPage {
     val window = json.getJSONObject("window")
     val period = window.nullableString("period")

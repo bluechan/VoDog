@@ -1,5 +1,9 @@
 package org.vodog
 
+import kotlinx.coroutines.flow.distinctUntilChanged
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.foundation.BorderStroke
@@ -10,8 +14,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,10 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -36,7 +35,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.SimCard
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -44,19 +42,16 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.ButtonColors
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SwitchColors
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -64,7 +59,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -79,8 +73,6 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.font.FontWeight
@@ -402,16 +394,37 @@ internal enum class LineStatus { ONLINE, OFFLINE, PENDING }
 
 /** Status is a shape, not only a color: ● online, ○ offline, ◐ pending. */
 @Composable
-internal fun StatusShape(status: LineStatus, size: androidx.compose.ui.unit.Dp = 8.dp) {
+internal fun StatusShape(status: LineStatus, size: androidx.compose.ui.unit.Dp = 8.dp, modifier: Modifier = Modifier) {
     val signal = LocalSignal.current
     when (status) {
-        LineStatus.ONLINE -> Box(Modifier.size(size).background(signal.call, CircleShape))
-        LineStatus.OFFLINE -> Box(Modifier.size(size).border(1.5.dp, signal.ink3, CircleShape))
+        LineStatus.ONLINE -> Box(modifier.size(size).background(signal.call, CircleShape))
+        LineStatus.OFFLINE -> Box(modifier.size(size).border(1.5.dp, signal.ink3, CircleShape))
         LineStatus.PENDING -> Box(
-            Modifier.size(size).border(1.5.dp, signal.warn, CircleShape).padding(1.5.dp)
+            modifier.size(size).border(1.5.dp, signal.warn, CircleShape).padding(1.5.dp)
                 .background(Brush.horizontalGradient(0f to signal.warn, 0.5f to signal.warn, 0.5f to Color.Transparent), CircleShape),
         )
     }
+}
+
+/**
+ * S138 决策 2: a switch that is on uses the same `call` green as the ● online shape. Thumb is white
+ * in light and the page `bg` in dark; disabled-but-on keeps the green at reduced alpha.
+ */
+@Composable
+internal fun signalSwitchColors(): SwitchColors {
+    val signal = LocalSignal.current
+    val thumb = if (signal === SignalDark) signal.bg else Color.White
+    val dimmed = signal.call.copy(alpha = 0.38f)
+    return SwitchDefaults.colors(
+        checkedThumbColor = thumb,
+        checkedTrackColor = signal.call,
+        checkedBorderColor = signal.call,
+        checkedIconColor = signal.call,
+        disabledCheckedThumbColor = thumb,
+        disabledCheckedTrackColor = dimmed,
+        disabledCheckedBorderColor = dimmed,
+        disabledCheckedIconColor = dimmed,
+    )
 }
 
 internal enum class StatusBannerKind { DEVICE_OFFLINE, SERVICE_UNAVAILABLE, LINE_OFFLINE }
@@ -505,7 +518,7 @@ internal fun SimIdentityCard(sim: ClientSim) {
 internal fun PullToRefresh(
     refreshing: Boolean,
     onRefresh: () -> Unit,
-    // S28: 列表下面多了一条分页条，所以调用方要能把它压成 `weight(1f)` 而不是整屏。
+    // 调用方要能把它压成 `weight(1f)` 而不是整屏（上面还有搜索框 / 日期条）。
     modifier: Modifier = Modifier.fillMaxSize(),
     content: @Composable () -> Unit,
 ) {
@@ -517,129 +530,27 @@ internal fun PullToRefresh(
     ) { content() }
 }
 
+/** 滚到离最后一行还有这么多行时就去读下一段，手指到底之前新行已经接上了。 */
+private const val LOAD_MORE_THRESHOLD = 10
+
 /**
- * S28 记录页分页条。三条列表（全部通话 / 报告 / 拦截记录）共用一条，钉在列表下面、导航栏上面：
- * 上一页 / 第 n / m 页（点开可跳页）/ 下一页 / 每页条数，全部 ≥ 48 dp。
+ * 记录页三条列表（全部通话 / 报告 / 拦截记录）共用的滚动加载触发：[listState] 滚到接近末尾时调用
+ * [onLoadMore]，要不要真的发请求由 ViewModel 判断（到底了 / 正在读 / 没联网）。
  *
- * 旧 Control 没有分页信封（[Page.supported] 为 false），整条不出现——见 [RecordsPagingPolicy.pagerVisible]。
+ * 触发的键是「接近末尾时的行数 [rowCount]」：接上新的一段（行数变了）而屏幕还没填满会接着读；读失败、
+ * 或一行新的都没带回来时行数不变，所以不会自己循环，滚开再滚回来才重试。列表末尾那个转圈项必须一直
+ * 在（不读时是空的），它的出现 / 消失才不会改变列表项数、把这里的判断来回翻动。
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun PagerBar(
-    page: Int,
-    pageSize: Int,
-    total: Int,
-    totalPages: Int,
-    onPage: (Int) -> Unit,
-    onPageSize: (Int) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    var jumping by rememberSaveable { mutableStateOf(false) }
-    var pickingSize by remember { mutableStateOf(false) }
-    Column(modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        Text(
-            "共 $total 条",
-            Modifier.padding(start = ScreenPadding, end = ScreenPadding, top = 6.dp),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        FlowRow(
-            Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            IconButton(
-                onClick = { onPage(page - 1) },
-                enabled = LocalNetworkAvailable.current && page > 1,
-                modifier = Modifier.size(TouchTarget),
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "上一页")
-            }
-            TextButton(onClick = { jumping = true }, enabled = LocalNetworkAvailable.current, modifier = Modifier.heightIn(min = TouchTarget)) {
-                Text("第 $page / $totalPages 页")
-            }
-            IconButton(
-                onClick = { onPage(page + 1) },
-                enabled = LocalNetworkAvailable.current && page < totalPages,
-                modifier = Modifier.size(TouchTarget),
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "下一页")
-            }
-            Box {
-                TextButton(onClick = { pickingSize = true }, enabled = LocalNetworkAvailable.current, modifier = Modifier.heightIn(min = TouchTarget)) {
-                    Text("每页 $pageSize 条")
-                }
-                DropdownMenu(expanded = pickingSize, onDismissRequest = { pickingSize = false }) {
-                    RecordsPagingPolicy.PAGE_SIZES.forEach { size ->
-                        DropdownMenuItem(
-                            enabled = LocalNetworkAvailable.current,
-                            text = { Text("每页 $size 条") },
-                            onClick = {
-                                pickingSize = false
-                                if (size != pageSize) onPageSize(size)
-                            },
-                            modifier = Modifier.heightIn(min = TouchTarget),
-                        )
-                    }
-                }
-            }
-        }
-    }
-    if (jumping) PagerJumpDialog(
-        page = page,
-        totalPages = totalPages,
-        onDismiss = { jumping = false },
-        onConfirm = {
-            jumping = false
-            onPage(it)
-        },
-    )
-}
-
-/** 「跳转到」：空输入不提交，越界的页码夹回 1..totalPages（服务端不会替客户端夹）。 */
-@Composable
-private fun PagerJumpDialog(page: Int, totalPages: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    var text by rememberSaveable(page) { mutableStateOf(page.toString()) }
-    val target = text.trim().toIntOrNull()
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("跳转到") },
-        text = {
-            // S30：对话框自成一个窗口，根 Box 的「点空白处收键盘」够不着，这里自己贴一次。
-            Column(Modifier.dismissKeyboardOnTapOutside(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { value -> text = value.filter(Char::isDigit).take(6) },
-                    label = { Text("页码") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                )
-                Text(
-                    "共 $totalPages 页",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { target?.let { onConfirm(RecordsPagingPolicy.clampPage(it, totalPages)) } },
-                enabled = LocalNetworkAvailable.current && target != null,
-                modifier = Modifier.heightIn(min = TouchTarget),
-            ) { Text("确定") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = TouchTarget)) { Text("取消") }
-        },
-    )
-}
-
-@Preview(name = "分页条 第 3/7 页", showBackground = true)
-@Composable
-private fun PagerBarPreview() {
-    VoDogTheme {
-        PagerBar(page = 3, pageSize = 100, total = 640, totalPages = 7, onPage = {}, onPageSize = {})
+internal fun LoadMoreOnNearEnd(listState: LazyListState, rowCount: Int, onLoadMore: () -> Unit) {
+    val rows by rememberUpdatedState(rowCount)
+    val loadMore by rememberUpdatedState(onLoadMore)
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            if (lastVisible >= info.totalItemsCount - LOAD_MORE_THRESHOLD) rows else -1
+        }.distinctUntilChanged().collect { if (it >= 0) loadMore() }
     }
 }
 

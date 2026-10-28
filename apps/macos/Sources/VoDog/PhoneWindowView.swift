@@ -1,34 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Signed in, the local-module sections still show only this Mac's data; say where the full picture is.
-private struct LocalOnlySectionBanner: View {
-    @ObservedObject var account: VoDogAccount
-    let section: PhoneWindowSection
-
-    var body: some View {
-        if account.user != nil, let text {
-            Label(text, systemImage: "info.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .adaptiveGlassSurface(cornerRadius: 10, treatment: .clear, tint: Color.blue.opacity(0.08))
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-        }
-    }
-
-    private var text: String? {
-        switch section {
-        case .recordings: return L10n.tr("仅显示本机模组记录，完整记录请查看 VoDog → 记录与报告")
-        case .contacts: return L10n.tr("仅显示本机通讯录，VoDog 通讯录请查看 VoDog → 通讯录")
-        default: return nil
-        }
-    }
-}
-
 struct PhoneWindowView: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var model: PhoneWindowModel
@@ -42,11 +14,14 @@ struct PhoneWindowView: View {
 
             Group {
                 if appState.call.hasCall && model.prefersFullCallPresentation {
-                    ActiveCallView(contacts: contacts)
+                    ActiveCallView(model: model, contacts: contacts)
                         .environmentObject(appState)
                 } else {
                     VStack(spacing: 0) {
-                        LocalOnlySectionBanner(account: appState.voDog, section: model.selection)
+                        // S139: a minimized local call stays one tap away on every page.
+                        if appState.showsLocalCallUI {
+                            ReturnToCallBar(contacts: contacts) { model.setFullCallPresentation(true) }
+                        }
                         sectionContent
                     }
                 }
@@ -79,6 +54,45 @@ struct PhoneWindowView: View {
     @ViewBuilder
     private var sectionContent: some View {
         switch model.selection {
+        case .phone:
+            // S139: the selected line's recent calls + dialer. Account line → cloud page; signed out or a
+            // local-only module line → this Mac's history with the local dialer when nothing is selected.
+            VoDogPhoneRoute(account: appState.voDog) {
+                ResizableCommunicationSplit(sidebarWidth: sidebarWidthBinding) {
+                    RecentCallsView(
+                        model: model,
+                        history: appState.callHistory,
+                        recordings: appState.callRecordings,
+                        contacts: contacts,
+                        account: appState.voDog,
+                        selectedRecordID: $model.selectedCallRecordID,
+                        focusFirstItemRequest: model.pendingListFocusSection == .phone,
+                        didHandleFocusFirstItemRequest: {
+                            model.consumeListFocusRequest(for: .phone)
+                        }
+                    )
+                        .environmentObject(appState)
+                        .communicationSidebarColumnStyle()
+                } detail: {
+                    if model.selectedCallRecordID == nil {
+                        DialerView(model: model, contacts: contacts)
+                            .environmentObject(appState)
+                            .communicationDetailColumnStyle()
+                    } else {
+                        RecentCallDetailView(
+                            model: model,
+                            history: appState.callHistory,
+                            recordings: appState.callRecordings,
+                            contacts: contacts,
+                            selectedRecordID: model.selectedCallRecordID
+                        )
+                            .environmentObject(appState)
+                            .communicationDetailColumnStyle()
+                    }
+                }
+            } remote: {
+                VoDogPhoneRecentsView(account: appState.voDog, sidebarWidth: sidebarWidthBinding)
+            }
         case .messages:
             // S57: signed in to VoDog → the account's SIMs; signed out → the local module.
             VoDogPhoneRoute(account: appState.voDog) {
@@ -95,63 +109,17 @@ struct PhoneWindowView: View {
             } remote: {
                 VoDogMessagesView(account: appState.voDog, sidebarWidth: sidebarWidthBinding)
             }
-        case .dialer:
-            VoDogPhoneRoute(account: appState.voDog) {
-                DialerView(model: model, contacts: contacts)
-                    .environmentObject(appState)
-            } remote: {
-                VoDogDialerView(account: appState.voDog)
-            }
-        case .recents:
-            // S67: signed in → the account's call list (selecting a call marks it seen); signed out → this Mac's history.
-            VoDogPhoneRoute(account: appState.voDog) {
-                ResizableCommunicationSplit(sidebarWidth: sidebarWidthBinding) {
-                    RecentCallsView(
-                        model: model,
-                        history: appState.callHistory,
-                        recordings: appState.callRecordings,
-                        contacts: contacts,
-                        selectedRecordID: $model.selectedCallRecordID,
-                        focusFirstItemRequest: model.pendingListFocusSection == .recents,
-                        didHandleFocusFirstItemRequest: {
-                            model.consumeListFocusRequest(for: .recents)
-                        }
-                    )
-                        .environmentObject(appState)
-                        .communicationSidebarColumnStyle()
-                } detail: {
-                    RecentCallDetailView(
-                        model: model,
-                        history: appState.callHistory,
-                        recordings: appState.callRecordings,
-                        contacts: contacts,
-                        selectedRecordID: model.selectedCallRecordID
-                    )
-                        .environmentObject(appState)
-                        .communicationDetailColumnStyle()
-                }
-            } remote: {
-                VoDogRecordsView(account: appState.voDog, sidebarWidth: sidebarWidthBinding) {
-                    model.dialNumber = ""
-                    model.activateFromRail(.dialer)
-                }
-            }
+        case .records:
+            CommunicationRecordsView(model: model, account: appState.voDog, contacts: contacts,
+                                     sidebarWidth: sidebarWidthBinding)
+                .environmentObject(appState)
         case .contacts:
-            ContactsManagementView(contacts: contacts) { number in
-                model.present(number: number, section: .dialer)
-            }
-            .environmentObject(appState)
-        case .recordings:
-            RecordingsLibraryView(
-                recordings: appState.callRecordings,
-                contacts: contacts,
-                selectedRecordingID: $model.selectedRecordingID,
-                sidebarWidth: sidebarWidthBinding,
-                focusFirstItemRequest: model.pendingListFocusSection == .recordings,
-                didHandleFocusFirstItemRequest: {
-                    model.consumeListFocusRequest(for: .recordings)
+            CommunicationContactsView(account: appState.voDog) {
+                ContactsManagementView(contacts: contacts) { number in
+                    model.present(number: number, section: .phone)
                 }
-            )
+                .environmentObject(appState)
+            }
         case .proxy:
             NetworkToolsView(
                 proxyController: appState.socksProxyController,
@@ -170,11 +138,10 @@ struct PhoneWindowView: View {
                 }
             )
                 .environmentObject(appState)
-        case .voDog:
-            VoDogSectionView(account: appState.voDog)
         case .settings:
             VoDogSettingsView(
                 sidebarWidth: sidebarWidthBinding,
+                pane: $model.settingsPane,
                 focusFirstItemRequest: model.pendingListFocusSection == .settings,
                 didHandleFocusFirstItemRequest: {
                     model.consumeListFocusRequest(for: .settings)
@@ -197,7 +164,7 @@ struct PhoneWindowView: View {
     }
 
     private func acknowledgeMissedCallsIfNeeded() {
-        guard model.selection == .recents else { return }
+        guard model.selection == .phone else { return }
         appState.callHistory.acknowledgeMissedCalls()
     }
 }
@@ -510,23 +477,13 @@ private struct CommunicationNavigationSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    group(L10n.tr("通信"), first: true)
-                    row(.messages, title: L10n.tr("短信"), systemImage: "message")
-                    row(.recents, title: L10n.tr("电话"), systemImage: "phone")
-                    row(.recordings, title: L10n.tr("录音"), systemImage: "waveform")
-                    row(.contacts, title: L10n.tr("通讯录"), systemImage: "person")
+                    row(.phone)
+                    row(.messages)
+                    row(.records)
+                    row(.contacts)
                     group(L10n.tr("设备"))
-                    row(.sim, title: L10n.tr("SIM 与 eSIM"), systemImage: "simcard")
-                    row(.proxy, title: L10n.tr("网络与代理"), systemImage: "globe")
-                    group(L10n.tr("账号"))
-                    row(.voDog, title: PhoneWindowSection.voDog.title, systemImage: "cloud") {
-                        HStack(spacing: 4) {
-                            LineStatusShape(status: account.user == nil ? .offline : .online, size: 6)
-                            Text(account.user == nil ? L10n.tr("未登录") : L10n.tr("已同步"))
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(Signal.ink3)
-                        }
-                    }
+                    row(.sim)
+                    row(.proxy)
                 }
                 .padding(.horizontal, 10)
             }
@@ -536,7 +493,8 @@ private struct CommunicationNavigationSidebar: View {
                 CommunicationModuleStatusMenu {
                     model.activateFromRail(.sim)
                 }
-                row(.settings, title: L10n.tr("设置"), systemImage: "slider.horizontal.3", iconTint: Signal.ink2)
+                accountRow
+                row(.settings, iconTint: Signal.ink2)
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 12)
@@ -550,9 +508,57 @@ private struct CommunicationNavigationSidebar: View {
         }
     }
 
-    /// The highlighted row: dialer is reached from 电话.
-    private var highlighted: PhoneWindowSection {
-        model.selection == .dialer ? .recents : model.selection
+    /// S139: signed in = username + ● 已同步; signed out = 登录 VoDog + ○ 未登录. Opens 设置 › 账号.
+    private var accountRow: some View {
+        let name = account.user?.username
+        let status = name == nil ? L10n.tr("未登录") : L10n.tr("已同步")
+        return Button {
+            withAnimation(.smooth(duration: 0.2)) { appState.showSettings(.account) }
+        } label: {
+            HStack(spacing: 9) {
+                Group {
+                    if let name, let initial = name.first {
+                        Text(verbatim: String(initial).uppercased()).font(.caption.weight(.semibold))
+                    } else {
+                        Image(systemName: "person.fill").font(.system(size: 12, weight: .medium))
+                    }
+                }
+                .foregroundStyle(Signal.ink2)
+                .frame(width: 26, height: 26)
+                .background(Signal.surface3, in: Circle())
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(verbatim: name ?? L10n.tr("登录 VoDog"))
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Signal.ink)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    HStack(spacing: 4) {
+                        LineStatusShape(status: name == nil ? .offline : .online, size: 6)
+                        Text(verbatim: status)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Signal.ink3)
+                    }
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Signal.ink3)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isAccountSelected ? Signal.surface3 : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.tr("账号：%@", [name ?? L10n.tr("登录 VoDog"), status].joined(separator: ", ")))
+        .accessibilityHint(L10n.tr("打开 设置 › 账号"))
+        .accessibilityAddTraits(isAccountSelected ? .isSelected : [])
+    }
+
+    private var isAccountSelected: Bool {
+        model.selection == .settings && model.settingsPane == .account
     }
 
     private func group(_ title: String, first: Bool = false) -> some View {
@@ -565,16 +571,13 @@ private struct CommunicationNavigationSidebar: View {
             .accessibilityAddTraits(.isHeader)
     }
 
-    private func row(
-        _ section: PhoneWindowSection,
-        title: String,
-        systemImage: String,
-        iconTint: Color = Signal.brand,
-        @ViewBuilder trailing: () -> some View = { EmptyView() }
-    ) -> some View {
-        let isSelected = highlighted == section
+    private func row(_ section: PhoneWindowSection, iconTint: Color = Signal.brand) -> some View {
+        let title = section.title
+        let systemImage = section.systemImage
+        let isSelected = model.selection == section && !(section == .settings && isAccountSelected)
         return Button {
-            guard section != model.selection else { return }
+            guard section != model.selection || isAccountSelected else { return }
+            if section == .settings, isAccountSelected { model.settingsPane = .appearance }
             withAnimation(.smooth(duration: 0.2)) { model.activateFromRail(section) }
         } label: {
             HStack(spacing: 9) {
@@ -586,7 +589,6 @@ private struct CommunicationNavigationSidebar: View {
                     .foregroundStyle(Signal.ink)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                trailing()
                 countBadge(section)
             }
             .font(.body)
@@ -613,7 +615,7 @@ private struct CommunicationNavigationSidebar: View {
             } else {
                 plainCount(appState.unreadCount)
             }
-        case .recents:
+        case .phone:
             if account.user != nil {
                 VoDogBadgeReader(store: account.badges) { store in
                     plainCount(store.counts.count(.calls, simID: nil))
@@ -638,6 +640,7 @@ private struct CommunicationNavigationSidebar: View {
 private struct ActiveCallView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var appState: AppState
+    @ObservedObject var model: PhoneWindowModel
     @ObservedObject var contacts: SystemContactStore
     @ObservedObject private var recordings = CallRecordingStore.shared
     @AppStorage("CallRecordingConsentAcknowledged.v1") private var recordingConsent = false
@@ -692,8 +695,23 @@ private struct ActiveCallView: View {
     }
 
     private func callStage(compact: Bool) -> some View {
+        // S139 / DESIGN.md order: collapse → contact + SIM → status pill / timer → 静音 / 键盘 → 结束.
         VStack(spacing: compact ? 12 : 17) {
-            callStateBadge
+            HStack {
+                Button {
+                    model.setFullCallPresentation(false)
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 32, height: 32)
+                        .background(Signal.surface2, in: Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help(L10n.tr("收起通话控制"))
+                .accessibilityLabel(L10n.tr("收起通话控制"))
+                Spacer()
+            }
 
             CallAvatar(
                 title: avatarTitle,
@@ -715,11 +733,6 @@ private struct ActiveCallView: View {
                         .lineLimit(1)
                 }
 
-                if appState.call.phase == .active, let startedAt = appState.call.startedAt {
-                    Text(startedAt, style: .timer)
-                        .font(.title3.monospacedDigit().weight(.medium))
-                }
-
                 Text(callRouteSummary)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -727,6 +740,8 @@ private struct ActiveCallView: View {
                     .minimumScaleFactor(0.82)
             }
             .accessibilityElement(children: .combine)
+
+            callStateBadge
 
             phaseActions(compact: compact)
 
@@ -817,19 +832,19 @@ private struct ActiveCallView: View {
                         toggleRecording()
                     }
                     .help(recordings.isRecording ? L10n.tr("停止并保存本次录音") : L10n.tr("录制通话双方声音"))
-
-                    CircularLiquidCallButton(
-                        title: L10n.tr("挂断"),
-                        systemImage: "phone.down.fill",
-                        tint: .red,
-                        prominent: true,
-                        role: .destructive,
-                        isEnabled: !appState.isChangingCall,
-                        diameter: compact ? 58 : 66
-                    ) {
-                        appState.hangUp()
-                    }
                 }
+            }
+
+            CircularLiquidCallButton(
+                title: L10n.tr("挂断"),
+                systemImage: "phone.down.fill",
+                tint: .red,
+                prominent: true,
+                role: .destructive,
+                isEnabled: !appState.isChangingCall,
+                diameter: compact ? 66 : 80
+            ) {
+                appState.hangUp()
             }
 
         case .dialing, .alerting, .ending, .recovering:
@@ -840,7 +855,7 @@ private struct ActiveCallView: View {
                 prominent: true,
                 role: .destructive,
                 isEnabled: !appState.isChangingCall || appState.call.phase == .recovering,
-                diameter: compact ? 58 : 66
+                diameter: compact ? 66 : 80
             ) {
                 appState.hangUp()
             }
@@ -1036,8 +1051,17 @@ private struct ActiveCallView: View {
     }
 
     private var callStateBadge: some View {
-        Label(callStateText, systemImage: callStateSystemImage)
-            .font(.caption.weight(.semibold))
+        Label {
+            HStack(spacing: 6) {
+                Text(verbatim: callStateText)
+                if appState.call.phase == .active, let startedAt = appState.call.startedAt {
+                    Text(startedAt, style: .timer).monospacedDigit()
+                }
+            }
+        } icon: {
+            Image(systemName: callStateSystemImage)
+        }
+            .font(.callout.weight(.semibold))
             .foregroundStyle(callTint)
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
@@ -1169,6 +1193,7 @@ private struct RecentCallsView: View {
     @ObservedObject var history: CallHistoryStore
     @ObservedObject var recordings: CallRecordingStore
     @ObservedObject var contacts: SystemContactStore
+    @ObservedObject var account: VoDogAccount
     @Binding var selectedRecordID: CallHistoryRecord.ID?
     var focusFirstItemRequest = false
     var didHandleFocusFirstItemRequest: () -> Void = {}
@@ -1179,6 +1204,37 @@ private struct RecentCallsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // S139: page header with the line popup (account SIMs + this Mac's local-only modules).
+            HStack(spacing: 8) {
+                Text(L10n.tr("电话")).font(.headline)
+                Spacer(minLength: 6)
+                VoDogLineMenu(account: account)
+                if selectedRecordID != nil {
+                    CommunicationIconActionButton(
+                        systemImage: "circle.grid.3x3.fill",
+                        accessibilityLabel: L10n.tr("拨号盘")
+                    ) {
+                        selectedRecordID = nil
+                    }
+                }
+            }
+            .signalToolbar()
+
+            if account.user == nil {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(L10n.tr("只显示这台 Mac 的本机通话。登录后可使用全部 VoDog 线路，记录会在各端同步。"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button(L10n.tr("登录 VoDog")) { appState.showSettings(.account) }
+                        .controlSize(.small)
+                        .accessibilityLabel(L10n.tr("登录 VoDog"))
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+            }
+
             HStack(spacing: 8) {
                 TextField("搜索联系人或号码", text: $searchText)
                     .communicationSearchField()
@@ -1189,10 +1245,11 @@ private struct RecentCallsView: View {
                     tint: .green
                 ) {
                     model.dialNumber = ""
-                    model.activateFromRail(.dialer)
+                    selectedRecordID = nil  // S139: the detail pane falls back to the dialer
                 }
             }
                 .padding(.horizontal, 14)
+                .padding(.top, 10)
                 .padding(.bottom, 10)
 
             CommunicationGlassTabs(
@@ -1208,7 +1265,8 @@ private struct RecentCallsView: View {
                 PhoneEmptyState(
                     title: missedOnly ? "没有未接来电" : "暂无最近通话",
                     detail: "完成或错过的蜂窝电话会保存在此 Mac。",
-                    systemImage: missedOnly ? "phone.badge.checkmark" : "clock.arrow.circlepath"
+                    systemImage: missedOnly ? "phone.badge.checkmark" : "clock.arrow.circlepath",
+                    illustration: "phone-empty"
                 )
             } else {
                 ScrollViewReader { proxy in
@@ -1294,7 +1352,6 @@ private struct RecentCallsView: View {
         }
         .onAppear {
             selectRequestedCall()
-            selectInitialRecordIfNeeded()
             handleFocusFirstItemRequest()
         }
         .onChange(of: focusFirstItemRequest) { _, requested in
@@ -1326,16 +1383,6 @@ private struct RecentCallsView: View {
         }
     }
 
-    private func selectInitialRecordIfNeeded() {
-        guard selectedRecordID == nil else { return }
-        if !model.dialNumber.isEmpty,
-           let matchingRecord = filteredRecords.first(where: { $0.number == model.dialNumber }) {
-            selectedRecordID = matchingRecord.id
-        } else if let firstRecord = filteredRecords.first {
-            selectedRecordID = firstRecord.id
-        }
-    }
-
     private func selectRequestedCall(using proxy: ScrollViewProxy? = nil) {
         guard let recordID = model.requestedCallRecordID,
               history.records.contains(where: { $0.id == recordID }) else {
@@ -1345,6 +1392,7 @@ private struct RecentCallsView: View {
         missedOnly = true
         selectedRecordID = recordID
         guard let proxy else { return }
+        model.consumeCallRecordRequest()  // S139: one-shot, so returning to 电话 shows the dialer again
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.18)) {
                 proxy.scrollTo(recordID, anchor: .center)
@@ -1353,16 +1401,15 @@ private struct RecentCallsView: View {
     }
 
     private func ensureSelectionIsVisible() {
+        // S139: no row selected = the dialer; a hidden selection falls back to it, never to another row.
         if let selectedRecordID,
-           filteredRecords.contains(where: { $0.id == selectedRecordID }) {
-            return
+           !filteredRecords.contains(where: { $0.id == selectedRecordID }) {
+            self.selectedRecordID = nil
         }
-        selectedRecordID = filteredRecords.first?.id
     }
 
     private func handleFocusFirstItemRequest() {
         guard focusFirstItemRequest else { return }
-        selectedRecordID = filteredRecords.first?.id
         didHandleFocusFirstItemRequest()
         listFocused = false
         DispatchQueue.main.async {
@@ -1435,6 +1482,7 @@ private struct RecentCallDetailView: View {
     @ObservedObject var recordings: CallRecordingStore
     @ObservedObject var contacts: SystemContactStore
     let selectedRecordID: CallHistoryRecord.ID?
+    @AppStorage(CommunicationRecordsSegment.storageKey) private var recordsSegment = CommunicationRecordsSegment.calls.rawValue
 
     var body: some View {
         Group {
@@ -1465,7 +1513,8 @@ private struct RecentCallDetailView: View {
                 PhoneEmptyState(
                     title: "选择一条通话记录",
                     detail: "选择左侧最近通话，查看联系人、通话信息和可用操作。",
-                    systemImage: "phone.badge.clock"
+                    systemImage: "phone.badge.clock",
+                    illustration: "records-empty"
                 )
             }
         }
@@ -1623,7 +1672,8 @@ private struct RecentCallDetailView: View {
                     compact: compact
                 ) {
                     model.selectedRecordingID = recording.id
-                    model.activateFromRail(.recordings)
+                    recordsSegment = CommunicationRecordsSegment.recordings.rawValue
+                    model.activateFromRail(.records)
                 }
             }
         }
@@ -1751,307 +1801,6 @@ private struct RecentCallDetailAction: View {
     }
 }
 
-private struct RecordingsManagementView: View {
-    @EnvironmentObject private var appState: AppState
-    @ObservedObject var recordings: CallRecordingStore
-    @ObservedObject var contacts: SystemContactStore
-    @Binding var selectedRecordingID: CallRecordingRecord.ID?
-    @Binding var sidebarWidth: CGFloat
-    @State private var renameText = ""
-    @State private var deletingRecording: CallRecordingRecord?
-    @State private var searchText = ""
-    @State private var directionFilter = 0
-
-    var body: some View {
-        Group {
-            if recordings.records.isEmpty {
-                PhoneEmptyState(
-                    title: "暂无通话录音",
-                    detail: "在通话中手动开始录音，结束后会保存在此 Mac。",
-                    systemImage: "waveform"
-                )
-            } else {
-                ResizableCommunicationSplit(sidebarWidth: $sidebarWidth) {
-                    recordingList
-                } detail: {
-                    recordingDetail
-                        .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-        }
-        .onAppear(perform: selectFirstRecordingIfNeeded)
-        .onChange(of: recordings.records.map(\.id)) { _, _ in
-            selectFirstRecordingIfNeeded()
-        }
-        .onChange(of: selectedRecordingID) { _, _ in
-            renameText = selectedRecording?.title ?? ""
-        }
-        .confirmationDialog(
-            "删除这段通话录音？",
-            isPresented: Binding(
-                get: { deletingRecording != nil },
-                set: { if !$0 { deletingRecording = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("删除录音", role: .destructive) {
-                guard let deletingRecording else { return }
-                recordings.delete(deletingRecording)
-                self.deletingRecording = nil
-            }
-            Button("取消", role: .cancel) { deletingRecording = nil }
-        } message: {
-            Text("音频文件将从这台 Mac 永久删除；最近通话记录仍会保留。")
-        }
-    }
-
-    private var recordingList: some View {
-        VStack(spacing: 0) {
-            TextField("搜索录音、联系人或号码", text: $searchText)
-                .communicationSearchField()
-                .padding(.horizontal, 14)
-                .padding(.bottom, 10)
-
-            CommunicationGlassTabs(
-                items: [(0, "全部"), (1, "呼入"), (2, "呼出")],
-                selection: $directionFilter
-            )
-            .padding(.horizontal, 14)
-            .padding(.bottom, 10)
-
-            Divider()
-
-        List(filteredRecordingRecords) { record in
-            HStack(spacing: 11) {
-                ZStack {
-                    Color.clear
-                        .selectionBackground(recordings.playingRecordingID == record.id ? Signal.brand : Signal.ink3,
-                                             opacity: recordings.playingRecordingID == record.id ? 0.14 : 0.10,
-                                             in: Circle())
-                    Image(systemName: recordings.playingRecordingID == record.id
-                        ? "waveform.circle.fill"
-                        : "waveform")
-                        .selectionTint(recordings.playingRecordingID == record.id
-                            ? AnyShapeStyle(Signal.brand)
-                            : AnyShapeStyle(.secondary))
-                }
-                .frame(width: 38, height: 38)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(presentedRecordingTitle(record))
-                        .lineLimit(1)
-                    HStack(spacing: 4) {
-                        Text(CommunicationUI.listTimestamp(record.startedAt))
-                            .fixedSize(horizontal: true, vertical: false)
-                        Text("·")
-                        Text(recordingDuration(record.duration))
-                        if record.isIncomplete {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .selectionTint(Signal.warn)
-                                .help(L10n.tr("录音过程中部分音频未能写入"))
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.vertical, 4)
-            .communicationSelectionHighlight(selectedRecordingID == record.id)
-            .contentShape(Rectangle())
-            .onTapGesture { selectedRecordingID = record.id }
-            .accessibilityAddTraits(selectedRecordingID == record.id ? .isSelected : [])
-            .tag(record.id)
-            .contextMenu {
-                Button("播放或暂停", systemImage: "playpause") { recordings.play(record) }
-                Button("导出…", systemImage: "square.and.arrow.up") { recordings.export(record) }
-                Button("在访达中显示", systemImage: "folder") { recordings.reveal(record) }
-                Divider()
-                Button("删除", systemImage: "trash", role: .destructive) {
-                    deletingRecording = record
-                }
-            }
-        }
-        .listStyle(.inset)
-        }
-        .communicationSidebarColumnStyle()
-    }
-
-    private var filteredRecordingRecords: [CallRecordingRecord] {
-        let directional = recordings.records.filter { record in
-            directionFilter == 0 ||
-                (directionFilter == 1 && record.direction == .incoming) ||
-                (directionFilter == 2 && record.direction == .outgoing)
-        }
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return directional }
-        return directional.filter { record in
-            record.number.localizedCaseInsensitiveContains(query) ||
-                (record.title ?? "").localizedCaseInsensitiveContains(query) ||
-                (contacts.displayName(for: record.number) ?? "")
-                    .localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    @ViewBuilder
-    private var recordingDetail: some View {
-        if let record = selectedRecording {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    HStack(alignment: .top, spacing: 18) {
-                        ZStack {
-                            Circle()
-                                .fill(.tint.opacity(0.13))
-                            Image(systemName: "waveform")
-                                .font(.system(size: 32, weight: .medium))
-                                .foregroundStyle(.tint)
-                        }
-                        .frame(width: 76, height: 76)
-
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(presentedRecordingTitle(record))
-                                .font(.title2.weight(.semibold))
-                            Text(CommunicationUI.displayText(record.number))
-                                .font(.body.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                            Label(
-                                record.direction == .incoming ? L10n.tr("来电录音") : L10n.tr("去电录音"),
-                                systemImage: record.direction == .incoming
-                                    ? "phone.arrow.down.left"
-                                    : "phone.arrow.up.right"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-
-                    HStack(spacing: 14) {
-                        Button {
-                            recordings.play(record)
-                        } label: {
-                            Label(
-                                recordings.playingRecordingID == record.id ? L10n.tr("暂停") : L10n.tr("播放"),
-                                systemImage: recordings.playingRecordingID == record.id
-                                    ? "pause.fill"
-                                    : "play.fill"
-                            )
-                            .frame(minWidth: 86)
-                        }
-                        .adaptiveGlassButton(.prominent)
-
-                        Button("回拨", systemImage: "phone") {
-                            appState.showPhoneWindow(number: record.number)
-                        }
-                        .adaptiveGlassButton()
-
-                        Button("发短信", systemImage: "message") {
-                            appState.showMessagesWindow(destination: record.number)
-                        }
-                        .adaptiveGlassButton()
-                    }
-
-                    recordingInformation(record)
-
-                    VStack(alignment: .leading, spacing: 9) {
-                        Text("名称")
-                            .font(.headline)
-                        HStack {
-                            TextField(
-                                L10n.tr("可选的录音名称"),
-                                text: $renameText
-                            )
-                            Button("保存") {
-                                recordings.rename(record, title: renameText)
-                            }
-                            .disabled(
-                                renameText.trimmingCharacters(in: .whitespacesAndNewlines) ==
-                                    (record.title ?? "")
-                            )
-                        }
-                    }
-                    .padding(16)
-                    .adaptiveGlassSurface(cornerRadius: 18, treatment: .clear)
-
-                    HStack {
-                        Button("导出录音…", systemImage: "square.and.arrow.up") {
-                            recordings.export(record)
-                        }
-                        Button("在访达中显示", systemImage: "folder") {
-                            recordings.reveal(record)
-                        }
-                        Spacer()
-                        Button("删除录音", systemImage: "trash", role: .destructive) {
-                            deletingRecording = record
-                        }
-                    }
-                    .buttonStyle(.borderless)
-
-                    if let error = recordings.lastError {
-                        Label(L10n.tr(error), systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                }
-                .padding(28)
-                .frame(maxWidth: 680, alignment: .leading)
-            }
-        } else {
-            PhoneEmptyState(
-                title: "选择一段录音",
-                detail: "可播放、重命名、导出或删除通话录音。",
-                systemImage: "waveform"
-            )
-        }
-    }
-
-    private func recordingInformation(_ record: CallRecordingRecord) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            LabeledContent("录制时间") {
-                Text(record.startedAt, format: .dateTime.year().month().day().hour().minute().second())
-            }
-            LabeledContent("时长", value: recordingDuration(record.duration))
-            LabeledContent("声道", value: L10n.tr("左声道：对方 · 右声道：本机"))
-            LabeledContent("存储", value: CallRecordingStore.storageText)
-            if record.isIncomplete {
-                Label("部分音频因写入队列过载而缺失，通话本身未受影响。", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-        }
-        .padding(16)
-        .adaptiveGlassSurface(cornerRadius: 18, treatment: .clear)
-    }
-
-    private var selectedRecording: CallRecordingRecord? {
-        guard let selectedRecordingID else { return nil }
-        return recordings.records.first { $0.id == selectedRecordingID }
-    }
-
-    private func selectFirstRecordingIfNeeded() {
-        if let selectedRecordingID,
-           recordings.records.contains(where: { $0.id == selectedRecordingID }) {
-            return
-        }
-        self.selectedRecordingID = recordings.records.first?.id
-    }
-
-    private func contactName(for record: CallRecordingRecord) -> String {
-        CommunicationUI.displayText(contacts.displayName(for: record.number), record.number)
-    }
-
-    private func presentedRecordingTitle(_ record: CallRecordingRecord) -> String {
-        CommunicationUI.displayText(record.title, contacts.displayName(for: record.number), record.number)
-    }
-
-    private func recordingDuration(_ duration: TimeInterval) -> String {
-        let total = max(0, Int(duration.rounded()))
-        if total >= 3_600 {
-            return String(format: "%d:%02d:%02d", total / 3_600, (total / 60) % 60, total % 60)
-        }
-        return String(format: "%d:%02d", total / 60, total % 60)
-    }
-}
-
 private struct ContactsManagementView: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var contacts: SystemContactStore
@@ -2086,7 +1835,6 @@ private struct ContactsManagementView: View {
                 )
             }
         }
-        .searchable(text: $searchText, prompt: "搜索姓名、号码或公司")
         .sheet(
             isPresented: Binding(
                 get: { editingDraft != nil },
@@ -2133,6 +1881,10 @@ private struct ContactsManagementView: View {
     private var authorizedContent: some View {
         HSplitView {
             VStack(spacing: 0) {
+                // S139: in-column search like the VoDog source; `.searchable` landed in the title bar over the traffic lights.
+                TextField(L10n.tr("搜索姓名、号码或公司"), text: $searchText)
+                    .communicationSearchField()
+                    .padding([.horizontal, .top], 12)
                 Picker("分组", selection: $selectedGroupID) {
                     Text("所有联系人").tag(SystemContactGroup.ID?.none)
                     ForEach(contacts.groups) { group in
@@ -2325,7 +2077,8 @@ private struct ContactsManagementView: View {
                 detail: filteredContacts.isEmpty
                     ? "新建联系人后可直接拨打或发送短信。"
                     : "联系人详情会显示在这里。",
-                systemImage: "person.crop.circle"
+                systemImage: "person.crop.circle",
+                illustration: "contacts-empty"
             )
         }
     }
@@ -2543,13 +2296,26 @@ struct PhoneEmptyState: View {
     let title: String
     let detail: String
     let systemImage: String
+    /// S103 VoDog illustration name in `Resources/Illustrations`; replaces the symbol when set.
+    var illustration: String? = nil
 
     var body: some View {
-        ContentUnavailableView(
-            L10n.tr(title),
-            systemImage: systemImage,
-            description: Text(L10n.tr(detail))
-        )
+        Group {
+            if let illustration {
+                ContentUnavailableView {
+                    VoDogIllustration(illustration, width: 140, fallbackSystemImage: systemImage)
+                    Text(L10n.tr(title)).font(.headline)
+                } description: {
+                    Text(L10n.tr(detail))
+                }
+            } else {
+                ContentUnavailableView(
+                    L10n.tr(title),
+                    systemImage: systemImage,
+                    description: Text(L10n.tr(detail))
+                )
+            }
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

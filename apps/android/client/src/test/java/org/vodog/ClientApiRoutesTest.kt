@@ -1,6 +1,7 @@
 package org.vodog
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
@@ -53,22 +54,31 @@ class ClientApiRoutesTest {
     }
 
     /**
-     * S28: `page` 是分页的开关，所以分页路由永远带 `page`，永远不带 `limit`/游标（服务端把 `page`
-     * 和游标的组合判成 400）。`simId` 和 `query` 只在非空时出现，参数顺序是固定的。
+     * 「全部通话」是游标路由：永远带 `limit=50` 和 `includeBlocked=true`，永远不带 `page`/`pageSize`
+     * （服务端把 `page` 和游标的组合判成 400）。`simId`、`query` 和游标只在非空时出现，参数顺序是固定的，
+     * `before` 是那一行自己的 `startedAt`，只转义、不改写。
      */
-    @Test fun pagedCallsRouteCarriesPageSizeSimAndQueryInAFixedOrder() {
-        assertEquals("/calls?page=1&pageSize=50&includeBlocked=true", ClientApiRoutes.callsPage())
+    @Test fun cursorCallsRouteCarriesLimitSimQueryAndCursorInAFixedOrder() {
+        assertEquals("/calls?limit=50&includeBlocked=true", ClientApiRoutes.callsPage())
         assertEquals(
-            "/calls?page=3&pageSize=100&includeBlocked=true&simId=a1b2&query=189%2F2",
-            ClientApiRoutes.callsPage("189/2", "a1b2", 3, 100),
+            "/calls?limit=50&includeBlocked=true&simId=a1b2&query=189%2F2",
+            ClientApiRoutes.callsPage("189/2", "a1b2"),
         )
         assertEquals(
-            "/calls?page=2&pageSize=200&includeBlocked=true&query=%E5%BC%A0%E4%B8%89",
-            ClientApiRoutes.callsPage(" 张三 ", "  ", 2, 200),
+            "/calls?limit=50&includeBlocked=true&query=%E5%BC%A0%E4%B8%89",
+            ClientApiRoutes.callsPage(" 张三 ", "  "),
         )
-        // 页码从 1 起，页长只能是服务端认的三个值。
-        assertEquals("/calls?page=1&pageSize=50&includeBlocked=true", ClientApiRoutes.callsPage(page = 0, pageSize = 7))
-        assertEquals("/calls?page=1&pageSize=200&includeBlocked=true", ClientApiRoutes.callsPage(page = -4, pageSize = 5_000))
+        assertEquals(
+            "/calls?limit=50&includeBlocked=true&simId=a1b2&query=189%2F2" +
+                "&before=2026-09-12T01%3A02%3A03.456Z&beforeId=0b6f1c1e-5a53-4a0e-9d0c-6f1f0f4b2a10",
+            ClientApiRoutes.callsPage("189/2", "a1b2", "2026-09-12T01:02:03.456Z", "0b6f1c1e-5a53-4a0e-9d0c-6f1f0f4b2a10"),
+        )
+        // `beforeId` 只是 `before` 的并列决胜位，单独出现没有意义。
+        assertEquals("/calls?limit=50&includeBlocked=true", ClientApiRoutes.callsPage(beforeId = "0b6f1c1e"))
+        listOf(ClientApiRoutes.callsPage(), ClientApiRoutes.callsPage("1", "s", "2026-09-12T01:02:03.456Z", "id")).forEach {
+            assertFalse(it.contains("page="))
+            assertFalse(it.contains("pageSize="))
+        }
     }
 
     @Test fun pagedReportRouteKeepsTheWindowAndAddsPageSizeAndSim() {
@@ -78,15 +88,21 @@ class ClientApiRoutesTest {
             ClientApiRoutes.reportsPage(range, "Asia/Shanghai"),
         )
         assertEquals(
-            "/reports/calls?timeZone=Asia%2FShanghai&from=2026-09-06&to=2026-09-12&page=4&pageSize=200" +
+            "/reports/calls?timeZone=Asia%2FShanghai&from=2026-09-06&to=2026-09-12&page=4&pageSize=50" +
                 "&simId=sim-1&query=%E5%BC%A0%E4%B8%89",
-            ClientApiRoutes.reportsPage(range, "Asia/Shanghai", " 张三 ", "sim-1", 4, 200),
+            ClientApiRoutes.reportsPage(range, "Asia/Shanghai", " 张三 ", "sim-1", 4),
+        )
+        // 滚动加载的下一段只是换一个 `page`，`pageSize` 永远是 50。
+        assertEquals(
+            "/reports/calls?timeZone=Asia%2FShanghai&from=2026-09-06&to=2026-09-12&page=3&pageSize=50",
+            ClientApiRoutes.reportsPage(range, "Asia/Shanghai", page = RecordsPagingPolicy.nextPage(100)),
         )
     }
 
     @Test fun pagedInterceptionsRouteReplacesTheLimit() {
         assertEquals("/blocklist/interceptions?page=1&pageSize=50", ClientApiRoutes.interceptionsPage())
-        assertEquals("/blocklist/interceptions?page=6&pageSize=100", ClientApiRoutes.interceptionsPage(6, 100))
+        assertEquals("/blocklist/interceptions?page=6&pageSize=50", ClientApiRoutes.interceptionsPage(6))
+        assertEquals("/blocklist/interceptions?page=1&pageSize=50", ClientApiRoutes.interceptionsPage(0))
     }
 
     @Test fun reportAndTranscriptRoutesEncodeIanaZoneAndCallId() {

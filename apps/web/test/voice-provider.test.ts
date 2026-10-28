@@ -12,6 +12,7 @@ import {
   voiceProviderShouldSubmit,
   voiceProviderStatusLabel,
   type VoiceProviderDto,
+  type VoiceProviderListDto,
 } from '../src/voice-provider.ts';
 
 /**
@@ -28,11 +29,11 @@ test('the contract response parses into a list and a selection', () => {
 });
 
 test('a missing or partial payload reads as an empty, unselected list', () => {
-  assert.deepEqual(voiceProviderList(undefined), {items: [], selected: '', configVersion: 1});
-  assert.deepEqual(voiceProviderList({}), {items: [], selected: '', configVersion: 1});
-  assert.deepEqual(voiceProviderList({items: [], selected: null}), {items: [], selected: '', configVersion: 1});
+  assert.deepEqual(voiceProviderList(undefined), {items: [], selected: '', configVersion: 1, contactInstantAi: null});
+  assert.deepEqual(voiceProviderList({}), {items: [], selected: '', configVersion: 1, contactInstantAi: null});
+  assert.deepEqual(voiceProviderList({items: [], selected: null}), {items: [], selected: '', configVersion: 1, contactInstantAi: null});
   // Entries without an id cannot be rendered as a radio at all.
-  assert.deepEqual(voiceProviderList({items: [{id: ''} as VoiceProviderDto]}), {items: [], selected: '', configVersion: 1});
+  assert.deepEqual(voiceProviderList({items: [{id: ''} as VoiceProviderDto]}), {items: [], selected: '', configVersion: 1, contactInstantAi: null});
 });
 
 test('missing flags decode as 未配置 rather than as selectable', () => {
@@ -106,4 +107,12 @@ test('the server message is shown first and the code is only a fallback', () => 
 
 test('the footer explains what the switch affects', () => {
   assert.equal(VOICE_PROVIDER_FOOTER, '切换只影响之后的 AI 即接 / 超时代接来电。');
+});
+
+test('S137 contactInstantAi parses booleans only; absent or malformed reads as null (hide the toggle)', () => {
+  assert.equal(voiceProviderList({contactInstantAi: true}).contactInstantAi, true);
+  assert.equal(voiceProviderList({contactInstantAi: false}).contactInstantAi, false);
+  assert.equal(voiceProviderList({}).contactInstantAi, null);
+  assert.equal(voiceProviderList({contactInstantAi: 'true'} as unknown as VoiceProviderListDto).contactInstantAi, null);
+  assert.equal(voiceProviderList({contactInstantAi: 1} as unknown as VoiceProviderListDto).contactInstantAi, null);
 });

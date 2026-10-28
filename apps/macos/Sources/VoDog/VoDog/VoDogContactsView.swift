@@ -162,7 +162,8 @@ struct VoDogContactsView: View {
                 if contacts.isEmpty && !loading && listError == nil {
                     PhoneEmptyState(title: search.isEmpty ? "没有联系人" : "没有匹配的联系人",
                                     detail: "新建的联系人会同步到所有 VoDog 客户端。",
-                                    systemImage: "person.crop.circle")
+                                    systemImage: "person.crop.circle",
+                                    illustration: search.isEmpty ? "contacts-empty" : "search-empty")
                 } else if contacts.isEmpty && loading {
                     ProgressView()
                 }
@@ -241,7 +242,8 @@ struct VoDogContactsView: View {
         } else if selectedID != nil {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            PhoneEmptyState(title: "选择一个联系人", detail: "联系人详情会显示在这里。", systemImage: "person.crop.circle")
+            PhoneEmptyState(title: "选择一个联系人", detail: "联系人详情会显示在这里。", systemImage: "person.crop.circle",
+                           illustration: "contacts-empty")
         }
     }
 
@@ -287,6 +289,9 @@ struct VoDogContactsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text(verbatim: phone.displayNumber)
                     .font(.body.monospacedDigit()).textSelection(.enabled)
+                if let location = VoDogLocation.full(phone.location) {
+                    Text(verbatim: location).font(.caption).foregroundStyle(.secondary)
+                }
             }
             if phone.isBlocked { VoDogBlockedBadge() }
             Spacer()
@@ -350,13 +355,26 @@ struct VoDogContactsView: View {
         let generation = listGeneration
         loading = true
         defer { if generation == listGeneration { loading = false } }
+        // S114: empty search browses every page in one call (server sorts Latin names first).
+        let browseAll = reset && VoDogContactDraft.trimmed(query) == nil
+        let pageSize = VoDogContactsLogic.contactsPageSize
         do {
-            let object = try await account.json("GET", "/contacts",
-                query: VoDogContactsLogic.contactsQuery(search: query, offset: reset ? 0 : contacts.count))
-            let page = try VoDogContactsLogic.decode(VoDogPage<VoDogContact>.self, from: object)
-            guard generation == listGeneration, query == search else { return }
-            contacts = reset ? page.items : contacts + page.items.filter { item in !contacts.contains { $0.id == item.id } }
-            hasMore = page.items.count >= VoDogContactsLogic.contactsPageSize
+            var items: [VoDogContact] = []
+            var seen = Set(reset ? [] : contacts.map(\.id))
+            var fetched = 0
+            var lastCount = 0
+            for _ in 0..<(browseAll ? VoDogContactsLogic.maxBrowsePages : 1) {
+                let object = try await account.json("GET", "/contacts",
+                    query: VoDogContactsLogic.contactsQuery(search: query, offset: (reset ? 0 : contacts.count) + fetched))
+                let page = try VoDogContactsLogic.decode(VoDogPage<VoDogContact>.self, from: object)
+                guard generation == listGeneration, query == search else { return }
+                fetched += page.items.count
+                lastCount = page.items.count
+                items += page.items.filter { seen.insert($0.id).inserted }
+                if lastCount < pageSize { break }
+            }
+            contacts = reset ? items : contacts + items
+            hasMore = !browseAll && lastCount >= pageSize
             listError = nil
             if selectedID == nil || !contacts.contains(where: { $0.id == selectedID }) && reset {
                 selectedID = contacts.first?.id

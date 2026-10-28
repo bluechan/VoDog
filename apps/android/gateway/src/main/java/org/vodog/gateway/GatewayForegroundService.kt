@@ -731,8 +731,8 @@ class GatewayForegroundService : Service() {
                 runCatching { audioLifecycle.reconcile(loop.token, mediaSetup, mediaProbe, loop.api) }
             }
         }
-        // S38 §4: deliberately outside the exact-call guard above, which by design never
-        // matches a call the user dialled on the Pixel. Synchronous like the Telecom sync.
+        // S38 §4 / S134: deliberately outside the exact-call guard above, which by design never
+        // matches a call dialled or answered on the Pixel. Synchronous like the Telecom sync.
         GatewayPassiveCallRecorder.reconcile(this, loop.api, telecom?.confirmedActiveCallIds.orEmpty())
         publishConnection(loop.runtime, ServerConnection.ONLINE, gatewayConnectionDetail(
             smsReady = inputs.smsReady,

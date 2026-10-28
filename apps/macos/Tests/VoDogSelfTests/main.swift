@@ -110,6 +110,11 @@ do {
     check(providers.items[1].disabledReason != nil && providers.items[1].displayLabel == "doubao", "partial provider disabled")
     let emptyList = try VoDogJSON.decode(VoDogVoiceProviderList.self, from: [:])
     check(emptyList.configVersion == 1, "empty list defaults")
+    check(providers.contactInstantAi == nil && emptyList.contactInstantAi == nil, "contactInstantAi absent → nil (toggle hidden)")
+    let instantOn = try VoDogJSON.decode(VoDogVoiceProviderList.self, from: object(#"{"items":[],"configVersion":2,"contactInstantAi":true}"#))
+    check(instantOn.contactInstantAi == true, "contactInstantAi true")
+    let instantOff = try VoDogJSON.decode(VoDogVoiceProviderList.self, from: object(#"{"items":[],"configVersion":2,"contactInstantAi":false}"#))
+    check(instantOff.contactInstantAi == false, "contactInstantAi false")
 
     let power = try VoDogJSON.decode(VoDogGatewayPower.self, from: object(#"{"gatewayId":"abcdef1234"}"#))
     check(!power.online && !power.controlEnabled && !power.remotePowerAllowed && !power.occupied, "power fails closed")
@@ -126,6 +131,33 @@ do {
 
     let error = VoDogAccount.apiError(status: 409, data: Data(#"{"error":{"code":"VERSION_CONFLICT","message":"x"}}"#.utf8))
     check(VoDogErrorText.isVersionConflict(error) && !VoDogErrorText.isProviderConflict(error), "error envelope")
+
+    // Gateway rename: trim, 1…120 UTF-16 units, PATCH request, 409/403 copy.
+    typealias R = VoDogGatewayRename
+    check(R.validName("  客厅 Pixel \n") == "客厅 Pixel", "rename trims both ends")
+    check(R.validName("") == nil && R.validName(" \n\t ") == nil, "rename rejects blank")
+    check(R.validName(String(repeating: "a", count: 120)) != nil, "rename accepts 120")
+    check(R.validName(String(repeating: "a", count: 121)) == nil, "rename rejects 121")
+    check(R.validName("  " + String(repeating: "a", count: 120) + "  ") != nil, "length counted after trim")
+    check(R.validName(String(repeating: "😀", count: 61)) == nil, "length counts UTF-16 like Control")
+    let renameRequest = R.request(gatewayId: "g1", name: " 新名 ")
+    check(renameRequest?.method == "PATCH" && renameRequest?.path == "/admin/gateways/g1"
+          && renameRequest?.body["name"] as? String == "新名", "rename request built")
+    check(R.request(gatewayId: "g1", name: "  ") == nil, "invalid name builds no request")
+    check(R.errorText(for: VoDogAPIError(status: 409, code: "gateway_name_taken", message: "x", body: Data())) == "已有同名网关",
+          "409 name taken")
+    check(R.errorText(for: VoDogAPIError(status: 409, code: "GATEWAY_NAME_TAKEN", message: nil, body: Data())) == "已有同名网关",
+          "409 code matched case-insensitively")
+    check(R.errorText(for: VoDogAPIError(status: 403, code: "FORBIDDEN", message: "x", body: Data())) == "需要管理员权限",
+          "403 needs admin")
+    check(R.errorText(for: VoDogAPIError(status: 404, code: "NOT_FOUND", message: "网关不存在", body: Data())) == "网关不存在",
+          "404 falls back to server message")
+    check(R.errorText(for: VoDogAPIError(status: 409, code: "VERSION_CONFLICT", message: nil, body: Data()))
+          == VoDogErrorText.text(for: VoDogAPIError(status: 409, code: "VERSION_CONFLICT", message: nil, body: Data())),
+          "other 409 codes keep the shared copy")
+    check(R.errorText(for: VoDogAPIError(status: 400, code: "INVALID_REQUEST", message: nil, body: Data())) == "请求失败（HTTP 400）",
+          "400 without message uses HTTP copy")
+    check(power.displayName == "GW-abcdef12", "displayName fallback unchanged")
 } catch {
     check(false, "decode threw \(error)")
 }
@@ -196,6 +228,11 @@ func accountTests() async {
             return auth == "Bearer new" ? (200, #"{"items":[]}"#) : (401, #"{"error":{"code":"UNAUTHENTICATED"}}"#)
         case ("DELETE", "/api/v1/passkeys/x"):
             return (204, "")
+        case ("PATCH", "/api/v1/admin/gateways/g1"):
+            let body = (try? JSONSerialization.jsonObject(with: StubProtocol.body(request))) as? [String: Any]
+            return body?["name"] as? String == "新名"
+                ? (200, #"{"id":"g1","name":"新名","kind":"pixel"}"#)
+                : (409, #"{"error":{"code":"gateway_name_taken","message":"taken"}}"#)
         case ("POST", "/api/v1/diag/events"):
             let items = (try? JSONSerialization.jsonObject(with: StubProtocol.body(request))) as? [[String: Any]] ?? []
             diagPosts.append(items.compactMap { $0["event"] as? String })
@@ -225,6 +262,20 @@ func accountTests() async {
 
     let deleted = try? await account.json("DELETE", "/passkeys/x")
     check(deleted?.isEmpty == true, "204 decodes to an empty object")
+
+    // Gateway rename goes through the same session: PATCH + bearer + trimmed JSON body; 409 maps to copy.
+    StubProtocol.log.removeAll()
+    let rename = VoDogGatewayRename.request(gatewayId: "g1", name: "  新名  ")!
+    let renamed = try? await account.json(rename.method, rename.path, body: rename.body)
+    check(renamed?["name"] as? String == "新名", "rename 200 (\(String(describing: renamed)))")
+    check(StubProtocol.log.first == "PATCH /api/v1/admin/gateways/g1 Bearer new", "rename uses session auth (\(StubProtocol.log))")
+    let taken = VoDogGatewayRename.request(gatewayId: "g1", name: "旧名")!
+    do {
+        _ = try await account.json(taken.method, taken.path, body: taken.body)
+        check(false, "409 must throw")
+    } catch {
+        check(VoDogGatewayRename.errorText(for: error) == "已有同名网关", "server 409 envelope maps to copy (\(error))")
+    }
 
     // Cancelled requests (tab switch) are neither logged nor surfaced as API errors.
     await account.flushDiag()
@@ -346,6 +397,19 @@ func badgeStoreTests() async {
     await badges.refresh()
     check(StubProtocol.log.isEmpty, "no poll while signed out")
 }
+
+// S96 shared short/full vectors.
+check(VoDogLocation.short("广东 深圳 · 移动") == "广东 深圳", "S96 short province city")
+check(VoDogLocation.short("北京 · 联通") == "北京", "S96 short municipality")
+check(VoDogLocation.short("加纳") == "加纳", "S96 short international")
+check(VoDogLocation.short("") == nil && VoDogLocation.short("  ") == nil
+      && VoDogLocation.short(nil) == nil, "S96 short blank → nil")
+check(VoDogLocation.full("广东 深圳 · 移动") == "广东 深圳 · 移动", "S96 full is the server string")
+check(VoDogLocation.full(" ") == nil && VoDogLocation.full(nil) == nil, "S96 full blank → nil")
+check(VoDogLocation.accessibilitySuffix(nil) == "" && VoDogLocation.accessibilitySuffix(" ") == "",
+      "S96 a11y suffix empty without location")
+check(VoDogLocation.accessibilitySuffix("北京 · 联通").hasPrefix("，")
+      && VoDogLocation.accessibilitySuffix("北京 · 联通").hasSuffix("北京"), "S96 a11y suffix uses short form")
 
 await accountTests()
 await badgeStoreTests()

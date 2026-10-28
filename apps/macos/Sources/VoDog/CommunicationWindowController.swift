@@ -2,43 +2,37 @@ import AppKit
 import SwiftUI
 
 enum PhoneWindowSection: String, CaseIterable, Identifiable {
+    case phone
     case messages
-    case dialer
-    case recents
+    case records
     case contacts
-    case recordings
-    case proxy
     case sim
-    case voDog
+    case proxy
     case settings
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .phone: return L10n.tr("电话")
         case .messages: return L10n.tr("短信")
-        case .dialer: return L10n.tr("拨号")
-        case .recents: return L10n.tr("最近通话")
+        case .records: return L10n.tr("记录")
         case .contacts: return L10n.tr("通讯录")
-        case .recordings: return L10n.tr("通话录音")
-        case .proxy: return L10n.tr("代理")
-        case .sim: return L10n.tr("SIM 卡")
-        case .voDog: return L10n.tr("VoDog")
+        case .sim: return L10n.tr("蜂窝模组")
+        case .proxy: return L10n.tr("网络与代理")
         case .settings: return L10n.tr("设置")
         }
     }
 
     var systemImage: String {
         switch self {
+        case .phone: return "phone"
         case .messages: return "message"
-        case .dialer: return "circle.grid.3x3.fill"
-        case .recents: return "clock.arrow.circlepath"
-        case .contacts: return "person.crop.circle"
-        case .recordings: return "waveform"
-        case .proxy: return "point.forward.to.point.capsulepath"
+        case .records: return "list.bullet.rectangle"
+        case .contacts: return "person"
         case .sim: return "simcard"
-        case .voDog: return "person.crop.circle.badge.checkmark"
-        case .settings: return "gearshape"
+        case .proxy: return "globe"
+        case .settings: return "slider.horizontal.3"
         }
     }
 }
@@ -46,6 +40,7 @@ enum PhoneWindowSection: String, CaseIterable, Identifiable {
 @MainActor
 final class PhoneWindowModel: ObservableObject {
     @Published var selection: PhoneWindowSection = .messages
+    @Published var settingsPane: SettingsPane = .appearance
     @Published private(set) var prefersFullCallPresentation = false
     @Published private(set) var pendingListFocusSection: PhoneWindowSection?
     @Published var dialNumber = ""
@@ -70,6 +65,10 @@ final class PhoneWindowModel: ObservableObject {
         onCallPresentationChange?()
     }
 
+    func consumeCallRecordRequest() {
+        requestedCallRecordID = nil
+    }
+
     func consumeListFocusRequest(for section: PhoneWindowSection) {
         guard pendingListFocusSection == section else { return }
         pendingListFocusSection = nil
@@ -88,7 +87,7 @@ final class PhoneWindowModel: ObservableObject {
         if let callRecordID {
             requestedCallRecordID = callRecordID
             selectedCallRecordID = callRecordID
-            selection = .recents
+            selection = .phone
             callRecordRequestSerial &+= 1
         }
         if let simModuleID {
@@ -98,7 +97,8 @@ final class PhoneWindowModel: ObservableObject {
         }
         if let number, !number.isEmpty {
             dialNumber = number
-            selection = .dialer
+            selectedCallRecordID = nil  // S139: the 电话 detail pane shows the dialer
+            selection = .phone
         }
     }
 }
@@ -127,7 +127,6 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
 
     private enum Kind: Hashable {
         case phone
-        case messages
     }
 
     let phoneModel = PhoneWindowModel()
@@ -188,16 +187,39 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
         callRecordID: CallHistoryRecord.ID? = nil,
         simModuleID: CellularModuleID? = nil
     ) {
+        // A local history id never matches a cloud row, so only a locally shown record is requested.
+        let localRecordID = callRecordID.flatMap { routeLineForCallRecord($0) ? $0 : nil }
         phoneModel.present(
             number: number,
-            section: section ?? (number == nil ? .recents : nil),
-            callRecordID: callRecordID,
+            section: section ?? (number == nil ? .phone : nil),
+            callRecordID: localRecordID,
             simModuleID: simModuleID
         )
-        if phoneModel.selection == .recents {
+        if phoneModel.selection == .phone {
             appState?.callHistory.acknowledgeMissedCalls()
         }
         show(.phone)
+    }
+
+    /// S139: a local call record opens 电话 on its line — the account SIM when its module serves one
+    /// (cloud list), else this Mac's module (local list with the record selected). Returns true when the
+    /// record will be shown in the local list.
+    private func routeLineForCallRecord(_ id: CallHistoryRecord.ID) -> Bool {
+        guard let appState else { return false }
+        guard appState.voDog.user != nil else { return true }  // signed out → always the local route
+        guard let moduleID = appState.callHistory.records.first(where: { $0.id == id })?.moduleID else {
+            return appState.localOnlyModule(storedLine: UserDefaults.standard.string(forKey: VoDogLinePolicy.localLineKey) ?? "") != nil
+        }
+        let defaults = UserDefaults.standard
+        if appState.localOnlyModules.contains(where: { $0.id == moduleID }) {
+            defaults.set(moduleID.rawValue, forKey: VoDogLinePolicy.localLineKey)
+            return true
+        }
+        defaults.set("", forKey: VoDogLinePolicy.localLineKey)
+        if let simID = appState.gatewayRuntime(for: moduleID)?.sim?.id {
+            defaults.set(simID, forKey: "VoDogPhone.sim.v1")
+        }
+        return false
     }
 
     func showMessages(
@@ -255,28 +277,10 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
                         .cellDockLanguageEnvironment()
                     )
                 )
-            case .messages:
-                hostingController = NSHostingController(
-                    rootView: AnyView(
-                        // S57: signed in to VoDog → the account's SIMs; signed out → the local module.
-                        VoDogPhoneRoute(account: appState.voDog) {
-                            MessagesWindowView(
-                                model: self.messagesModel,
-                                contacts: SystemContactStore.shared,
-                                sidebarWidth: .constant(CommunicationUI.sidebarWidth)
-                            )
-                            .environmentObject(appState)
-                        } remote: {
-                            VoDogMessagesView(account: appState.voDog,
-                                                     sidebarWidth: .constant(CommunicationUI.sidebarWidth))
-                        }
-                        .cellDockLanguageEnvironment()
-                    )
-                )
             }
 
             window = NSWindow(contentViewController: hostingController)
-            window.title = kind == .phone ? communicationWindowTitle : L10n.tr("短信")
+            window.title = communicationWindowTitle
             window.styleMask = [
                 .titled,
                 .closable,
@@ -303,18 +307,12 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
                 window.minSize = NSSize(width: 940, height: 560)
                 window.setContentSize(NSSize(width: 1000, height: 640))
                 window.setFrameAutosaveName("VoDogCommunicationWindow.v6")
-            case .messages:
-                window.minSize = NSSize(width: 680, height: 480)
-                window.setContentSize(NSSize(width: 720, height: 500))
-                window.setFrameAutosaveName("VoDogMessagesWindow.v4")
             }
             window.center()
             windows[kind] = window
         }
 
-        if kind == .phone {
-            window.title = communicationWindowTitle
-        }
+        window.title = communicationWindowTitle
 
         NSApplication.shared.setActivationPolicy(.regular)
         window.makeKeyAndOrderFront(nil)
@@ -330,7 +328,6 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
 
     @objc private func appLanguageDidChange() {
         windows[.phone]?.title = communicationWindowTitle
-        windows[.messages]?.title = L10n.tr("短信")
     }
 
     @objc private func appActivationDidChange() {
@@ -338,15 +335,7 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
     }
 
     private var communicationWindowTitle: String {
-        switch phoneModel.selection {
-        case .messages: return L10n.tr("短信")
-        case .recents, .dialer, .contacts: return L10n.tr("最近通话")
-        case .recordings: return L10n.tr("通话录音")
-        case .proxy: return L10n.tr("代理")
-        case .sim: return L10n.tr("SIM 卡")
-        case .voDog: return L10n.tr("VoDog")
-        case .settings: return L10n.tr("设置")
-        }
+        phoneModel.selection.title
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -355,7 +344,6 @@ final class CommunicationWindowController: NSObject, NSWindowDelegate {
             self.updateCallIslandVisibility()
             guard
                   !self.hasVisibleWindows,
-                  !MainWindowController.shared.isVisible,
                   !StandaloneFlowWindowController.shared.hasVisibleWindows,
                   !InitialSetupWindowController.shared.isVisible else {
                 return

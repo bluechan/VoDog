@@ -112,7 +112,21 @@ check(Logic.gatewayTime(nil, timeZone: nil) == "—", "missing time")
 
 // Queries.
 check(Logic.interceptionsQuery(page: 0, kind: "sms") == ["page": "1", "pageSize": "50", "kind": "sms"], "interceptions query")
-check(Logic.contactsQuery(search: "  ", offset: 200) == ["limit": "200", "offset": "200"], "blank search omitted")
+check(Logic.contactsQuery(search: "  ", offset: 200) == ["limit": "500", "offset": "200"], "blank search omitted")
+check(Logic.contactsQuery(search: "", offset: 500)["offset"] == "500", "browse offset")
 check(Logic.contactsQuery(search: " 张 ", offset: 0)["query"] == "张", "search trimmed")
+
+// S96: optional location on contact phones and remoteLocation on interceptions.
+do {
+    let contact = try Logic.decode(VoDogContact.self, from: [
+        "id": "c", "displayName": "张三",
+        "phones": [["id": "p1", "rawNumber": "2025550123", "location": "北京 · 联通"], ["id": "p2", "rawNumber": "10086"]],
+    ] as [String: Any])
+    check(contact.phones.map(\.location) == ["北京 · 联通", nil], "S96 phone location decode")
+    let page = try Logic.decode(VoDogPage<VoDogInterception>.self, from: [
+        "items": [["id": "i1", "kind": "call", "remoteLocation": "广东 深圳 · 移动"], ["id": "i2", "kind": "sms"]],
+    ] as [String: Any])
+    check(page.items.map(\.remoteLocation) == ["广东 深圳 · 移动", nil], "S96 interception remoteLocation decode")
+} catch { check(false, "S96 decode threw \(error)") }
 
 print("VoDogContactsSelfTests passed")

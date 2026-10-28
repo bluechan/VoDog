@@ -36,6 +36,10 @@ enum AlertSoundKind: String, CaseIterable, Identifiable {
     fileprivate var customDisplayNameKey: String {
         "VoDog.AlertSound.\(rawValue).displayName.v1"
     }
+
+    fileprivate var mutedKey: String {
+        "VoDog.AlertSound.\(rawValue).muted.v1"
+    }
 }
 
 enum AlertSoundServiceError: LocalizedError {
@@ -83,15 +87,29 @@ final class AlertSoundService: ObservableObject {
         return customSoundURL(for: kind) == nil
     }
 
+    func isEnabled(_ kind: AlertSoundKind) -> Bool {
+        _ = configurationRevision
+        return !defaults.bool(forKey: kind.mutedKey)
+    }
+
+    func setEnabled(_ enabled: Bool, for kind: AlertSoundKind) {
+        defaults.set(!enabled, forKey: kind.mutedKey)
+        configurationRevision &+= 1
+        if !enabled {
+            if kind == .incomingCall { stopIncomingRingtone() } else { messagePlayer?.stop() }
+        }
+    }
+
     func playMessageAlert() {
-        guard let url = soundURL(for: .message) else { return }
+        guard isEnabled(.message), let url = soundURL(for: .message) else { return }
         messagePlayer?.stop()
         messagePlayer = makePlayer(url: url, numberOfLoops: 0)
         messagePlayer?.play()
     }
 
     func startIncomingRingtone() {
-        guard ringtonePlayer?.isPlaying != true,
+        guard isEnabled(.incomingCall),
+              ringtonePlayer?.isPlaying != true,
               let url = soundURL(for: .incomingCall) else { return }
         ringtonePlayer = makePlayer(url: url, numberOfLoops: -1)
         ringtonePlayer?.play()

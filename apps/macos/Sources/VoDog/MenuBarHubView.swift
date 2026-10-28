@@ -201,7 +201,7 @@ struct MenuBarHubView: View {
             onDismiss()
             return
         }
-        transition { appState.showPhoneWindow(number: text.isEmpty ? nil : text, section: .dialer) }
+        transition { appState.showPhoneWindow(number: text.isEmpty ? nil : text, section: .phone) }
     }
 
     // MARK: Latest verification code
@@ -235,6 +235,7 @@ struct MenuBarHubView: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(code, forType: .string)
                 codeCopied = true
+                appState.markRead(message)
             } label: {
                 Label(codeCopied ? L10n.tr("已复制") : L10n.tr("复制"),
                       systemImage: codeCopied ? "checkmark" : "doc.on.doc")

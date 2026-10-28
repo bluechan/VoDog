@@ -36,15 +36,19 @@ struct MessagesWindowView: View {
                     )
                     .environmentObject(appState)
                 } else {
-                    ContentUnavailableView(
-                        L10n.tr("选择一段对话"),
-                        systemImage: "message",
-                        description: Text(L10n.tr("选择左侧会话，或新建短信。"))
-                    )
+                    ContentUnavailableView {
+                        VoDogIllustration("sms-empty", width: 140, fallbackSystemImage: "message")
+                        Text(L10n.tr("选择一段对话")).font(.headline)
+                    } description: {
+                        Text(L10n.tr("选择左侧会话，或新建短信。"))
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .communicationDetailColumnStyle()
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VoDogSyncBanner(gateway: appState.gateway, account: appState.voDog)
         }
         .onAppear {
             if contacts.authorizationState == .notDetermined {
@@ -79,7 +83,12 @@ struct MessagesWindowView: View {
             HStack(spacing: 8) {
                 Text(L10n.tr("短信")).font(.headline)
                 Spacer(minLength: 6)
-                moduleMenu
+                // S139: signed in, this page is a local-only line; the line popup switches back to an account SIM.
+                if appState.voDog.user != nil {
+                    VoDogLineMenu(account: appState.voDog)
+                } else {
+                    moduleMenu
+                }
                 Button(action: beginNewMessage) {
                     Image(systemName: "square.and.pencil").frame(width: 28, height: 28)
                 }
@@ -465,6 +474,7 @@ private struct MessageThreadView: View {
                 .frame(maxWidth: 760)
                 .frame(maxWidth: .infinity)
             }
+            .smsLinkConfirmHost()
             .onAppear {
                 if let target = validScrollTarget {
                     proxy.scrollTo(target, anchor: .center)
@@ -593,6 +603,32 @@ private struct MessageThreadView: View {
     }
 }
 
+/// S88: the local page deletes on this Mac only; server-synced delete/multi-select needs the VoDog page.
+private struct VoDogSyncBanner: View {
+    @EnvironmentObject private var appState: AppState
+    @ObservedObject var gateway: GatewayAgent
+    @ObservedObject var account: VoDogAccount
+
+    var body: some View {
+        if gateway.isEnabled, account.user == nil {
+            HStack(spacing: 8) {
+                Label(L10n.tr("登录 VoDog 后，短信的删除与多选会与其他端同步"), systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button(L10n.tr("登录")) { appState.showSettings(.account) }
+                    .controlSize(.small)
+                    .accessibilityLabel(L10n.tr("登录"))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .adaptiveGlassSurface(cornerRadius: 10, treatment: .clear, tint: Color.blue.opacity(0.08))
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+        }
+    }
+}
+
 private struct MessageBubble: View {
     @EnvironmentObject private var appState: AppState
     let message: SMSMessage
@@ -602,12 +638,14 @@ private struct MessageBubble: View {
             if message.isOutgoing { Spacer(minLength: 70) }
 
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 4) {
-                Text(verbatim: (message.body.isEmpty ? L10n.tr("（空短信）") : message.body))
-                    .textSelection(.enabled)
+                SMSBodyText(text: message.body.isEmpty ? L10n.tr("（空短信）") : message.body,
+                            color: message.isOutgoing ? Color.white : Signal.ink, linked: true)
                     .signalBubble(outgoing: message.isOutgoing)
 
                 if let code = message.verificationCode, !message.isOutgoing {
-                    CopyCodeButton(code: code)
+                    CopyCodeButton(code: code) {
+                        appState.markRead(message)
+                    }
                 }
 
                 if message.isOutgoing {

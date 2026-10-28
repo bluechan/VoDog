@@ -18,13 +18,13 @@ struct RecordsView: View {
     @State private var callsError: String?
     @State private var callsSnapshotCaption: String?
     @State private var callQuery = ""
-    /// S26. The three segments' paging state lives here, not in the lists: 拦截记录 is rebuilt from scratch on
-    /// every segment switch, and 报告's list is too, so a page kept inside either would silently snap back to 1.
-    @State private var callsPaging = RecordsPagingStore()
-    @State private var reportPaging = RecordsPagingStore()
-    @State private var interceptionsPaging = RecordsPagingStore()
-    @State private var callsRequest = RecordsRequestKey()
-    @State private var reportRequest = RecordsRequestKey()
+    /// S133: 全部通话 scrolls instead of paging. `callsScope` names the account and search the loaded rows belong
+    /// to — a head for anything else replaces them instead of merging, and no next chunk is asked for them.
+    @State private var callsScope: String?
+    @State private var callsReachedEnd = false
+    @State private var callsLoadingMore = false
+    /// 拦截记录 is rebuilt from scratch on every segment switch, so its 类型 filter lives here to survive one.
+    @State private var interceptionsKind = InterceptionKindFilter.all
     @State private var callsLoadGeneration = 0
     @State private var reportLoadGeneration = 0
 
@@ -32,6 +32,10 @@ struct RecordsView: View {
     @State private var reportItems: [CallReportItem] = []
     @State private var reportLoaded = false
     @State private var reportLoading = false
+    /// S133: same shape as 全部通话 — the scope the loaded cards belong to, and where the scroll stands.
+    @State private var reportScope: String?
+    @State private var reportReachedEnd = false
+    @State private var reportLoadingMore = false
     @State private var reportError: String?
     @State private var reportSnapshotCaption: String?
     @State private var reportQuery = ""
@@ -62,6 +66,7 @@ struct RecordsView: View {
         let timeZone: String?
         var originatingPlatform: String? = nil
         var ownerJoinedLocal = false
+        var answeredByPlatform: String? = nil
         /// S58: 报告卡打开录音时也按网关类型标注设备归档（DJI 4G 而非 Pixel）。
         var gatewayKind: String? = nil
         var id: String { "\(callID)\u{001f}\(kind)" }
@@ -91,10 +96,13 @@ struct RecordsView: View {
             ?? ReportDateRangePolicy.ordered(from: customFrom, to: customTo)
     }
 
-    /// What 全部通话 is listing, page aside. A change here — today only the debounced search text, plus the
-    /// `simId` the server route already accepts — makes the current page meaningless and starts over at 1.
+    /// What 全部通话 is listing. A change here — today only the debounced search text — starts over at the head.
     private var callContentKey: String {
         RecordSearchPolicy.trimmed(callQuery)
+    }
+
+    private func callsScopeKey(_ identity: UUID, _ content: String) -> String {
+        "\(identity.uuidString)\u{001f}\(content)"
     }
 
     /// Every input the report request depends on, so `.task(id:)` reloads on a preset, a custom date or a
@@ -129,7 +137,7 @@ struct RecordsView: View {
                 switch tab {
                 case .calls: callList
                 case .reports: reportList
-                case .interceptions: InterceptionsView(embedded: true, paging: interceptionsPaging)
+                case .interceptions: InterceptionsView(embedded: true, kind: $interceptionsKind)
                 }
             }
             .background(Signal.bg)
@@ -137,7 +145,7 @@ struct RecordsView: View {
             .toolbarTitleDisplayMode(.inlineLarge)
             // The calls list is also what names the gateway time zone the report window is read in, so it loads
             // for every segment rather than only when 全部通话 is on screen.
-            .task(id: callsRequest) { await loadCalls(debounced: callsRequest.debounced) }
+            .task(id: callContentKey) { await loadCalls() }
             .task(id: "\(session.sessionIdentity?.uuidString ?? "none"):\(navigation.tab):\(scenePhase)") {
                 guard navigation.tab == .records, scenePhase == .active else { return }
                 await loadAll()
@@ -146,18 +154,6 @@ struct RecordsView: View {
                     await loadAll()
                 }
             }
-            // S26: the content keys reset to page 1 and keep the 350 ms debounce; a page or page-size change
-            // asks for the new page at once, which is why the flag is written into the key instead of derived.
-            .onChange(of: callContentKey) { old, new in
-                reloadCalls(content: new, reset: RecordsPagingPolicy.resetsPage(oldKey: old, newKey: new))
-            }
-            .onChange(of: callsPaging.page) { _, page in turnCallsPage(to: page) }
-            .onChange(of: callsPaging.pageSize) { _, size in resizeCalls(to: size) }
-            .onChange(of: reportKey) { old, new in
-                reloadReport(reset: RecordsPagingPolicy.resetsPage(oldKey: old, newKey: new))
-            }
-            .onChange(of: reportPaging.page) { _, page in turnReportPage(to: page) }
-            .onChange(of: reportPaging.pageSize) { _, size in resizeReport(to: size) }
             .confirmationDialog(
                 HistoryRowActionPolicy.blockConfirmationTitle,
                 isPresented: Binding(
@@ -192,7 +188,8 @@ struct RecordsView: View {
                         RecordingRecordView(callID: target.callID, gatewayTimeZone: target.timeZone,
                                             gatewayKind: target.gatewayKind,
                                             originatingPlatform: target.originatingPlatform,
-                                            ownerJoinedLocal: target.ownerJoinedLocal)
+                                            ownerJoinedLocal: target.ownerJoinedLocal,
+                                            answeredByPlatform: target.answeredByPlatform)
                     case .aiConversation:
                         AiConversationRecordView(callID: target.callID, gatewayTimeZone: target.timeZone)
                     }
@@ -220,7 +217,7 @@ struct RecordsView: View {
         List {
             Group {
             if let callsSnapshotCaption, RecordSearchPolicy.showsSnapshotCaption(
-                query: callQuery, page: callsPaging.page, stale: callsError != nil || !availability.canMutate
+                query: callQuery, stale: callsError != nil || !availability.canMutate
             ) {
                 Text(callsSnapshotCaption).font(.caption).foregroundStyle(.secondary)
             }
@@ -242,12 +239,21 @@ struct RecordsView: View {
                             .accessibilityIdentifier("records.callDetail")
                             // §F: the contact card stays one long-press / swipe away instead of a per-row (i).
                             .accessibilityAction(named: Text("联系人卡片")) { card = ContactCardTarget(call: call) }
+                            .onAppear {
+                                if CallsScrollPolicy.isNearEnd(call.id, in: calls) { Task { await loadMoreCalls() } }
+                            }
                         .contextMenu {
                             Button("联系人卡片", systemImage: "person.crop.circle") { card = ContactCardTarget(call: call) }
                             historyActions(for: call)
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) { historyActions(for: call) }
                     }
+                }
+            }
+            if callsLoadingMore {
+                Section {
+                    HStack { ProgressView(); Text("正在读取更早的通话…") }
+                        .accessibilityIdentifier("records.calls.loadingMore")
                 }
             }
             if let callsError {
@@ -261,8 +267,14 @@ struct RecordsView: View {
         }
         .signalList()
         .searchable(text: Binding(get: { callQuery }, set: { if availability.canMutate { callQuery = $0 } }), prompt: RecordSearchPolicy.searchPrompt)
-        // 下拉刷新 re-reads the page that is on screen; it is a refresh, not a jump back to the first page.
-        .refreshable { await loadCalls(debounced: false) }
+        // S133: 下拉刷新 goes back to the head. The appended rows are dropped before the request, so whichever
+        // head answers next — this one or the poll's — merges over the first chunk only.
+        .refreshable {
+            if calls.count > CallsScrollPolicy.chunk {
+                calls = Array(calls.prefix(CallsScrollPolicy.chunk)); callsReachedEnd = false
+            }
+            await loadCalls(debounced: false)
+        }
         .confirmationDialog(
             RecordDeletePolicy.confirmTitle,
             isPresented: Binding(
@@ -281,15 +293,14 @@ struct RecordsView: View {
             Text(RecordDeletePolicy.confirmMessage)
             if let reason = availability.reason { Text(reason) }
         }
-        .safeAreaInset(edge: .bottom) { PagerBar(store: callsPaging).disabled(!availability.canMutate || callsError != nil) }
     }
 }
 
 /// §F: a blocked row leads with the block icon, the number carries the matched contact name, and the state
 /// stays on the right. `contactName` is absent on a pre-S21 Control, which simply prints the number alone.
 ///
-/// Its own view so the paged list can be previewed without a session.
-/// S95: the records list is grouped by gateway-local day (今天 / 昨天 / M月d日), page order kept.
+/// Its own view so the list can be previewed without a session.
+/// S95: the records list is grouped by gateway-local day (今天 / 昨天 / M月d日), list order kept.
 struct RecordDaySection {
     let title: String
     var calls: [CallRecord]
@@ -483,7 +494,7 @@ extension RecordsView {
             Group {
             Section { dateControl.disabled(!availability.canMutate) }
             if let reportSnapshotCaption, RecordSearchPolicy.showsSnapshotCaption(
-                query: reportQuery, page: reportPaging.page, stale: reportError != nil || !availability.canMutate
+                query: reportQuery, stale: reportError != nil || !availability.canMutate
             ) {
                 Text(reportSnapshotCaption).font(.caption).foregroundStyle(.secondary)
             }
@@ -510,7 +521,15 @@ extension RecordsView {
                         Text("这段时间内的每通电话都会出现在这里。").font(.footnote).foregroundStyle(.secondary)
                     }
                 } else if !reportItems.isEmpty {
-                    ForEach(reportItems) { item in reportCard(item) }
+                    ForEach(reportItems) { item in
+                        reportCard(item).onAppear {
+                            if RecordsScrollPolicy.isNearEnd(item.id, in: reportItems) { Task { await loadMoreReport() } }
+                        }
+                    }
+                }
+                if reportLoadingMore {
+                    HStack { ProgressView(); Text("正在读取更早的报告…") }
+                        .accessibilityIdentifier("records.report.loadingMore")
                 }
             }
             }
@@ -518,9 +537,15 @@ extension RecordsView {
         }
         .signalList()
         .searchable(text: Binding(get: { reportQuery }, set: { if availability.canMutate { reportQuery = $0 } }), prompt: RecordSearchPolicy.searchPrompt)
-        .refreshable { await loadReport(debounced: false) }
-        .task(id: reportRequest) { await loadReport(debounced: reportRequest.debounced) }
-        .safeAreaInset(edge: .bottom) { PagerBar(store: reportPaging).disabled(!availability.canMutate || reportError != nil) }
+        // S133: 下拉刷新 goes back to the head, exactly as 全部通话 does.
+        .refreshable {
+            if reportItems.count > RecordsScrollPolicy.chunk {
+                reportItems = Array(reportItems.prefix(RecordsScrollPolicy.chunk)); reportReachedEnd = false
+            }
+            await loadReport(debounced: false)
+        }
+        // A new window or search text starts over at the head, debounced because it is usually a keystroke.
+        .task(id: reportKey) { await loadReport() }
     }
 
     @ViewBuilder private var dateControl: some View {
@@ -696,7 +721,8 @@ extension RecordsView {
                 markReportSeen(item)
                 sheetTarget = RecordSheet(callID: item.callId, kind: .recording, timeZone: item.gatewayTimeZone,
                                           originatingPlatform: item.originatingPlatform,
-                                          ownerJoinedLocal: item.ownerJoinedLocal, gatewayKind: item.gatewayKind)
+                                          ownerJoinedLocal: item.ownerJoinedLocal, answeredByPlatform: item.answeredByPlatform,
+                                          gatewayKind: item.gatewayKind)
             } label: {
                 Text("查看录音").frame(minHeight: 44).contentShape(Rectangle())
             }
@@ -792,8 +818,8 @@ extension RecordsView {
     }
 
     /// S30 §1.1. `DELETE /calls/:id` answers 204 and takes the recording, the transcript and the report entry
-    /// with it, so the row, the report card and the page count are all corrected locally before the reload — the
-    /// list must not flash the deleted row back while the request that proves it is gone is in flight.
+    /// with it, so the row and the report card are dropped locally. S133: 全部通话 has no page count to correct
+    /// and is not re-read — the list stays where the user scrolled to.
     private func deleteCall(_ call: CallRecord) async {
         guard availability.canMutate else { return }
         guard let identity = session.sessionIdentity else { return }
@@ -808,20 +834,10 @@ extension RecordsView {
             )
             guard session.isCurrentSession(identity), deleteBusyID == id else { return }
             calls = RecordDeletePolicy.callsAfterDelete(calls, id: id)
+            // A head sent before the delete would still carry the row and merge it back; void it.
+            callsLoadGeneration += 1
             reportItems = RecordDeletePolicy.reportItemsAfterDelete(reportItems, callID: id)
             callsError = nil
-            let total = RecordDeletePolicy.totalAfterDelete(callsPaging.total)
-            let totalPages = RecordDeletePolicy.totalPagesAfterDelete(
-                total: total, totalPages: callsPaging.totalPages, pageSize: callsPaging.pageSize
-            )
-            let before = callsPaging.page
-            callsPaging.apply(
-                page: RecordDeletePolicy.pageAfterDelete(page: before, totalPages: totalPages),
-                total: total, totalPages: totalPages, requestedPage: before
-            )
-            // Deleting the last row of the last page rewinds a page, and `.onChange(of: callsPaging.page)` already
-            // asks for the new one. Only an unchanged page still needs a reload of its own.
-            if callsPaging.page == before { await loadCalls(debounced: false) }
             // 报告 is driven by `call_records`, so the deleted call is gone from it too. Dropping the card locally
             // is not enough: its own 共 N 条 would stay one too high until the next report request, so a report
             // that has already been read is re-read here — the same rule Android's `deleteCall` follows.
@@ -838,50 +854,79 @@ extension RecordsView {
 
     private func loadAll() async { await loadCalls(debounced: false); await loadReport(debounced: false) }
 
+    /// The head of 全部通话: the first load, a search change, the poll and 下拉刷新 all come through here. It is
+    /// merged over the rows already loaded for the same account and search, and replaces anything else.
     private func loadCalls(debounced: Bool = true) async {
-        let requestedQuery = callQuery
-        let requestedPageSize = callsPaging.pageSize
+        let requestedKey = callContentKey
         guard let identity = session.sessionIdentity else { return }
         // The same debounce the contacts list uses: one request per pause, not per keystroke.
-        if debounced, !RecordSearchPolicy.trimmed(requestedQuery).isEmpty {
+        if debounced, !requestedKey.isEmpty {
             do { try await Task.sleep(for: RecordSearchPolicy.debounce) } catch { return }
         }
-        let requestedPage = callsPaging.page
         callsLoadGeneration += 1
         let generation = callsLoadGeneration
+        let scope = callsScopeKey(identity, requestedKey)
         do {
             let result: PagedEnvelope<CallRecord> = try await session.request(
                 "calls",
                 requiredSessionIdentity: identity,
-                queryItems: RecordSearchPolicy.callsQuery(
-                    query: requestedQuery, page: requestedPage, pageSize: requestedPageSize
-                )
+                queryItems: RecordSearchPolicy.callsQuery(query: requestedKey)
             )
             guard !Task.isCancelled, generation == callsLoadGeneration, session.isCurrentSession(identity),
-                  callQuery == requestedQuery, callsPaging.page == requestedPage,
-                  callsPaging.pageSize == requestedPageSize else { return }
-            // Rows first, paging second: `apply` can lower the page (page 9 of a result that shrank to 3), which
-            // cancels this task and starts the next one — the rows it just showed must already be on screen.
-            calls = result.items; callsError = nil; callsLoaded = true
-            callsSnapshotCaption = "已加载：\(requestedQuery.isEmpty ? "全部通话" : requestedQuery) · 第 \(result.page ?? requestedPage) 页"
-            callsPaging.apply(
-                page: result.page, total: result.total, totalPages: result.totalPages, requestedPage: requestedPage
+                  callContentKey == requestedKey else { return }
+            // Merged against the rows as they are now, not as they were when the request left: a chunk that
+            // was appended meanwhile stays.
+            let feed = CallsScrollPolicy.afterHead(
+                result.items, loaded: callsScope == scope ? calls : [], reachedEnd: callsReachedEnd
             )
+            calls = feed.calls; callsReachedEnd = feed.reachedEnd; callsScope = scope
+            callsError = nil; callsLoaded = true
+            callsSnapshotCaption = "已加载：\(requestedKey.isEmpty ? "全部通话" : requestedKey)"
         } catch SessionLifecycleError.staleSession {
             return
         } catch {
             guard !Task.isCancelled, generation == callsLoadGeneration, session.isCurrentSession(identity),
-                  callQuery == requestedQuery, callsPaging.page == requestedPage,
-                  callsPaging.pageSize == requestedPageSize else { return }
-            if calls.isEmpty { callsPaging.clearPaging() }
+                  callContentKey == requestedKey else { return }
             callsError = error.localizedDescription; callsLoaded = true
         }
     }
 
+    /// S133: the next chunk, asked for when a row near the end appears. One at a time; a failure keeps the rows
+    /// and is retried by the next such row appearing, never by itself. The head's generation is deliberately
+    /// not checked — a 5 s poll would otherwise void every chunk on a slow link — so the answer is appended
+    /// only if the list still ends on the row the cursor was taken from.
+    private func loadMoreCalls() async {
+        guard availability.canMutate, !callsLoadingMore, !callsReachedEnd,
+              let identity = session.sessionIdentity,
+              let cursor = CallsScrollPolicy.cursor(after: calls) else { return }
+        let requestedKey = callContentKey
+        let scope = callsScopeKey(identity, requestedKey)
+        guard callsScope == scope else { return }
+        callsLoadingMore = true
+        defer { callsLoadingMore = false }
+        do {
+            let result: PagedEnvelope<CallRecord> = try await session.request(
+                "calls",
+                requiredSessionIdentity: identity,
+                queryItems: RecordSearchPolicy.callsQuery(query: requestedKey, cursor: cursor)
+            )
+            guard session.isCurrentSession(identity), callsScope == scope,
+                  calls.last?.id == cursor.beforeId else { return }
+            let feed = CallsScrollPolicy.afterChunk(result.items, loaded: calls)
+            calls = feed.calls; callsReachedEnd = feed.reachedEnd; callsError = nil
+        } catch SessionLifecycleError.staleSession {
+            return
+        } catch {
+            guard session.isCurrentSession(identity), callsScope == scope else { return }
+            callsError = error.localizedDescription
+        }
+    }
+
+    /// The head of 报告 (page 1): merged over the cards already loaded for the same account, window and search,
+    /// and replacing anything else.
     private func loadReport(debounced: Bool = true) async {
         let requestedKey = reportKey
         let requestedQuery = reportQuery
-        let requestedPageSize = reportPaging.pageSize
         guard let identity = session.sessionIdentity else { return }
         if debounced, !RecordSearchPolicy.trimmed(requestedQuery).isEmpty {
             do { try await Task.sleep(for: RecordSearchPolicy.debounce) } catch { return }
@@ -891,9 +936,9 @@ extension RecordsView {
             if !Task.isCancelled, session.isCurrentSession(identity) { reportLoading = false }
         }
         let range = reportRange
-        let requestedPage = reportPaging.page
         reportLoadGeneration += 1
         let generation = reportLoadGeneration
+        let scope = callsScopeKey(identity, requestedKey)
         do {
             let result: CallReportEnvelope = try await session.request(
                 "reports/calls",
@@ -903,87 +948,63 @@ extension RecordsView {
                     to: ReportDateRangePolicy.day(range.to, timeZone: reportZone),
                     timeZone: reportTimeZone,
                     query: requestedQuery,
-                    page: requestedPage,
-                    pageSize: requestedPageSize
+                    page: 1
                 )
             )
             guard !Task.isCancelled, generation == reportLoadGeneration, session.isCurrentSession(identity),
-                  reportKey == requestedKey, reportPaging.page == requestedPage,
-                  reportPaging.pageSize == requestedPageSize else { return }
-            // Same order as 全部通话: the cards land before `apply` is allowed to re-key the task.
-            reportItems = result.items; reportLoaded = true
-            reportSnapshotCaption = "已加载：\(ReportDateRangePolicy.day(range.from, timeZone: reportZone)) 至 \(ReportDateRangePolicy.day(range.to, timeZone: reportZone)) · \(requestedQuery.isEmpty ? "全部" : requestedQuery) · 第 \(result.page) 页"
-            reportPaging.apply(
-                page: result.page, total: result.total, totalPages: result.totalPages, requestedPage: requestedPage
+                  reportKey == requestedKey else { return }
+            reportItems = RecordsScrollPolicy.afterHead(result.items, loaded: reportScope == scope ? reportItems : [])
+            reportReachedEnd = RecordsScrollPolicy.reachedEnd(
+                loadedCount: reportItems.count, total: result.supported ? result.total : nil, answered: result.items.count
             )
+            reportScope = scope; reportLoaded = true
+            reportSnapshotCaption = "已加载：\(ReportDateRangePolicy.day(range.from, timeZone: reportZone)) 至 \(ReportDateRangePolicy.day(range.to, timeZone: reportZone)) · \(requestedQuery.isEmpty ? "全部" : requestedQuery)"
         } catch SessionLifecycleError.staleSession {
             return
         } catch {
             guard !Task.isCancelled, generation == reportLoadGeneration, session.isCurrentSession(identity),
-                  reportKey == requestedKey, reportPaging.page == requestedPage,
-                  reportPaging.pageSize == requestedPageSize else { return }
+                  reportKey == requestedKey else { return }
             reportLoaded = true
             reportError = error.localizedDescription
         }
     }
 
-    // MARK: - 分页
-
-    /// A content change: back to page 1, and still debounced because it is usually a keystroke.
-    private func reloadCalls(content: String, reset: Bool) {
-        if reset { callsPaging.goToFirstPage() }
-        callsRequest = RecordsRequestKey(
-            content: content, page: callsPaging.page, pageSize: callsPaging.pageSize, debounced: true
-        )
+    /// S133: the next 50 cards, asked for when a card near the end appears. Same guards as `loadMoreCalls`:
+    /// one at a time, appended only if the list still ends on the card the page was computed against, and a
+    /// chunk that adds nothing simply waits for the next card to appear or the next head.
+    private func loadMoreReport() async {
+        guard availability.canMutate, !reportLoadingMore, !reportReachedEnd,
+              let identity = session.sessionIdentity else { return }
+        let scope = callsScopeKey(identity, reportKey)
+        guard reportScope == scope, let last = reportItems.last?.id else { return }
+        reportLoadingMore = true
+        defer { reportLoadingMore = false }
+        let range = reportRange
+        do {
+            let result: CallReportEnvelope = try await session.request(
+                "reports/calls",
+                requiredSessionIdentity: identity,
+                queryItems: RecordSearchPolicy.reportQuery(
+                    from: ReportDateRangePolicy.day(range.from, timeZone: reportZone),
+                    to: ReportDateRangePolicy.day(range.to, timeZone: reportZone),
+                    timeZone: reportTimeZone,
+                    query: reportQuery,
+                    page: RecordsScrollPolicy.nextPage(loadedCount: reportItems.count)
+                )
+            )
+            guard session.isCurrentSession(identity), reportScope == scope, reportItems.last?.id == last else { return }
+            reportItems = RecordsScrollPolicy.afterChunk(result.items, loaded: reportItems)
+            reportReachedEnd = RecordsScrollPolicy.reachedEnd(
+                loadedCount: reportItems.count, total: result.supported ? result.total : nil, answered: result.items.count
+            )
+            reportError = nil
+        } catch SessionLifecycleError.staleSession {
+            return
+        } catch {
+            guard session.isCurrentSession(identity), reportScope == scope else { return }
+            reportError = error.localizedDescription
+        }
     }
-
-    /// A page turn is a deliberate tap, so it goes out at once. The guard is what keeps the page-1 reset a
-    /// content change just wrote from being re-sent undebounced.
-    private func turnCallsPage(to page: Int) {
-        guard page != callsRequest.page else { return }
-        callsRequest = RecordsRequestKey(
-            content: callContentKey, page: page, pageSize: callsPaging.pageSize, debounced: false
-        )
-    }
-
-    private func resizeCalls(to pageSize: Int) {
-        callsPaging.goToFirstPage()
-        callsRequest = RecordsRequestKey(
-            content: callContentKey, page: RecordsPagingPolicy.firstPage, pageSize: pageSize, debounced: false
-        )
-    }
-
-    private func reloadReport(reset: Bool) {
-        if reset { reportPaging.goToFirstPage() }
-        reportRequest = RecordsRequestKey(
-            content: reportKey, page: reportPaging.page, pageSize: reportPaging.pageSize, debounced: true
-        )
-    }
-
-    private func turnReportPage(to page: Int) {
-        guard page != reportRequest.page else { return }
-        reportRequest = RecordsRequestKey(
-            content: reportKey, page: page, pageSize: reportPaging.pageSize, debounced: false
-        )
-    }
-
-    private func resizeReport(to pageSize: Int) {
-        reportPaging.goToFirstPage()
-        reportRequest = RecordsRequestKey(
-            content: reportKey, page: RecordsPagingPolicy.firstPage, pageSize: pageSize, debounced: false
-        )
-    }
-}
-
-/// What one 全部通话 / 报告 request is made of.
-///
-/// It is written by the `.onChange` handlers instead of being computed from the view's state so that a page
-/// turn can say "this one is not a keystroke, do not wait 350 ms" while a typed character still debounces.
-struct RecordsRequestKey: Equatable, Sendable {
-    var content: String = ""
-    var page: Int = RecordsPagingPolicy.firstPage
-    var pageSize: Int = RecordsPagingPolicy.defaultPageSize
-    var debounced: Bool = false
 }
 
 struct RecordDetailView: View {
@@ -1072,7 +1093,7 @@ struct RecordDetailView: View {
                         Label("已屏蔽", systemImage: ContactDisplay.blockedSymbol)
                             .font(.footnote).foregroundStyle(Color.callerDanger)
                     }
-                    LabeledContent("状态", value: callStateTitle(call.state))
+                    LabeledContent("状态", value: callStateTitle(call.state, failureReason: call.failureReason))
                     // S38 三端合同：标记独立成行，接听方式仍按 AI/真人/未接显示。
                     if let badge = call.s38BadgeTitle {
                         LabeledContent("标记", value: badge)
@@ -1226,7 +1247,8 @@ struct RecordDetailView: View {
             NavigationStack {
                 RecordingRecordView(callID: callID, gatewayTimeZone: call?.gatewayTimeZone, gatewayKind: call?.gatewayKind,
                                     originatingPlatform: call?.originatingPlatform,
-                                    ownerJoinedLocal: call?.ownerJoinedLocal == true)
+                                    ownerJoinedLocal: call?.ownerJoinedLocal == true,
+                                    answeredByPlatform: call?.answeredByPlatform ?? report?.answeredByPlatform)
             }
         }
         .onDisappear { RecordingPlaybackController.shared.stop() }
@@ -1693,13 +1715,14 @@ private struct RecordingRecordView: View {
     private let ownerJoinedLocal: Bool
 
     init(callID: String, gatewayTimeZone: String?, gatewayKind: String? = nil, originatingPlatform: String? = nil,
-         ownerJoinedLocal: Bool = false) {
+         ownerJoinedLocal: Bool = false, answeredByPlatform: String? = nil) {
         self.callID = callID
         self.ownerJoinedLocal = ownerJoinedLocal
         self.gatewayTimeZone = gatewayTimeZone
         self.gatewayKind = gatewayKind
         _recordingSource = State(initialValue: .defaultSource(originatingPlatform: originatingPlatform,
-                                                                          ownerJoinedLocal: ownerJoinedLocal))
+                                                                          ownerJoinedLocal: ownerJoinedLocal,
+                                                                          answeredByPlatform: answeredByPlatform))
     }
 
     var body: some View {
@@ -2098,9 +2121,8 @@ func recordingErrorPresentation(_ error: Error, source: RecordingSource, gateway
 }
 
 #if DEBUG
-/// S26 preview: 全部通话 on page 2 of 4, 60 rows and the pager, rendered without a session or a login.
-private struct PagedCallListPreviewHost: View {
-    @State private var store = RecordsPagingStore(page: 2, pageSize: 50, total: 187, totalPages: 4)
+/// S133 preview: 全部通话 with 60 rows and the trailing "loading more" row, no pager, no session, no login.
+private struct CallListPreviewHost: View {
     private let calls = PreviewCallRecords.make(60)
 
     var body: some View {
@@ -2108,22 +2130,15 @@ private struct PagedCallListPreviewHost: View {
             List {
                 Group {
                 Section {
-                    ForEach(calls) { call in
-                        HStack(spacing: 0) {
-                            CallHistoryRow(call: call)
-                            Image(systemName: "info.circle")
-                                .font(.title3).frame(width: 44, height: 44)
-                                .foregroundStyle(Color.callerAccent)
-                        }
-                    }
+                    ForEach(calls) { call in CallHistoryRow(call: call) }
                 }
+                Section { HStack { ProgressView(); Text("正在读取更早的通话…") } }
                 }
                 .listRowBackground(Signal.surface)
             }
             .signalList()
             .navigationTitle("记录")
             .toolbarTitleDisplayMode(.inlineLarge)
-            .safeAreaInset(edge: .bottom) { PagerBar(store: store) }
         }
     }
 }
@@ -2137,7 +2152,7 @@ private enum PreviewCallRecords {
             let hour = String(format: "%02d", 8 + index % 12)
             let json = """
             {"id":"preview-call-\(index)","simId":"sim-1","direction":"\(index.isMultiple(of: 3) ? "outgoing" : "incoming")",\
-            "remoteNumber":"1866692\(String(format: "%04d", 1000 + index))",\
+            "remoteNumber":"20255501\(String(format: "%02d", index % 100))",\
             "state":"\(index.isMultiple(of: 7) ? "failed" : "completed")",\
             "startedAt":"2026-09-12T\(hour):\(minute):00Z","gatewayTimeZone":"Asia/Shanghai",\
             "contactName":\(index.isMultiple(of: 4) ? "\"张三\"" : "null"),\
@@ -2148,7 +2163,7 @@ private enum PreviewCallRecords {
     }
 }
 
-#Preview("全部通话 第 2 页") {
-    PagedCallListPreviewHost()
+#Preview("全部通话 滚动加载") {
+    CallListPreviewHost()
 }
 #endif

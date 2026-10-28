@@ -57,7 +57,6 @@ struct VoDogErrorLine: View {
 
 struct VoDogNumbersView: View {
     @ObservedObject var account: VoDogAccount
-    @State private var sidebarWidth: CGFloat = 300
     @State private var selectedID: String?
 
     private var sims: [VoDogSIM] { account.sims }
@@ -65,26 +64,19 @@ struct VoDogNumbersView: View {
     private var loadError: String? { account.simsError }
 
     var body: some View {
-        ResizableCommunicationSplit(sidebarWidth: $sidebarWidth) {
-            sidebar.communicationSidebarColumnStyle()
-        } detail: {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if let sim = sims.first(where: { $0.id == selectedID }) {
-                        VoDogSIMDetail(account: account, sim: sim) { await load() }
-                            .id(sim.id)
-                    } else {
-                        Text(loaded ? L10n.tr("选择一个号码查看接听设置") : L10n.tr("正在读取号码…"))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, minHeight: 120)
-                    }
-                    VoDogVoiceProviderCard(account: account)
+        // S139: hosted inside 设置's scroll view — the SIM list, then one SIM's detail with a back row.
+        VStack(alignment: .leading, spacing: 16) {
+            if let sim = sims.first(where: { $0.id == selectedID }) {
+                Button { selectedID = nil } label: {
+                    Label(L10n.tr("SIM 卡"), systemImage: "chevron.left")
                 }
-                .padding(22)
+                .buttonStyle(.borderless)
+                .accessibilityLabel(L10n.tr("SIM 卡"))
+                VoDogSIMDetail(account: account, sim: sim) { await load() }
+                    .id(sim.id)
+            } else {
+                list
             }
-            .scrollContentBackground(.hidden)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .communicationDetailColumnStyle()
         }
         .task {
             // ponytail: plain 5 s poll while the page is on screen (iOS ForegroundRefreshPolicy).
@@ -95,32 +87,26 @@ struct VoDogNumbersView: View {
         }
     }
 
-    private var sidebar: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(L10n.tr("号码与接听")).font(.title2.bold()).padding(.horizontal, 14).padding(.bottom, 8)
-                if !loaded {
-                    ProgressView().frame(maxWidth: .infinity)
-                } else if sims.isEmpty, loadError == nil {
-                    Text(L10n.tr("没有已分配的 SIM")).foregroundStyle(.secondary).padding(.horizontal, 14)
-                }
-                ForEach(sims) { sim in row(sim) }
-                if let loadError { VoDogErrorLine(text: loadError).padding(.horizontal, 14) }
+    private var list: some View {
+        VoDogCard(title: L10n.tr("SIM 卡")) {
+            if !loaded {
+                ProgressView().frame(maxWidth: .infinity)
+            } else if sims.isEmpty, loadError == nil {
+                Text(L10n.tr("没有已分配的 SIM")).foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 16)
+            ForEach(sims) { sim in row(sim) }
+            if let loadError { VoDogErrorLine(text: loadError) }
         }
     }
 
     private func row(_ sim: VoDogSIM) -> some View {
-        let selected = sim.id == selectedID
-        return Button { selectedID = sim.id } label: {
+        Button { selectedID = sim.id } label: {
             HStack(spacing: 11) {
                 Image(systemName: "simcard")
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(Color.secondary)
                     .frame(width: 22)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(sim.displayName).font(.body.weight(selected ? .semibold : .regular))
+                    Text(sim.displayName).font(.body)
                     // AI modes are carried by the badge; 人工接听 stays plain text.
                     Text([sim.phoneLabel, sim.settings?.mode == VoDogReceptionMode.normal.rawValue
                           ? VoDogReceptionMode.normal.title : nil]
@@ -130,25 +116,24 @@ struct VoDogNumbersView: View {
                 Spacer(minLength: 4)
                 AiBadge(settings: sim.settings, full: true)
                 let online = VoDogPhonePolicy.showsOnline(sim, fresh: loadError == nil)
-                Circle().fill(online ? Color.green : Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
-                    .help(online ? L10n.tr("在线") : L10n.tr("离线"))
+                HStack(spacing: 5) {
+                    LineStatusShape(status: online ? .online : .offline)
+                    Text(online ? L10n.tr("在线") : L10n.tr("离线")).font(.caption).foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 12)
-            .frame(minHeight: 50)
+            .frame(minHeight: 40)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background {
-            if selected {
-                RoundedRectangle(cornerRadius: 13, style: .continuous).fill(Color.accentColor.opacity(0.12))
-            }
-        }
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityElement(children: .combine)
     }
 
     private func load() async {
         await account.refreshSIMs()
-        if selectedID == nil || !sims.contains(where: { $0.id == selectedID }) { selectedID = sims.first?.id }
+        if let selectedID, !sims.contains(where: { $0.id == selectedID }) { self.selectedID = nil }
     }
 }
 
@@ -205,9 +190,11 @@ private struct VoDogSIMDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(labelText.isEmpty ? sim.displayName : labelText).font(.largeTitle.bold())
-                Text(sim.online == true ? L10n.tr("在线") : L10n.tr("离线"))
-                    .font(.body).foregroundStyle(sim.online == true ? Color.green : Color.secondary)
+                Text(labelText.isEmpty ? sim.displayName : labelText).font(.title2.bold())
+                HStack(spacing: 6) {
+                    LineStatusShape(status: sim.online == true ? .online : .offline, size: 8)
+                    Text(sim.online == true ? L10n.tr("在线") : L10n.tr("离线")).font(.body).foregroundStyle(.secondary)
+                }
             }
             notesCard
             modeCard
@@ -247,26 +234,18 @@ private struct VoDogSIMDetail: View {
     }
 
     private var modeCard: some View {
-        VoDogCard(title: L10n.tr("接听模式"), footer: nil) {
-            Picker(L10n.tr("模式"), selection: $mode) {
-                ForEach(VoDogReceptionMode.allCases) { candidate in
-                    Text(candidate.title).tag(candidate).disabled(settings?.isAvailable(candidate) != true)
-                }
+        VoDogCard(title: L10n.tr("接听方式"),
+                         footer: L10n.tr("三种方式是同一项设置；保存后由网关设备确认应用才生效。")) {
+            // S138 决策 5: three selectable cards over the same `mode` field.
+            VStack(spacing: 10) {
+                ForEach([VoDogReceptionMode.normal, .timeoutAI, .ai], id: \.self) { modeOption($0) }
             }
-            .pickerStyle(.radioGroup)
             .disabled(busy)
             if let reason = settings?.aiUnavailableReason, !reason.isEmpty {
                 Label(reason, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
             } else if settings?.isAvailable(.ai) != true || settings?.isAvailable(.timeoutAI) != true {
                 Label(L10n.tr("当前号码暂不支持 AI 接听模式。"), systemImage: "info.circle")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-            if mode == .timeoutAI {
-                HStack {
-                    Slider(value: $timeout, in: 10...120, step: 5).disabled(busy)
-                    Text(L10n.tr("%lld 秒", Int64(timeout))).monospacedDigit().frame(width: 60, alignment: .trailing)
-                }
-                Text(L10n.tr("无人接听超过这个时间后由 AI 代接。")).font(.caption).foregroundStyle(.secondary)
             }
             if settingsConflict {
                 Label(L10n.tr("接听设置已在其他客户端更新，当前草稿已保留。请载入并确认最新设置后再保存。"),
@@ -282,8 +261,18 @@ private struct VoDogSIMDetail: View {
             LabeledContent(L10n.tr("设备已应用"), value: settings?.appliedVersion.map(String.init) ?? L10n.tr("尚未确认"))
             applyStatusLine
             HStack {
-                if settingsDirty { Text(L10n.tr("未保存设置")).font(.caption).foregroundStyle(.red) }
-                Spacer()
+                if settingsDirty {
+                    Text(L10n.tr("未保存设置")).font(.caption).foregroundStyle(.red)
+                    Spacer()
+                    // S138 决策 6: back to the values the draft is based on; local only, conflicts stay.
+                    Button(L10n.tr("放弃修改")) {
+                        mode = VoDogReceptionMode(rawValue: settingsBaseMode) ?? .normal
+                        timeout = Double(settingsBaseTimeout)
+                    }
+                    .disabled(busy)
+                } else {
+                    Spacer()
+                }
                 Button { Task { await saveSettings() } } label: {
                     if saving { ProgressView().controlSize(.small) } else { Text(L10n.tr("保存设置")) }
                 }
@@ -293,6 +282,46 @@ private struct VoDogSIMDetail: View {
         }
     }
 
+    private func modeOption(_ candidate: VoDogReceptionMode) -> some View {
+        let selected = mode == candidate
+        let available = settings?.isAvailable(candidate) == true
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return VStack(alignment: .leading, spacing: 8) {
+            Button { mode = candidate } label: {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(selected ? Signal.brand : Signal.ink3)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(candidate.cardTitle).font(.body.weight(.semibold))
+                        Text(candidate.cardDetail(timeoutSeconds: Int(timeout)))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!available)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            if selected, candidate == .timeoutAI {
+                HStack(spacing: 8) {
+                    Text(L10n.tr("等待时间")).font(.caption).foregroundStyle(.secondary)
+                    Slider(value: $timeout, in: 10...120, step: 5)
+                        .accessibilityLabel(L10n.tr("等待时间"))
+                    Text(L10n.tr("%lld 秒", Int64(timeout))).monospacedDigit().frame(width: 60, alignment: .trailing)
+                }
+                .padding(.leading, 26)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected ? Signal.brandSoft : Color.clear, in: shape)
+        .overlay(shape.strokeBorder(selected ? Signal.brand : Signal.line, lineWidth: selected ? 1.5 : 1))
+        .opacity(available ? 1 : 0.5)
+    }
+
     @ViewBuilder private var applyStatusLine: some View {
         let status = VoDogApplyPolicy.label(applyState, appliedVersion: settings?.appliedVersion,
                                                    version: settings?.version)
@@ -300,7 +329,7 @@ private struct VoDogSIMDetail: View {
         case .pending:
             HStack(spacing: 8) { ProgressView().controlSize(.small); Text(status.text).font(.caption).foregroundStyle(.secondary) }
         case .success:
-            Label(status.text, systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(.green)
+            Label(status.text, systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(Signal.call)
         case .warning:
             Text(status.text).font(.caption).foregroundStyle(.orange).reportsVoDogError(status.text)
         case .none:
@@ -455,8 +484,26 @@ private struct VoDogSIMDetail: View {
     }
 }
 
+private extension VoDogReceptionMode {
+    var cardTitle: String {
+        switch self {
+        case .normal: return L10n.tr("我自己接")
+        case .timeoutAI: return L10n.tr("先响铃，无人接听再交给 AI")
+        case .ai: return L10n.tr("AI 立即代接")
+        }
+    }
+
+    func cardDetail(timeoutSeconds: Int) -> String {
+        switch self {
+        case .normal: return L10n.tr("来电在你的设备上响铃，由你接听。")
+        case .timeoutAI: return L10n.tr("等待 %lld 秒无人接听，由 AI 代接。", Int64(timeoutSeconds))
+        case .ai: return L10n.tr("来电立即由 AI 接听。")
+        }
+    }
+}
+
 /// Account-level AI voice provider (S24 决策 3). Hidden when the route 404s.
-private struct VoDogVoiceProviderCard: View {
+struct VoDogVoiceProviderCard: View {
     @ObservedObject var account: VoDogAccount
     @State private var list: VoDogVoiceProviderList?
     @State private var unavailable = false
@@ -470,6 +517,7 @@ private struct VoDogVoiceProviderCard: View {
                 if let list {
                     if list.items.isEmpty { Text(L10n.tr("没有可用的语音服务")).foregroundStyle(.secondary) }
                     ForEach(list.items) { item in row(item, selected: list.selected == item.id) }
+                    if let on = list.contactInstantAi { contactInstantAiRow(on) }
                 } else {
                     ProgressView().controlSize(.small)
                 }
@@ -509,6 +557,46 @@ private struct VoDogVoiceProviderCard: View {
         .disabled(item.disabledReason != nil || busy != nil || conflict || selected)
     }
 
+    private func contactInstantAiRow(_ on: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.tr("通讯录用户启用AI即接"))
+                Text(L10n.tr("关闭时，通讯录号码来电先响铃 15 秒，无人接听再由 AI 代接，开场白改为“不好意思，机主在忙。我是 VoDog AI 助理，请您留言，谢谢”。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            if busy == Self.contactInstantAiBusy { ProgressView().controlSize(.small) }
+            Toggle(L10n.tr("通讯录用户启用AI即接"), isOn: Binding(
+                get: { on },
+                set: { value in Task { await setContactInstantAi(value) } }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(Signal.callFill)
+            .disabled(busy != nil)
+        }
+    }
+
+    private static let contactInstantAiBusy = "contactInstantAi"
+
+    private func setContactInstantAi(_ value: Bool) async {
+        guard busy == nil, let previous = list?.contactInstantAi else { return }
+        busy = Self.contactInstantAiBusy
+        defer { busy = nil }
+        error = nil
+        list?.contactInstantAi = value
+        do {
+            list = try await account.decode(VoDogVoiceProviderList.self, "PUT", "/ai/contact-instant-ai",
+                                            body: ["enabled": value])
+        } catch is CancellationError {
+            list?.contactInstantAi = previous
+        } catch {
+            list?.contactInstantAi = previous
+            self.error = VoDogErrorText.message(error)
+        }
+    }
+
     private func load() async {
         do {
             list = try await account.decode(VoDogVoiceProviderList.self, "GET", "/ai/voice-providers")
@@ -540,77 +628,27 @@ private struct VoDogVoiceProviderCard: View {
     }
 }
 
-// MARK: 账号
+// MARK: 账号 (S139: 设置 › 账号 / 隐私与安全 / 网关设备 each host one part)
 
 struct VoDogAccountView: View {
     @ObservedObject var account: VoDogAccount
-    @State private var passkeys: [VoDogPasskey] = []
-    @State private var passkeysLoaded = false
-    @State private var passkeyError: String?
-    @State private var renaming: VoDogPasskey?
-    @State private var renameText = ""
-    @State private var deleting: VoDogPasskey?
-    @State private var gateways: [VoDogGatewayPower] = []
-    @State private var gatewaysLoaded = false
-    @State private var powerUnavailable = false
-    @State private var powerError: String?
-    @State private var powerBusy: Set<String> = []
-    @State private var confirmingOff: VoDogGatewayPower?
     @State private var loggingOut = false
 
-    private struct PasskeyList: Decodable { var items: [VoDogPasskey] }
-    private struct PowerList: Decodable { var items: [VoDogGatewayPower] }
-    private struct PowerItem: Decodable { var item: VoDogGatewayPower }
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text(L10n.tr("账号")).font(.largeTitle.bold())
-                userCard
-                passkeyCard
-                if !powerUnavailable { gatewayCard }
-                HStack {
-                    Spacer()
-                    Button(role: .destructive) {
-                        loggingOut = true
-                        Task { await account.logout(); loggingOut = false }
-                    } label: {
-                        if loggingOut { ProgressView().controlSize(.small) } else { Text(L10n.tr("退出登录")) }
-                    }
-                    .disabled(loggingOut)
+        VStack(alignment: .leading, spacing: 16) {
+            userCard
+            HStack {
+                Spacer()
+                Button(role: .destructive) {
+                    loggingOut = true
+                    Task { await account.logout(); loggingOut = false }
+                } label: {
+                    if loggingOut { ProgressView().controlSize(.small) } else { Text(L10n.tr("退出登录")) }
                 }
-            }
-            .frame(maxWidth: 720, alignment: .leading)
-            .padding(22)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .scrollContentBackground(.hidden)
-        .communicationDetailColumnStyle()
-        .task { await loadPasskeys() }
-        .task {
-            powerUnavailable = false
-            while !Task.isCancelled, !powerUnavailable, account.user != nil {
-                await loadGateways()
-                await VoDogPollCadence.sleep()
+                .disabled(loggingOut)
             }
         }
-        .sheet(item: $renaming) { item in renameSheet(item) }
-        .confirmationDialog(L10n.tr("删除这个通行密钥？"),
-                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-                            titleVisibility: .visible, presenting: deleting) { item in
-            Button(L10n.tr("删除"), role: .destructive) { Task { await deletePasskey(item) } }
-            Button(L10n.tr("取消"), role: .cancel) {}
-        } message: { item in
-            Text(L10n.tr("删除后，%@ 将不能再用于登录。", item.resolvedName))
-        }
-        .confirmationDialog(L10n.tr("关闭网关？"),
-                            isPresented: Binding(get: { confirmingOff != nil }, set: { if !$0 { confirmingOff = nil } }),
-                            titleVisibility: .visible, presenting: confirmingOff) { item in
-            Button(L10n.tr("关闭"), role: .destructive) { Task { await setPower(item, on: false) } }
-            Button(L10n.tr("取消"), role: .cancel) {}
-        } message: { item in
-            Text(L10n.tr("将关闭 %@ 的网关总控。通话进行中时服务器会拒绝关闭。", item.displayName))
-        }
+        .frame(maxWidth: 720, alignment: .leading)
     }
 
     private var userCard: some View {
@@ -621,7 +659,20 @@ struct VoDogAccountView: View {
         }
     }
 
-    private var passkeyCard: some View {
+}
+
+struct VoDogPasskeysCard: View {
+    @ObservedObject var account: VoDogAccount
+    @State private var passkeys: [VoDogPasskey] = []
+    @State private var passkeysLoaded = false
+    @State private var passkeyError: String?
+    @State private var renaming: VoDogPasskey?
+    @State private var renameText = ""
+    @State private var deleting: VoDogPasskey?
+
+    private struct PasskeyList: Decodable { var items: [VoDogPasskey] }
+
+    var body: some View {
         VoDogCard(title: L10n.tr("通行密钥"), footer: L10n.tr("在 Mac 上添加通行密钥暂不支持，请在 iPhone 或网页上添加。")) {
             if !passkeysLoaded {
                 ProgressView().controlSize(.small)
@@ -644,39 +695,15 @@ struct VoDogAccountView: View {
             }
             if let passkeyError { VoDogErrorLine(text: passkeyError) }
         }
-    }
-
-    private var gatewayCard: some View {
-        VoDogCard(title: L10n.tr("网关总控"), footer: L10n.tr("远程开启需要网关允许远程开启（待命）。通话进行中不会被远程关闭。")) {
-            if !gatewaysLoaded {
-                ProgressView().controlSize(.small)
-            } else if gateways.isEmpty, powerError == nil {
-                Text(L10n.tr("没有可管理的网关")).foregroundStyle(.secondary)
-            }
-            ForEach(gateways) { item in
-                HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.displayName).font(.body.weight(.semibold))
-                        Text(item.statusTitle).font(.caption)
-                            .foregroundStyle(item.online || item.standbyOnline ? Color.secondary : Color.red)
-                        if let reason = item.toggleDisabledReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-                        if let pending = item.pendingTitle { Text(pending).font(.caption).foregroundStyle(.orange) }
-                        if let failure = item.lastResultFailure {
-                            Text(failure).font(.caption).foregroundStyle(.red).reportsVoDogError(failure)
-                        }
-                    }
-                    Spacer()
-                    if powerBusy.contains(item.gatewayId) { ProgressView().controlSize(.small) }
-                    Toggle(L10n.tr("网关总控"), isOn: Binding(
-                        get: { item.controlEnabled },
-                        set: { on in if on { Task { await setPower(item, on: true) } } else { confirmingOff = item } }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(item.toggleDisabledReason != nil || powerBusy.contains(item.gatewayId))
-                }
-            }
-            if let powerError { VoDogErrorLine(text: powerError) }
+        .task { await loadPasskeys() }
+        .sheet(item: $renaming) { item in renameSheet(item) }
+        .confirmationDialog(L10n.tr("删除这个通行密钥？"),
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible, presenting: deleting) { item in
+            Button(L10n.tr("删除"), role: .destructive) { Task { await deletePasskey(item) } }
+            Button(L10n.tr("取消"), role: .cancel) {}
+        } message: { item in
+            Text(L10n.tr("删除后，%@ 将不能再用于登录。", item.resolvedName))
         }
     }
 
@@ -734,6 +761,133 @@ struct VoDogAccountView: View {
         } catch {
             passkeyError = VoDogErrorText.message(error)
             await loadPasskeys()
+        }
+    }
+
+}
+
+/// 网关总控 for every gateway of the account (hidden when the route 404s).
+struct VoDogGatewayPowerCard: View {
+    @ObservedObject var account: VoDogAccount
+    @State private var gateways: [VoDogGatewayPower] = []
+    @State private var gatewaysLoaded = false
+    @State private var powerUnavailable = false
+    @State private var powerError: String?
+    @State private var powerBusy: Set<String> = []
+    @State private var confirmingOff: VoDogGatewayPower?
+    @State private var gatewayRenaming: VoDogGatewayPower?
+    @State private var gatewayRenameText = ""
+    @State private var gatewayRenameSaving = false
+    @State private var gatewayRenameError: String?
+
+    private struct PowerList: Decodable { var items: [VoDogGatewayPower] }
+    private struct PowerItem: Decodable { var item: VoDogGatewayPower }
+
+    var body: some View {
+        if !powerUnavailable { card }
+    }
+
+    private var card: some View {
+        VoDogCard(title: L10n.tr("网关总控"), footer: L10n.tr("远程开启需要网关允许远程开启（待命）。通话进行中不会被远程关闭。")) {
+            if !gatewaysLoaded {
+                ProgressView().controlSize(.small)
+            } else if gateways.isEmpty, powerError == nil {
+                Text(L10n.tr("没有可管理的网关")).foregroundStyle(.secondary)
+            }
+            ForEach(gateways) { item in
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.displayName).font(.body.weight(.semibold))
+                        HStack(spacing: 5) {
+                            LineStatusShape(status: item.online ? .online : .offline)
+                            Text(item.statusTitle).font(.caption)
+                                .foregroundStyle(item.online || item.standbyOnline ? Color.secondary : Color.red)
+                        }
+                        if let reason = item.toggleDisabledReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
+                        if let pending = item.pendingTitle { Text(pending).font(.caption).foregroundStyle(.orange) }
+                        if let failure = item.lastResultFailure {
+                            Text(failure).font(.caption).foregroundStyle(.red).reportsVoDogError(failure)
+                        }
+                    }
+                    Spacer()
+                    if account.isAdmin {
+                        Button(L10n.tr("重命名")) {
+                            gatewayRenameText = item.name ?? ""
+                            gatewayRenameError = nil
+                            gatewayRenaming = item
+                        }
+                    }
+                    if powerBusy.contains(item.gatewayId) { ProgressView().controlSize(.small) }
+                    Toggle(L10n.tr("网关总控"), isOn: Binding(
+                        get: { item.controlEnabled },
+                        set: { on in if on { Task { await setPower(item, on: true) } } else { confirmingOff = item } }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(Signal.callFill)
+                    .disabled(item.toggleDisabledReason != nil || powerBusy.contains(item.gatewayId))
+                }
+            }
+            if let powerError { VoDogErrorLine(text: powerError) }
+        }
+        .sheet(item: $gatewayRenaming) { item in gatewayRenameSheet(item) }
+        .task {
+            powerUnavailable = false
+            while !Task.isCancelled, !powerUnavailable, account.user != nil {
+                await loadGateways()
+                await VoDogPollCadence.sleep()
+            }
+        }
+        .confirmationDialog(L10n.tr("关闭网关？"),
+                            isPresented: Binding(get: { confirmingOff != nil }, set: { if !$0 { confirmingOff = nil } }),
+                            titleVisibility: .visible, presenting: confirmingOff) { item in
+            Button(L10n.tr("关闭"), role: .destructive) { Task { await setPower(item, on: false) } }
+            Button(L10n.tr("取消"), role: .cancel) {}
+        } message: { item in
+            Text(L10n.tr("将关闭 %@ 的网关总控。通话进行中时服务器会拒绝关闭。", item.displayName))
+        }
+    }
+
+    private func gatewayRenameSheet(_ item: VoDogGatewayPower) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(L10n.tr("重命名网关")).font(.headline)
+            TextField(L10n.tr("名称"), text: $gatewayRenameText)
+                .textFieldStyle(.roundedBorder).frame(width: 280)
+                .disabled(gatewayRenameSaving)
+                .onChange(of: gatewayRenameText) { _, text in
+                    if text.count > VoDogGatewayRename.maxLength {
+                        gatewayRenameText = String(text.prefix(VoDogGatewayRename.maxLength))
+                    }
+                }
+            if let gatewayRenameError { VoDogErrorLine(text: gatewayRenameError) }
+            HStack {
+                Spacer()
+                if gatewayRenameSaving { ProgressView().controlSize(.small) }
+                Button(L10n.tr("取消"), role: .cancel) { gatewayRenaming = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(gatewayRenameSaving)
+                Button(L10n.tr("保存")) { Task { await renameGateway(item) } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(gatewayRenameSaving || VoDogGatewayRename.validName(gatewayRenameText) == nil)
+            }
+        }
+        .padding(20)
+        .interactiveDismissDisabled(gatewayRenameSaving)
+    }
+
+    private func renameGateway(_ item: VoDogGatewayPower) async {
+        guard !gatewayRenameSaving,
+              let request = VoDogGatewayRename.request(gatewayId: item.gatewayId, name: gatewayRenameText) else { return }
+        gatewayRenameSaving = true
+        defer { gatewayRenameSaving = false }
+        do {
+            _ = try await account.json(request.method, request.path, body: request.body)
+            gatewayRenaming = nil
+            await loadGateways()
+        } catch is CancellationError {
+            return
+        } catch {
+            gatewayRenameError = VoDogErrorText.shown(VoDogGatewayRename.errorText(for: error), error: error)
         }
     }
 

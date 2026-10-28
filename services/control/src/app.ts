@@ -21,6 +21,7 @@ import {
   EMPTY_NUMBER_ANNOTATION,
   normalizeContactName,
   normalizePhone,
+  lookupContact,
   ownerCountryIso,
   type NumberAnnotation,
 } from "./contacts/repository.js";
@@ -144,6 +145,8 @@ const DOORBELL_HARD_CAP_MS = 8000;
 const GATEWAY_HEARTBEAT_EXPECTED_MS = 2000;
 /** S42 决策 2: how long every other client still has to beat the AI after the owner reports a busy device. */
 const OWNER_BUSY_AI_GRACE_SECONDS = 5;
+/** S137 决策 1: how long a contact's would-be AI 即接 call rings before AI takes it (186 cards cut at 18–19 s). */
+const CONTACT_DEFERRED_AI_SECONDS = 15;
 /** S36b D3: the gateway row as it was before a heartbeat applied — what a flip is measured against. */
 type GatewayHeartbeatPrev = { control_enabled: boolean; telephony_ready: boolean; sms_ready: boolean; media_ready: boolean; last_seen_at: string | null };
 
@@ -970,6 +973,7 @@ export async function buildApp(
         recordingRoot: config.RECORDING_ROOT ?? null,
         pixelArchiveRoot: config.PIXEL_ARCHIVE_ROOT ?? null,
         recordingBackupRoot: config.RECORDING_BACKUP_ROOT ?? null,
+        mp3CacheDir: config.RECORDING_MP3_CACHE_DIR ?? null,
         nodes: media,
         log: req.log,
       },
@@ -1249,6 +1253,7 @@ export async function buildApp(
     // 验收 3 reads this diag row in production: without the provider, `aiScheduled:false` from "no live
     // worker" and from "the call was no longer ringing" look identical.
     let aiSkippedProvider: string | null = null;
+    let advanced = false;
     const aiScheduled=await tx(db,async c=>{
       const target=await c.query(`SELECT gateway_id FROM call_records WHERE id=$1 AND snapshot_owner_id=$2`,[id,p.user.id]);
       if(!target.rowCount)fail(404,"NOT_FOUND","Call not found");
@@ -1258,6 +1263,17 @@ export async function buildApp(
         WHERE c.id=$1 AND c.snapshot_owner_id=$2 FOR UPDATE OF c`,[id,p.user.id]);
       if(!q.rowCount)fail(404,"NOT_FOUND","Call not found");
       const call=q.rows[0];
+      // S137 决策 6: a deferred contact run is pulled in to the S42 grace, keeping its leave-message greeting.
+      if(config.BUSY_CONFLICT_ENABLED&&call.state==="incoming_ringing"&&call.ai_run_id){
+        const moved=await c.query(`UPDATE ai_call_runs SET trigger_at=now()+$2::int*interval '1 second',updated_at=now()
+          WHERE call_id=$1 AND state IN ('pending','preparing') AND greeting_kind='leave_message'
+            AND trigger_at>now()+$2::int*interval '1 second' RETURNING trigger_at`,[id,OWNER_BUSY_AI_GRACE_SECONDS]);
+        if(moved.rowCount){
+          await c.query(`UPDATE call_records SET ai_trigger_at=$2 WHERE id=$1`,[id,moved.rows[0].trigger_at]);
+          advanced=true;
+          return true;
+        }
+      }
       // S72 B3: an internal call always rings as 人工; the owner being busy never hands it to AI.
       if(!config.BUSY_CONFLICT_ENABLED||call.direction!=="incoming"||call.state!=="incoming_ringing"||call.ai_run_id||call.internal_call)return false;
       const run=await createAiRunForIncoming(c,{
@@ -1270,7 +1286,7 @@ export async function buildApp(
       return Boolean(run);
     });
     if(aiScheduled)wakeAiClaims();
-    diag(db,"call.owner_busy",{ms:Date.now()-startedAt,aiScheduled,platform:p.platform,
+    diag(db,"call.owner_busy",{ms:Date.now()-startedAt,aiScheduled,platform:p.platform,...(advanced?{advanced:true}:{}),
       ...(aiSkippedProvider?{aiSkipped:"provider_unavailable",voiceProvider:aiSkippedProvider}:{})},{callId:id,userId:p.user.id});
     return {aiScheduled};
   });
@@ -2436,6 +2452,9 @@ async function conversationOffsetMs(store: RecordingStore | RemoteRecordingStore
   const timelineBytes = "artifacts" in manifest ? manifest.artifacts.find((artifact) => artifact.name === "timeline.jsonl")?.bytes ?? 0 : 0;
   return store instanceof RecordingStore ? store.firstPacketSkewMs(callId, timelineBytes) : null;
 }
+// S94: with the owner-side uplink capture the caller half of the mix is that track, so an owner who
+// picked up on the phone is in the export; the duration probe still aligns it.
+const conversationPart = (uplink: boolean, part: RecordingTrack) => uplink && part === "caller_original" ? "caller_uplink" as const : part;
 /**
  * Pre-builds the per-track mp3 exports once a Pixel archive completes, into the same cache files the
  * GET …/recordings/:track?format=mp3 route serves (cachedMp3 skips existing ones and serializes the
@@ -2448,6 +2467,7 @@ export async function pretranscodePixelRecording(
   callId: string,
   transcode = transcodeMp3,
   wait: { maxWaitMs?: number; pollMs?: number; transcriptionEnabled?: boolean } = {},
+  mix = mixMp3,
 ) {
   let track = "";
   try {
@@ -2457,6 +2477,13 @@ export async function pretranscodePixelRecording(
       track = item.track;
       await cachedMp3(cacheDir, `${callId}-pixel-${item.track}`, (target) =>
         transcode(db, cacheDir, target, () => reader.openTrack(callId, item.track)));
+    }
+    // S141: the conversation mix too — built on first play it took 32–65 s on the relay host, past the Mac's 30 s watchdog.
+    if (manifest && ["caller_original", "remote_original"].every((name) => manifest.tracks.some((item) => item.track === name && item.bytes))) {
+      track = "conversation";
+      const uplink = Boolean(manifest.uplinkTracks?.length);
+      await cachedMp3(cacheDir, `${callId}-pixel-conversation`, (target) =>
+        mix(db, cacheDir, target, (part) => reader.openTrack(callId, conversationPart(uplink, part)), null));
     }
   } catch (error) {
     diag(db, "recording.pretranscode_failed", { track, reason: errorReason(error) }, { callId, level: "warn" });
@@ -2585,11 +2612,9 @@ function registerRecordingRoutes(
         mp3 = await cachedMp3(cacheDir, `${id}-${source}-${track}`, async (target) => {
           if (track !== "conversation") return transcodeMp3(db, cacheDir, target, () => selected.openTrack(id, track as RecordingTrack));
           const offset = await conversationOffsetMs(selected, id);
-          // S94: with the owner-side uplink capture the caller half of the mix is that track, so an
-          // owner who picked up on the phone is in the export; the duration probe still aligns it.
           const uplink = selected instanceof PixelRecordingArchiveReader && (await selected.manifest(id))?.uplinkTracks?.length ? selected : null;
           return mixMp3(db, cacheDir, target, (part) => uplink
-            ? uplink.openTrack(id, part === "caller_original" ? "caller_uplink" : part) : selected.openTrack(id, part), offset);
+            ? uplink.openTrack(id, conversationPart(true, part)) : selected.openTrack(id, part), offset);
         });
       } else opened = await selected.openTrack(
         id,
@@ -3848,6 +3873,8 @@ function registerGatewayRoutes(
         blockSource: z.literal("phone").optional(),
         // S86: label of the third-party screening app that blocked it; the number joins the call blocklist.
         screeningApp: z.string().trim().min(1).max(64).optional(),
+        // S136: the screening app silenced (not rejected) this ringing call: a contact goes to AI, anyone else is intercepted.
+        screened: z.boolean().optional(),
       })
       .parse(req.body);
     const fingerprint = requestFingerprint(b);
@@ -3963,7 +3990,18 @@ function registerGatewayRoutes(
         diag(db, "call.internal_linked", { peerCallId: peerLeg.id, reason: linkReason }, { callId });
         diag(db, "call.internal_linked", { peerCallId: callId, reason: linkReason }, { callId: peerLeg.id });
       };
-      if (sim.rowCount && sim.rows[0].owner_user_id && (blockedLocally ||
+      // S136: a call the Pixel's screening app silenced goes to AI only for a contact; any other
+      // number (or none) stays intercepted like a blocklist hit, minus the blocklist insert.
+      const contactOwner: string | null = !blockedLocally && !internal && sim.rowCount ? sim.rows[0].owner_user_id ?? null : null;
+      const screenedOwner = config.SCREENED_CALL_AI_ANSWER_ENABLED && b.screened === true ? contactOwner : null;
+      // S137 决策 3: the one address-book country S136 and S137 share; only derived when a lookup can follow.
+      const contactIso = contactOwner && (screenedOwner || config.CONTACT_DEFERRED_AI_ENABLED) ?
+        (typeof sim.rows[0].country_iso === "string" && /^[A-Za-z]{2}$/.test(sim.rows[0].country_iso)
+          ? sim.rows[0].country_iso.toUpperCase() : await ownerCountryIso(c, contactOwner)) : null;
+      const screenedContact = !!(screenedOwner && contactIso && b.remoteNumber &&
+        await lookupContact(c, screenedOwner, b.remoteNumber, contactIso));
+      const screenedBlock = !!screenedOwner && !screenedContact;
+      if (sim.rowCount && sim.rows[0].owner_user_id && (blockedLocally || screenedBlock ||
         // S72 B3: an internal call never goes through the owner's call blocklist.
         (!internal && await ownerBlocksRemote(c, sim.rows[0].owner_user_id, "call", b.remoteNumber ?? null, sim.rows[0].country_iso)))) {
         const existingBlocked = await c.query(
@@ -3985,7 +4023,7 @@ function registerGatewayRoutes(
                 sim.rows[0].mode ?? "normal",
                 b.deviceCallId,
                 b.observedAt,
-                blockedLocally ? b.blockSource ?? "gateway" : "control",
+                blockedLocally ? b.blockSource ?? "gateway" : screenedBlock ? "phone" : "control",
                 await callCanonicalKeyFor(c, sim.rows[0].owner_user_id, b.remoteNumber ?? null, sim.rows[0].country_iso),
               ],
             )
@@ -3993,6 +4031,8 @@ function registerGatewayRoutes(
           // The device already hung up on its own; issuing a hangup would race a call that no
           // longer exists and burn a command sequence for nothing.
           if (!blockedLocally) await queueHangup(call.id);
+          if (screenedBlock)
+            diag(db, "call.screened", { action: "blocked", contact: false, simMode: sim.rows[0].mode ?? "normal" }, { callId: call.id, userId: sim.rows[0].owner_user_id });
           // S86: equivalence dedupe as in POST /api/v1/blocklist; emergency numbers have no key.
           const screenKey = blockedLocally && b.screeningApp && config.SCREENING_APP_AUTO_BLOCK_ENABLED
             ? canonicalBlocklistKey(b.remoteNumber) : null;
@@ -4122,7 +4162,16 @@ function registerGatewayRoutes(
       if (!localOnly && !call) {
         const s = sim.rows[0];
         // S72 D6: an internal call rings as 人工 whatever the SIM's mode, so no AI run is created.
-        const mode = internal ? "normal" : busyAi ? "ai" : s.mode ?? "normal";
+        // S136: a screened call from a contact goes to AI at once; without a run it just rings.
+        const screenedAi = !internal && !busyAi && screenedContact;
+        // S137: a contact's call that would be AI 即接 rings first as timeout_ai and gets the leave-message
+        // greeting, unless the owner turned 通讯录用户启用AI即接 on. S38 busyAi is never deferred.
+        const instantAi = !internal && !busyAi && (screenedContact || (s.mode ?? "normal") === "ai");
+        const ownerContactInstantAi = instantAi && config.CONTACT_DEFERRED_AI_ENABLED &&
+          !!(await c.query(`SELECT 1 FROM users WHERE id=$1 AND contact_instant_ai`, [s.owner_user_id])).rowCount;
+        const deferContact = instantAi && config.CONTACT_DEFERRED_AI_ENABLED && !ownerContactInstantAi &&
+          (screenedContact || (!!b.remoteNumber && !!contactIso && !!(await lookupContact(c, s.owner_user_id, b.remoteNumber, contactIso))));
+        const mode = internal ? "normal" : busyAi ? "ai" : deferContact ? "timeout_ai" : screenedAi ? "ai" : s.mode ?? "normal";
         call = (
           await c.query(
             `INSERT INTO call_records(gateway_id,sim_id,snapshot_owner_id,direction,remote_number,state,generation,mode_snapshot,device_call_id,observed_at,started_at,gateway_time_zone,remote_canonical_key,conflict_disposition,internal_call,peer_sim_id)
@@ -4154,8 +4203,16 @@ function registerGatewayRoutes(
           callId:call.id,gatewayId:p.gatewayId,ownerId:s.owner_user_id,deviceGeneration:b.generation,
           mediaEpoch:Number(call.media_epoch),mode,settingsVersion:Number(s.settings_version??1),
           assignmentVersion:Number(s.version),timeoutSeconds:Number(s.timeout_seconds??45),observedAt:b.observedAt,
+          triggerSeconds:deferContact?CONTACT_DEFERRED_AI_SECONDS:undefined,greetingKind:deferContact?"leave_message":undefined,
           onProviderUnavailable:({provider})=>{aiSkippedProvider=provider;},
         });
+        if (deferContact)
+          diag(db, "call.contact_deferred", { seconds: CONTACT_DEFERRED_AI_SECONDS, aiScheduled: Boolean(run), screened: screenedContact, simMode: s.mode ?? "normal" }, { callId: call.id, userId: s.owner_user_id });
+        if (screenedAi)
+          diag(db, "call.screened", { action: "ai", contact: true, aiScheduled: Boolean(run), simMode: s.mode ?? "normal" }, { callId: call.id, userId: s.owner_user_id });
+        // S136: the 拦截转 AI 接听 label, only when a run exists; the re-read below picks it up.
+        if (screenedAi && run)
+          await c.query(`UPDATE call_records SET conflict_disposition='screened_ai' WHERE id=$1 AND conflict_disposition IS NULL`, [call.id]);
         // AI off or no live worker: ringing this Pixel would collide with the call the owner is on,
         // so the cross-gateway case degrades to the same auto-reject as the same-gateway one.
         if(busyAi&&!run){
@@ -4348,7 +4405,8 @@ function registerGatewayRoutes(
         telecomCreationTimeMillis: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       })
       .parse(req.body);
-    if (!(config.PIXEL_ORIGINATED_CALLS_ENABLED || config.EARLY_MEDIA_ENABLED || config.AI_EARLY_LEG_ENABLED) || !config.PIXEL_ARCHIVE_ENABLED)
+    if (!(config.PIXEL_ORIGINATED_CALLS_ENABLED || config.EARLY_MEDIA_ENABLED || config.AI_EARLY_LEG_ENABLED ||
+      config.PIXEL_LOCAL_ANSWER_RECORDING_ENABLED) || !config.PIXEL_ARCHIVE_ENABLED)
       fail(503, "CAPTURE_DISABLED", "Pixel-originated recording capture is not enabled");
     const bridge = requireMediaBridge(media);
     return tx(db, async (c) => {
@@ -4367,8 +4425,10 @@ function registerGatewayRoutes(
       const earlyMediaCall = config.EARLY_MEDIA_ENABLED && call.direction === "outgoing";
       // S123 决策 7: an AI early leg arms here once ACTIVE, like the S56 outgoing leg.
       const aiEarlyLegCall = config.AI_EARLY_LEG_ENABLED && call.direction === "incoming" && call.answered_by_platform === "ai";
-      if (!(pixelCall || earlyMediaCall || aiEarlyLegCall) || call.state !== "active")
-        fail(409, "CAPTURE_NOT_ACTIVE", "Recording capture requires an active call dialed on the phone");
+      // S134: an incoming call the owner answered on the Pixel itself has no WebRTC leg either.
+      const localAnswerCall = config.PIXEL_LOCAL_ANSWER_RECORDING_ENABLED && call.direction === "incoming" && call.answered_by_platform === "device";
+      if (!(pixelCall || earlyMediaCall || aiEarlyLegCall || localAnswerCall) || call.state !== "active")
+        fail(409, "CAPTURE_NOT_ACTIVE", "Recording capture requires an active call dialed or answered on the phone");
       const nodeId = call.media_node_id ?? bridge.defaultNodeId;
       if (!call.media_node_id)
         await c.query(
@@ -4798,13 +4858,21 @@ function registerGatewayRoutes(
         `SELECT generation,snapshot_sequence,reported_sequence,local_busy,calls,observed_at FROM gateway_telecom_snapshots WHERE gateway_id=$1`,
         [p.gatewayId],
       );
-      if (
-        lastSnapshot.rowCount &&
-        Number(lastSnapshot.rows[0].generation) === b.generation &&
-        (Number(lastSnapshot.rows[0].snapshot_sequence) >= b.snapshotSequence ||
-          Number(lastSnapshot.rows[0].reported_sequence) > b.reportedSequence)
-      )
+      const sameGeneration = Boolean(lastSnapshot.rowCount) && Number(lastSnapshot.rows[0].generation) === b.generation;
+      if (sameGeneration && Number(lastSnapshot.rows[0].snapshot_sequence) >= b.snapshotSequence)
         fail(409, "STALE_SNAPSHOT", "Telecom snapshot is older than the accepted state");
+      // S140: a lower reportedSequence is only stale while a command in the gap is still pending; otherwise the
+      // gateway's local command ledger regressed (CellDock ledger per Mac) and the snapshot is accepted.
+      let ledgerRegressedFrom: number | null = null;
+      if (sameGeneration && Number(lastSnapshot.rows[0].reported_sequence) > b.reportedSequence) {
+        const storedReported = Number(lastSnapshot.rows[0].reported_sequence);
+        const open = await c.query(
+          `SELECT 1 FROM commands WHERE gateway_id=$1 AND generation=$2 AND sequence>$3 AND sequence<=$4 AND status='pending' LIMIT 1`,
+          [p.gatewayId, b.generation, b.reportedSequence, storedReported],
+        );
+        if (open.rowCount) fail(409, "STALE_SNAPSHOT", "Telecom snapshot is older than the accepted state");
+        ledgerRegressedFrom = storedReported;
+      }
 
       const matched = new Set<string>();
       const confirmedAbsent = new Set(b.confirmedAbsentCallIds);
@@ -4929,8 +4997,10 @@ function registerGatewayRoutes(
          VALUES($1,$2,'telecom.snapshot',$1,$3)`,
         [p.gatewayId, b.snapshotId, JSON.stringify({ requestFingerprint: fingerprint, response })],
       );
-      return { ...response, replayed: false, closeCallIds };
+      return { ...response, replayed: false, closeCallIds, ledgerRegressedFrom };
     });
+    if (!value.replayed && value.ledgerRegressedFrom != null)
+      diag(db, "gateway.snapshot_ledger_regressed", { gatewayId: p.gatewayId, storedReported: value.ledgerRegressedFrom, reported: b.reportedSequence, generation: b.generation });
     await Promise.all(value.closeCallIds.map((callId: string) => requestMediaClose(db, media, callId)));
     // S39 §决策1: the CallLog purge queue rides the heartbeat instead of becoming a command kind, so
     // an older gateway simply ignores an unknown field. Read after the transaction: it is unrelated to

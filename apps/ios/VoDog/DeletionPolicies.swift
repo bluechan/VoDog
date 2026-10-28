@@ -52,7 +52,7 @@ enum RecordDeletePolicy {
         return error.localizedDescription
     }
 
-    // MARK: - The list and the pager after one row is gone
+    // MARK: - The lists after one row is gone
 
     static func callsAfterDelete(_ calls: [CallRecord], id: String) -> [CallRecord] {
         calls.filter { $0.id != id }
@@ -60,30 +60,6 @@ enum RecordDeletePolicy {
 
     static func reportItemsAfterDelete(_ items: [CallReportItem], callID: String) -> [CallReportItem] {
         items.filter { $0.callId != callID }
-    }
-
-    /// One row fewer. A Control that does not page answers no `total` at all, and nil must stay nil rather than
-    /// become 0 — that is what `RecordsPagingPolicy.showsPager` reads to decide the bar is unsupported.
-    static func totalAfterDelete(_ total: Int?) -> Int? {
-        guard let total else { return nil }
-        return max(0, total - 1)
-    }
-
-    /// The page count recomputed from the new total, so deleting the only row on the last page removes the page
-    /// instead of leaving the bar pointing at one that no longer exists. Never below page 1: an empty list still
-    /// has a first page.
-    static func totalPagesAfterDelete(total: Int?, totalPages: Int?, pageSize: Int) -> Int? {
-        guard totalPages != nil else { return nil }
-        guard let total else { return totalPages }
-        let size = max(1, RecordsPagingPolicy.normalizedPageSize(pageSize))
-        let pages = (total + size - 1) / size
-        return max(RecordsPagingPolicy.firstPage, pages)
-    }
-
-    /// Where the list lands. Deleting the last row of page 4 of 4 rewinds to page 3 rather than showing an empty
-    /// page 4; anything else stays where it was.
-    static func pageAfterDelete(page: Int, totalPages: Int?) -> Int {
-        RecordsPagingPolicy.clampPage(page, totalPages: totalPages)
     }
 }
 

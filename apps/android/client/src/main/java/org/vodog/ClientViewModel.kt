@@ -102,78 +102,86 @@ internal fun <T> remoteResourceAfterRefresh(
 ): RemoteResource<T> = if (previous is RemoteResource.Loaded && updated is RemoteResource.Failed) previous else updated
 
 /**
- * 翻页 / 换搜索词（[sameRequest] 为 false）要给一个明确的「正在读」；只是重读当前这一页时保留旧结果。
+ * 换搜索词 / 条件（[sameRequest] 为 false）要给一个明确的「正在读」；只是重读最新一段时保留旧结果。
  */
 internal fun <T> pageStateDuringLoad(current: RemoteResource<T>, sameRequest: Boolean): RemoteResource<T> =
     if (sameRequest) remoteResourceDuringRefresh(current) else RemoteResource.Loading
 
-/** 服务端回来的页码为准（越界时夹回最后一页），失败时页码不动。 */
-internal fun pageNumberAfterLoad(current: Int, loaded: Page<*>?): Int =
-    loaded?.let { RecordsPagingPolicy.clampPage(it.page, it.totalPages) } ?: current
-
 /**
- * 分页结果落地。整个函数只碰 `callsPage`/`callsPageNum` —— [ClientUiState.calls]（拨号页轮询的那份）
- * 是刻意不在 copy 里的，这条约束有单测盯着。
+ * 「全部通话」最新一段的落地：和屏幕上已经滚出来的行合并（[RecordsPagingPolicy.mergeCallsHead]），
+ * 而不是替换。整个函数只碰 `callsPage` 这一组 —— [ClientUiState.calls]（拨号页轮询的那份）是刻意
+ * 不在 copy 里的，这条约束有单测盯着。
  */
 internal fun clientStateWithCallsPage(
     current: ClientUiState,
-    result: RemoteResource<Page<JSONObject>>,
-): ClientUiState = current.copy(
-    callsPage = remoteResourceAfterRefresh(current.callsPage, result),
-    // 失败时 `callsPage` 会原样留着上一份 Loaded，所以转圈必须由这一位收尾，否则下拉刷新会一直转。
-    callsPageRefreshing = false,
-    callsPageNum = pageNumberAfterLoad(current.callsPageNum, (result as? RemoteResource.Loaded)?.value),
-)
+    result: RemoteResource<List<JSONObject>>,
+): ClientUiState {
+    val head = (result as? RemoteResource.Loaded)?.value
+        // 失败时 `callsPage` 会原样留着上一份 Loaded，所以转圈必须由这一位收尾，否则下拉刷新会一直转。
+        ?: return current.copy(
+            callsPage = remoteResourceAfterRefresh(current.callsPage, result),
+            callsPageRefreshing = false,
+        )
+    val loaded = (current.callsPage as? RemoteResource.Loaded)?.value.orEmpty()
+    val merged = RecordsPagingPolicy.mergeCallsHead(loaded, head)
+    return current.copy(
+        callsPage = RemoteResource.Loaded(merged),
+        callsPageRefreshing = false,
+        // 不足一段就是整份列表；否则只有尾巴原样留着时，之前「到底了」的结论才还成立。
+        callsEndReached = head.size < ClientApiRoutes.CALLS_CHUNK || (
+            current.callsEndReached && loaded.isNotEmpty() &&
+                merged.last().optString("id") == loaded.last().optString("id")
+            ),
+    )
+}
+
+/**
+ * 滚到底读回来的下一段（[more] 为 null = 请求失败）。只有列表的最后一行还是发请求时的那一行
+ * （[cursorId]）才接上去：中途被下拉刷新截短、或整份换掉之后，这一段已经接不上了，丢掉等下一次滚动。
+ * 失败和丢弃都只收掉转圈，屏幕上的行一行不动。
+ */
+internal fun clientStateWithMoreCalls(
+    current: ClientUiState,
+    cursorId: String,
+    more: List<JSONObject>?,
+): ClientUiState {
+    val loaded = (current.callsPage as? RemoteResource.Loaded)?.value
+    if (more == null || loaded == null || loaded.lastOrNull()?.optString("id") != cursorId) {
+        return current.copy(callsLoadingMore = false)
+    }
+    return current.copy(
+        callsPage = RemoteResource.Loaded(RecordsPagingPolicy.appendCalls(loaded, more)),
+        callsLoadingMore = false,
+        callsEndReached = more.size < ClientApiRoutes.CALLS_CHUNK,
+    )
+}
 
 /**
  * S30 删掉一条通话记录之后的就地落地。**刻意不经过 [clientStateWithCallsPage]**：那条路只写
- * `callsPage`（S28 钉死它一行都不许碰 [ClientUiState.calls]，因为分页结果不是「当前全部通话」），而
- * 删除恰恰要三处一起改 —— 拨号页轮询的 `calls`、记录页当前这一页 `callsPage`、以及报告页 `reports`
+ * `callsPage`（S28 钉死它一行都不许碰 [ClientUiState.calls]，因为记录页的结果不是「当前全部通话」），而
+ * 删除恰恰要三处一起改 —— 拨号页轮询的 `calls`、记录页已经滚出来的 `callsPage`、以及报告页 `reports`
  * 里的同一通。服务端一条 `DELETE /calls/:id` 就把录音、转写和报告行级联删了，客户端只是在紧接着的
  * 重读回来之前不让这一行留在屏幕上。
  *
- * `total` 减一、`totalPages` 按 [RecordsPagingPolicy.totalPagesFor] 重算；删掉的正好是本页最后一行
- * 时页码退一页，否则随后的 [ClientViewModel.loadCallsPage] 会去请求一页空结果。旧 Control 的
- * `supported=false` 信封没有页数可言，`totalPages` 保持 1、也不退页。
+ * 两条列表都是滚动加载，没有页码可退：拿掉这一行就完了。报告的 `total` 也不在这里改，紧接着的
+ * 重读会带回服务端的口径。
  */
 internal fun clientStateWithoutCall(current: ClientUiState, callId: String): ClientUiState {
     if (callId.isBlank()) return current
     val calls = (current.calls as? RemoteList.Loaded)
         ?.let { loaded -> RemoteList.Loaded(loaded.items.filterNot { it.optString("id") == callId }) }
         ?: current.calls
-    val trimmedPage = (current.callsPage as? RemoteResource.Loaded)?.value?.let { page ->
-        val items = page.items.filterNot { it.optString("id") == callId }
-        val total = (if (items.size != page.items.size) page.total - 1 else page.total)
-            .coerceAtLeast(items.size)
-        val totalPages =
-            if (!page.supported) page.totalPages else RecordsPagingPolicy.totalPagesFor(total, page.pageSize)
-        val wanted = if (items.isEmpty() && page.page > 1) page.page - 1 else page.page
-        page.copy(
-            items = items,
-            total = total,
-            totalPages = totalPages,
-            page = RecordsPagingPolicy.clampPage(wanted, totalPages),
-        )
-    }
+    val callsPage = (current.callsPage as? RemoteResource.Loaded)
+        ?.let { loaded -> RemoteResource.Loaded(loaded.value.filterNot { it.optString("id") == callId }) }
+        ?: current.callsPage
     val reports = (current.reports as? RemoteResource.Loaded)?.value?.let { report ->
-        val items = report.items.filterNot { it.callId == callId }
-        val total = (if (items.size != report.items.size) report.paging.total - 1 else report.paging.total)
-            .coerceAtLeast(items.size)
         RemoteResource.Loaded(
-            report.copy(
-                paging = report.paging.copy(
-                    items = items,
-                    total = total,
-                    totalPages = if (!report.paging.supported) report.paging.totalPages
-                    else RecordsPagingPolicy.totalPagesFor(total, report.paging.pageSize),
-                ),
-            ),
+            report.copy(paging = report.paging.copy(items = report.items.filterNot { it.callId == callId })),
         )
     } ?: current.reports
     return current.copy(
         calls = calls,
-        callsPage = trimmedPage?.let { RemoteResource.Loaded(it) } ?: current.callsPage,
-        callsPageNum = trimmedPage?.page ?: current.callsPageNum,
+        callsPage = callsPage,
         reports = reports,
         // 打开着的转录 / 录音页指的就是这一通的话，它已经没有内容可读了。
         callDetail = current.callDetail?.takeIf { it.item.callId != callId },
@@ -259,21 +267,79 @@ internal fun dialResponseMediaStartId(
     }
 }
 
+/**
+ * 拦截记录最新一段的落地：和已经滚出来的行合并（[RecordsPagingPolicy.mergeHeadPage]），失败时留着
+ * 上一份。只碰拦截记录自己的两个字段。
+ */
 internal fun clientStateWithInterceptionsPage(
     current: ClientUiState,
     result: RemoteResource<Page<JSONObject>>,
-): ClientUiState = current.copy(
-    interceptionsPage = remoteResourceAfterRefresh(current.interceptionsPage, result),
-    interceptionsPageNum = pageNumberAfterLoad(current.interceptionsPageNum, (result as? RemoteResource.Loaded)?.value),
-)
+): ClientUiState {
+    val head = (result as? RemoteResource.Loaded)?.value
+        ?: return current.copy(interceptionsPage = remoteResourceAfterRefresh(current.interceptionsPage, result))
+    val loaded = (current.interceptionsPage as? RemoteResource.Loaded)?.value
+    val merged = RecordsPagingPolicy.mergeHeadPage(loaded, head, JSONObject::interceptionId)
+    return current.copy(
+        interceptionsPage = RemoteResource.Loaded(merged),
+        interceptionsEndReached = RecordsPagingPolicy.endAfterHead(head, merged.items.size),
+    )
+}
 
+/**
+ * 拦截记录滚到底读回来的下一段（[more] 为 null = 请求失败）。和 [clientStateWithMoreCalls] 一样：
+ * 最后一行还是发请求时的那一行（[cursorId]）才接上去，否则只收掉转圈。一行新的都没带回来、又没到底
+ * 的一段也只是收掉转圈 —— 行数没变，列表不会自己再读，等下一次滚动或下一次最新一段的合并。
+ */
+internal fun clientStateWithMoreInterceptions(
+    current: ClientUiState,
+    cursorId: String,
+    more: Page<JSONObject>?,
+): ClientUiState {
+    val loaded = (current.interceptionsPage as? RemoteResource.Loaded)?.value
+    if (more == null || loaded == null || loaded.items.lastOrNull()?.interceptionId() != cursorId) {
+        return current.copy(interceptionsLoadingMore = false)
+    }
+    val appended = RecordsPagingPolicy.appendPage(loaded, more, JSONObject::interceptionId)
+    return current.copy(
+        interceptionsPage = RemoteResource.Loaded(appended),
+        interceptionsLoadingMore = false,
+        interceptionsEndReached = RecordsPagingPolicy.endAfterMore(more, appended.items.size),
+    )
+}
+
+/** 报告最新一段的落地，规则同 [clientStateWithInterceptionsPage]；[reset]（下拉刷新）时整份替换。 */
 internal fun clientStateWithReportsPage(
     current: ClientUiState,
     result: RemoteResource<CallReportPage>,
-): ClientUiState = current.copy(
-    reports = remoteResourceAfterRefresh(current.reports, result),
-    reportsPageNum = pageNumberAfterLoad(current.reportsPageNum, (result as? RemoteResource.Loaded)?.value?.paging),
-)
+    reset: Boolean = false,
+): ClientUiState {
+    val head = (result as? RemoteResource.Loaded)?.value
+        ?: return current.copy(reports = remoteResourceAfterRefresh(current.reports, result))
+    val loaded = (current.reports as? RemoteResource.Loaded)?.value?.paging?.takeUnless { reset }
+    val merged = RecordsPagingPolicy.mergeHeadPage(loaded, head.paging, CallReportItem::callId)
+    return current.copy(
+        reports = RemoteResource.Loaded(head.copy(paging = merged)),
+        reportsEndReached = RecordsPagingPolicy.endAfterHead(head.paging, merged.items.size),
+    )
+}
+
+/** 报告滚到底读回来的下一段，规则同 [clientStateWithMoreInterceptions]。 */
+internal fun clientStateWithMoreReports(
+    current: ClientUiState,
+    cursorId: String,
+    more: CallReportPage?,
+): ClientUiState {
+    val loaded = (current.reports as? RemoteResource.Loaded)?.value
+    if (more == null || loaded == null || loaded.items.lastOrNull()?.callId != cursorId) {
+        return current.copy(reportsLoadingMore = false)
+    }
+    val appended = RecordsPagingPolicy.appendPage(loaded.paging, more.paging, CallReportItem::callId)
+    return current.copy(
+        reports = RemoteResource.Loaded(loaded.copy(paging = appended)),
+        reportsLoadingMore = false,
+        reportsEndReached = RecordsPagingPolicy.endAfterMore(more.paging, appended.items.size),
+    )
+}
 
 /** S67c: only a successful list read may clear optimistic ids. */
 internal fun prunedLocalIds(local: Set<String>, result: RemoteList, flag: String): Set<String> =
@@ -338,16 +404,18 @@ data class ClientUiState(
     val endingCallIds: Set<String> = emptySet(),
     // S22 决策 10 记录页: 全部通话 carries a server-side search, 报告 carries a date window plus its own
     // search.
-    // S28: 记录页的三条列表都翻页了，而且每一条都有自己的一份 state —— `callsPage` 与上面的 `calls`
-    // 是两份数据。`calls` 仍旧是拨号页每 2–5 秒轮的那一份（运行时对账、占用释放都读它），分页请求
-    // 一行都不许写进去，否则第 3 页的 50 条会被当成「当前全部通话」去对账。
+    // S28: 记录页的三条列表每一条都有自己的一份 state —— `callsPage` 与上面的 `calls` 是两份数据。
+    // `calls` 仍旧是拨号页每 2–5 秒轮的那一份（运行时对账、占用释放都读它），记录页的请求一行都
+    // 不许写进去，否则搜索结果的 50 条会被当成「当前全部通话」去对账。
+    // 「全部通话」不翻页：`callsPage` 是已经滚出来的全部行（最新 50 条起，滚到底再接 50 条）。
     val callQuery: String = "",
-    val callsPage: RemoteResource<Page<JSONObject>> = RemoteResource.NotLoaded,
-    // 重读当前页时列表要留在屏幕上（不然每次屏蔽 / 挂断都闪一下），所以「正在请求」是独立的一位，
+    val callsPage: RemoteResource<List<JSONObject>> = RemoteResource.NotLoaded,
+    // 重读最新一段时列表要留在屏幕上（不然每次屏蔽 / 挂断都闪一下），所以「正在请求」是独立的一位，
     // 而不是把 `callsPage` 打回 Loading —— 下拉刷新的转圈只认它，失败也会落下来。
     val callsPageRefreshing: Boolean = false,
-    val callsPageNum: Int = 1,
-    val callsPageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
+    // 滚到底的那一段正在读（列表末尾的小转圈）；`callsEndReached` 之后不再往下读。
+    val callsLoadingMore: Boolean = false,
+    val callsEndReached: Boolean = false,
     val callsSimId: String = "",
     val reportPreset: ReportRangePreset = ReportRangePreset.DAYS_7,
     val reportRange: ReportDateRange? = null,
@@ -355,8 +423,9 @@ data class ClientUiState(
     val reportSimId: String = "",
     val reportTimeZone: String = DEFAULT_GATEWAY_TIME_ZONE,
     val reports: RemoteResource<CallReportPage> = RemoteResource.NotLoaded,
-    val reportsPageNum: Int = 1,
-    val reportsPageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
+    // 报告也是滚动加载：`reports` 是已经滚出来的全部行，这两位的意思同 `callsLoadingMore` / `callsEndReached`。
+    val reportsLoadingMore: Boolean = false,
+    val reportsEndReached: Boolean = false,
     val reportBlocking: Set<String> = emptySet(),
     val reportMessage: String = "",
     val callDetail: CallDetailUiState? = null,
@@ -388,8 +457,8 @@ data class ClientUiState(
     val contactCard: ContactCardUiState? = null,
     val dialerLookup: DialerLookupState = DialerLookupState(),
     val interceptionsPage: RemoteResource<Page<JSONObject>> = RemoteResource.NotLoaded,
-    val interceptionsPageNum: Int = 1,
-    val interceptionsPageSize: Int = RecordsPagingPolicy.DEFAULT_PAGE_SIZE,
+    val interceptionsLoadingMore: Boolean = false,
+    val interceptionsEndReached: Boolean = false,
     /** S66 来电黑名单 (`scope=call`). */
     val blocklist: RemoteList = RemoteList.NotLoaded,
     /** S66 短信黑名单 (`scope=sms`), filled only by 短信「删除并屏蔽」. */
@@ -410,6 +479,7 @@ data class ClientUiState(
     val voiceProviderReview: String? = null,
     val voiceProviderConflict: Boolean = false,
     val voiceProviderConflictVersion: Long? = null,
+    val contactInstantAiPending: Boolean = false,
     val simNotesSubmissions: Map<String, SimNotesSubmission> = emptyMap(),
     val simNotesConflicts: Map<String, Long> = emptyMap(),
     val simSettingsSubmissions: Map<String, SimSettingsSubmission> = emptyMap(),
@@ -596,8 +666,15 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     private val _lastLogin = MutableStateFlow(runCatching { lastLoginStore.read() }.getOrNull())
     val lastLogin: StateFlow<LastLogin?> = _lastLogin.asStateFlow()
     private val reportRequests = AsyncRequestGuard()
+    private val reportsMoreRequests = AsyncRequestGuard()
+    // 下拉刷新要的「整份替换」记在这里而不是带在请求上：每 2–5 秒的轮询会顶掉那一次请求，谁先成功
+    // 落地谁来兑现。
+    private var reportsResetPending = false
     private val callsPageRequests = AsyncRequestGuard()
+    // 滚动加载单独一个守卫：和上面共用的话，每 2–5 秒一次的最新一段重读会把在途的下一段作废。
+    private val callsMoreRequests = AsyncRequestGuard()
     private val interceptionsRequests = AsyncRequestGuard()
+    private val interceptionsMoreRequests = AsyncRequestGuard()
     private val detailRequests = AsyncRequestGuard()
     private val historyRecordRequests = AsyncRequestGuard()
     private val viewerValidityRequests = AsyncRequestGuard()
@@ -961,8 +1038,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     fun logout() {
         val installationId = AndroidPushStore(getApplication()).installationId
         reportRequests.invalidate()
+        reportsMoreRequests.invalidate()
+        reportsResetPending = false
         callsPageRequests.invalidate()
+        callsMoreRequests.invalidate()
         interceptionsRequests.invalidate()
+        interceptionsMoreRequests.invalidate()
         detailRequests.invalidate()
         historyRecordRequests.invalidate()
         viewerValidityRequests.invalidate()
@@ -1244,8 +1325,8 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     fun refreshAll() {
         val expectedEpoch = sessions.snapshot().also { if (it.session == null) return }.epoch
-        // S28: 记录页的当前页跟着一起重读 —— 屏蔽 / 解除屏蔽之后第 3 页该变的行要当场变。没打开过
-        // 记录页就一个请求都不发（`NotLoaded`），拨号页的刷新不会白白多付一次 COUNT。
+        // S28: 记录页最新的一段跟着一起重读 —— 屏蔽 / 解除屏蔽之后该变的行要当场变。没打开过
+        // 记录页就一个请求都不发（`NotLoaded`）。
         if (_state.value.callsPage !is RemoteResource.NotLoaded) loadCallsPage()
         refreshBadges()
         if (refreshJob?.isActive == true) return
@@ -1850,8 +1931,6 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         query: String = _state.value.reportQuery,
         timeZone: String = _state.value.reportTimeZone,
         simId: String = _state.value.reportSimId,
-        page: Int = _state.value.reportsPageNum,
-        pageSize: Int = _state.value.reportsPageSize,
         debounceMs: Long = 0,
     ) {
         if (!_state.value.networkAvailable) return
@@ -1862,13 +1941,12 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         val resolved = (if (preset == ReportRangePreset.CUSTOM) range else reportRangeFor(preset, today))
             ?: range
             ?: checkNotNull(reportRangeFor(ReportRangePreset.DAYS_7, today))
-        val size = RecordsPagingPolicy.clampPageSize(pageSize)
-        val previousKey = reportContentKey()
         val key = reportContentKey(resolved, query, zone, simId)
-        // 窗口 / 搜索词 / SIM 一变就回第 1 页：旧的第 7 页在新的条件下多半是空的。
-        val wanted = if (RecordsPagingPolicy.resetsPage(previousKey, key)) 1 else page.coerceAtLeast(1)
-        val token = reportRequests.next(expected.epoch, reportRequestKey(key, size, wanted))
+        val sameKey = key == reportContentKey()
+        val token = reportRequests.next(expected.epoch, key)
         reportsJob?.cancel()
+        // 窗口 / 搜索词 / SIM 变了：在途的下一段属于上一份列表，作废，转圈也一起收掉。
+        if (!sameKey) reportsMoreRequests.invalidate()
         _state.update {
             it.copy(
                 reportPreset = preset,
@@ -1876,35 +1954,65 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                 reportQuery = query,
                 reportSimId = simId,
                 reportTimeZone = zone,
-                reportsPageNum = wanted,
-                reportsPageSize = size,
-                // 轮询当前页时保留最后一次成功快照；换条件或翻页才显示整页加载态。
-                reports = pageStateDuringLoad(
-                    it.reports,
-                    sameRequest = key == previousKey && wanted == it.reportsPageNum && size == it.reportsPageSize,
-                ),
-                // 翻页不是换内容：只有窗口/搜索/SIM 变了才关掉已经打开的转录页。
-                callDetail = if (key != previousKey) null else it.callDetail,
+                // 轮询最新一段时保留已经滚出来的行；换条件才显示整页加载态（落地时就是整份替换）。
+                reports = pageStateDuringLoad(it.reports, sameKey),
+                reportsLoadingMore = it.reportsLoadingMore && sameKey,
+                // 只有窗口/搜索/SIM 变了才关掉已经打开的转录页。
+                callDetail = if (!sameKey) null else it.callDetail,
             )
         }
         reportsJob = viewModelScope.launch {
             if (debounceMs > 0) delay(debounceMs)
             val result: RemoteResource<CallReportPage> = runCatching {
-                withContext(Dispatchers.IO) { clientApi.reportsPage(resolved, zone, query, simId, wanted, size) }
+                withContext(Dispatchers.IO) { clientApi.reportsPage(resolved, zone, query, simId) }
             }.fold(
                 onSuccess = { RemoteResource.Loaded(it) },
                 onFailure = { RemoteResource.Failed(it.reportUserMessage()) },
             )
-            val current = _state.value
-            val currentKey = reportRequestKey(reportContentKey(), current.reportsPageSize, current.reportsPageNum)
-            if (!reportRequests.accepts(token, sessions.snapshot().epoch, currentKey)) return@launch
-            _state.update { clientStateWithReportsPage(it, result) }
-            (result as? RemoteResource.Loaded)?.value?.paging?.let(RecordsPagingPolicy::rewindPage)
-                ?.let { last -> loadReports(page = last) }
+            if (!reportRequests.accepts(token, sessions.snapshot().epoch, reportContentKey())) return@launch
+            val reset = reportsResetPending
+            if (result is RemoteResource.Loaded) reportsResetPending = false
+            _state.update { clientStateWithReportsPage(it, result, reset) }
         }
     }
 
-    /** 决定「这是不是同一份内容」：翻页不算，换窗口 / 搜索词 / SIM 才算。 */
+    /**
+     * 报告列表滚到接近末尾时调用：读下一段（[RecordsPagingPolicy.nextPage]）。同一时间只有一段在读；
+     * 失败只收掉转圈（见 [clientStateWithMoreReports]），再滚一下才会重试。
+     */
+    fun loadMoreReports() {
+        val current = _state.value
+        val loaded = (current.reports as? RemoteResource.Loaded)?.value ?: return
+        val range = current.reportRange ?: return
+        val cursorId = loaded.items.lastOrNull()?.callId ?: return
+        if (!current.networkAvailable || current.reportsEndReached || current.reportsLoadingMore) return
+        val expected = sessions.snapshot().also { if (it.session == null) return }
+        val token = reportsMoreRequests.next(expected.epoch, reportContentKey())
+        _state.update { it.copy(reportsLoadingMore = true) }
+        viewModelScope.launch {
+            val more = runCatching {
+                withContext(Dispatchers.IO) {
+                    clientApi.reportsPage(
+                        range, current.reportTimeZone, current.reportQuery, current.reportSimId,
+                        RecordsPagingPolicy.nextPage(loaded.items.size),
+                    )
+                }
+            }.getOrNull()
+            // 被作废的一方（换条件 / 下拉刷新 / 退出）已经自己收掉了转圈，这里什么都不写。
+            if (!reportsMoreRequests.accepts(token, sessions.snapshot().epoch, reportContentKey())) return@launch
+            _state.update { clientStateWithMoreReports(it, cursorId, more) }
+        }
+    }
+
+    /** 下拉刷新 / 重试：完全回到最新的一段 —— 下一次成功落地的最新一段整份替换已经滚出来的行。 */
+    fun refreshReportsFromHead(timeZone: String = _state.value.reportTimeZone) {
+        reportsResetPending = true
+        reportsMoreRequests.invalidate()
+        _state.update { it.copy(reportsLoadingMore = false) }
+        loadReports(timeZone = timeZone)
+    }
+
+    /** 决定「这是不是同一份内容」：换窗口 / 搜索词 / 时区 / SIM 才算换。也是异步守卫用的键。 */
     private fun reportContentKey(
         range: ReportDateRange? = _state.value.reportRange,
         query: String = _state.value.reportQuery,
@@ -1912,66 +2020,92 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         simId: String = _state.value.reportSimId,
     ): String = "${range?.fromWire}|${range?.toWire}|${query.trim()}|$timeZone|$simId"
 
-    /** 异步守卫用的键：内容 + 页长 + 页码，晚到的上一页结果不会覆盖当前页。 */
-    private fun reportRequestKey(contentKey: String, pageSize: Int, page: Int): String = "$contentKey|$pageSize|$page"
-
     /** Typing in the 报告 search box; the request is debounced the same way contacts search is. */
     fun setReportQuery(query: String) {
         if (_state.value.reportQuery == query) return
-        loadReports(query = query, page = 1, debounceMs = CALL_SEARCH_DEBOUNCE_MS)
+        loadReports(query = query, debounceMs = CALL_SEARCH_DEBOUNCE_MS)
     }
 
-    fun setReportsPage(page: Int) = loadReports(page = page)
-
-    fun setReportsPageSize(pageSize: Int) = loadReports(page = 1, pageSize = pageSize)
-
     /**
-     * S28 全部通话：这一页现在是服务端切的，搜索词和 SIM 都进了 WHERE，所以「清空搜索框」也是一次
-     * 请求（回到第 1 页的完整列表），而不是回读轮询列表。轮询列表 [ClientUiState.calls] 只服务拨号页。
+     * 全部通话：读最新的一段（[ClientApiRoutes.CALLS_CHUNK] 条）。搜索词和 SIM 都在服务端的 WHERE 里，
+     * 所以「清空搜索框」也是一次请求，而不是回读轮询列表；轮询列表 [ClientUiState.calls] 只服务拨号页。
+     * 搜索词 / SIM 没变时（前台轮询、推送、删除之后）结果是并进已经滚出来的行，不会把人打回前 50 行。
      */
     fun loadCallsPage(
         query: String = _state.value.callQuery,
         simId: String = _state.value.callsSimId,
-        page: Int = _state.value.callsPageNum,
-        pageSize: Int = _state.value.callsPageSize,
         debounceMs: Long = 0,
     ) {
         if (!_state.value.networkAvailable) return
         val expected = sessions.snapshot().also { if (it.session == null) return }
-        val size = RecordsPagingPolicy.clampPageSize(pageSize)
-        val previous = _state.value
-        val previousKey = callsContentKey()
         val key = callsContentKey(query, simId)
-        val wanted = if (RecordsPagingPolicy.resetsPage(previousKey, key)) 1 else page.coerceAtLeast(1)
-        val sameRequest = key == previousKey && wanted == previous.callsPageNum && size == previous.callsPageSize
-        val token = callsPageRequests.next(expected.epoch, callsRequestKey(key, size, wanted))
+        val sameKey = key == callsContentKey()
+        val token = callsPageRequests.next(expected.epoch, key)
         callsPageJob?.cancel()
+        // 换了搜索词 / SIM：在途的下一段属于上一份列表，作废，转圈也一起收掉。
+        if (!sameKey) callsMoreRequests.invalidate()
         _state.update {
             it.copy(
                 callQuery = query,
                 callsSimId = simId,
-                callsPageNum = wanted,
-                callsPageSize = size,
-                callsPage = pageStateDuringLoad(it.callsPage, sameRequest),
+                callsPage = pageStateDuringLoad(it.callsPage, sameKey),
                 callsPageRefreshing = true,
+                callsLoadingMore = it.callsLoadingMore && sameKey,
             )
         }
         callsPageJob = viewModelScope.launch {
             if (debounceMs > 0) delay(debounceMs)
-            val result: RemoteResource<Page<JSONObject>> = runCatching {
-                withContext(Dispatchers.IO) { clientApi.callsPage(query, simId, wanted, size) }
+            val result: RemoteResource<List<JSONObject>> = runCatching {
+                withContext(Dispatchers.IO) { clientApi.callsPage(query, simId) }
             }.fold(
                 onSuccess = { RemoteResource.Loaded(it) },
                 onFailure = { RemoteResource.Failed(it.userMessage()) },
             )
-            val current = _state.value
-            val currentKey = callsRequestKey(callsContentKey(), current.callsPageSize, current.callsPageNum)
-            if (!callsPageRequests.accepts(token, sessions.snapshot().epoch, currentKey)) return@launch
-            // 只写 callsPage：state.calls 属于拨号页的轮询与运行时对账，分页结果碰不得。
+            if (!callsPageRequests.accepts(token, sessions.snapshot().epoch, callsContentKey())) return@launch
+            // 只写 callsPage：state.calls 属于拨号页的轮询与运行时对账，记录页的结果碰不得。
             _state.update { clientStateWithCallsPage(it, result) }
-            (result as? RemoteResource.Loaded)?.value?.let(RecordsPagingPolicy::rewindPage)
-                ?.let { last -> loadCallsPage(page = last) }
         }
+    }
+
+    /**
+     * 滚到接近末尾时由列表调用：用最后一行的 `startedAt`/`id` 当游标读下一段。同一时间只有一段在读；
+     * 失败只收掉转圈（见 [clientStateWithMoreCalls]），再滚一下才会重试，不会自己循环。
+     */
+    fun loadMoreCalls() {
+        val current = _state.value
+        val last = (current.callsPage as? RemoteResource.Loaded)?.value?.lastOrNull() ?: return
+        val before = last.optString("startedAt")
+        val cursorId = last.optString("id")
+        if (!current.networkAvailable || current.callsEndReached || current.callsLoadingMore || before.isEmpty()) return
+        val expected = sessions.snapshot().also { if (it.session == null) return }
+        val key = callsContentKey()
+        val token = callsMoreRequests.next(expected.epoch, key)
+        _state.update { it.copy(callsLoadingMore = true) }
+        viewModelScope.launch {
+            val more = runCatching {
+                withContext(Dispatchers.IO) { clientApi.callsPage(current.callQuery, current.callsSimId, before, cursorId) }
+            }.getOrNull()
+            // 被作废的一方（换搜索词 / 下拉刷新 / 退出）已经自己收掉了转圈，这里什么都不写。
+            if (!callsMoreRequests.accepts(token, sessions.snapshot().epoch, callsContentKey())) return@launch
+            _state.update { clientStateWithMoreCalls(it, cursorId, more) }
+        }
+    }
+
+    /**
+     * 下拉刷新：完全回到最新的一段。先把已经滚出来的行截回第一段、作废在途的下一段，再走
+     * [refreshAll]（连 SIM 和短信一起重读）；之后回来的最新一段和这一段合并，等于整份替换。
+     */
+    fun refreshCallsFromHead() {
+        callsMoreRequests.invalidate()
+        _state.update { state ->
+            val loaded = (state.callsPage as? RemoteResource.Loaded)?.value ?: return@update state.copy(callsLoadingMore = false)
+            state.copy(
+                callsPage = RemoteResource.Loaded(loaded.take(ClientApiRoutes.CALLS_CHUNK)),
+                callsLoadingMore = false,
+                callsEndReached = state.callsEndReached && loaded.size <= ClientApiRoutes.CALLS_CHUNK,
+            )
+        }
+        refreshAll()
     }
 
     private fun callsContentKey(
@@ -1979,23 +2113,17 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         simId: String = _state.value.callsSimId,
     ): String = "${query.trim()}|$simId"
 
-    private fun callsRequestKey(contentKey: String, pageSize: Int, page: Int): String = "$contentKey|$pageSize|$page"
-
-    fun setCallsPage(page: Int) = loadCallsPage(page = page)
-
-    fun setCallsPageSize(pageSize: Int) = loadCallsPage(page = 1, pageSize = pageSize)
-
     /** The 全部通话 search box; the request is debounced exactly like 报告 and 通讯录. */
     fun setCallQuery(query: String) {
         if (_state.value.callQuery == query) return
-        loadCallsPage(query = query, page = 1, debounceMs = CALL_SEARCH_DEBOUNCE_MS)
+        loadCallsPage(query = query, debounceMs = CALL_SEARCH_DEBOUNCE_MS)
     }
 
     /**
      * S30：删掉一条通话记录。服务端一条 `DELETE /calls/:id` 就把这通的录音、转写和报告条目级联删了
-     * （S29 把外键改成级联/置空），客户端先用 [clientStateWithoutCall] 就地把这一行从三处拿掉，再按
-     * 当前的搜索词 / SIM / 页码重读，让分页条的总数和页码回到服务端的口径；报告页已经读过才跟着重读，
-     * 没打开过就一个请求都不发。
+     * （S29 把外键改成级联/置空），客户端先用 [clientStateWithoutCall] 就地把这一行从三处拿掉，再重读
+     * 最新的一段（合并，不丢已经滚出来的行；顺带顶掉删除之前发出、还带着这一行的在途重读）；报告页已经
+     * 读过才跟着重读，没打开过就一个请求都不发。
      *
      * 失败落在 [ClientUiState.message]，[Workspace] 把它顶在 tab 内容上方，所以 409
      * 「通话仍在进行或处理中，稍后再删」在记录页上看得见。
@@ -2990,49 +3118,44 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     fun clearBlocklistMessage() = _state.update { it.copy(blocklistMessage = "") }
 
-    /** 屏蔽 / 解除屏蔽之后重读拦截记录：停在用户当前那一页，不会被拉回第 1 页。 */
+    /** 屏蔽 / 解除屏蔽之后重读拦截记录：最新一段并进已经滚出来的行，不会把人拉回顶上。 */
     fun refreshInterceptions() = loadInterceptionsPage()
 
-    fun setInterceptionsPage(page: Int) = loadInterceptionsPage(page = page)
-
-    fun setInterceptionsPageSize(pageSize: Int) = loadInterceptionsPage(page = 1, pageSize = pageSize)
-
-    fun loadInterceptionsPage(
-        page: Int = _state.value.interceptionsPageNum,
-        pageSize: Int = _state.value.interceptionsPageSize,
-    ) {
+    fun loadInterceptionsPage() {
         if (!_state.value.networkAvailable) return
         val expected = sessions.snapshot().also { if (it.session == null) return }
-        val size = RecordsPagingPolicy.clampPageSize(pageSize)
-        val previous = _state.value
-        val wanted = page.coerceAtLeast(1)
-        val sameRequest = wanted == previous.interceptionsPageNum && size == previous.interceptionsPageSize
-        val token = interceptionsRequests.next(expected.epoch, interceptionsRequestKey(size, wanted))
+        val token = interceptionsRequests.next(expected.epoch, "")
         interceptionsJob?.cancel()
-        _state.update {
-            it.copy(
-                interceptionsPageNum = wanted,
-                interceptionsPageSize = size,
-                interceptionsPage = pageStateDuringLoad(it.interceptionsPage, sameRequest),
-            )
-        }
+        _state.update { it.copy(interceptionsPage = remoteResourceDuringRefresh(it.interceptionsPage)) }
         interceptionsJob = viewModelScope.launch {
             val result: RemoteResource<Page<JSONObject>> = runCatching {
-                withContext(Dispatchers.IO) { clientApi.interceptionsPage(wanted, size) }
+                withContext(Dispatchers.IO) { clientApi.interceptionsPage() }
             }.fold(
                 onSuccess = { RemoteResource.Loaded(it) },
                 onFailure = { RemoteResource.Failed(it.userMessage()) },
             )
-            val current = _state.value
-            val currentKey = interceptionsRequestKey(current.interceptionsPageSize, current.interceptionsPageNum)
-            if (!interceptionsRequests.accepts(token, sessions.snapshot().epoch, currentKey)) return@launch
+            if (!interceptionsRequests.accepts(token, sessions.snapshot().epoch, "")) return@launch
             _state.update { clientStateWithInterceptionsPage(it, result) }
-            (result as? RemoteResource.Loaded)?.value?.let(RecordsPagingPolicy::rewindPage)
-                ?.let { last -> loadInterceptionsPage(page = last) }
         }
     }
 
-    private fun interceptionsRequestKey(pageSize: Int, page: Int): String = "$pageSize|$page"
+    /** 拦截记录滚到接近末尾时调用，规则同 [loadMoreReports]。 */
+    fun loadMoreInterceptions() {
+        val current = _state.value
+        val loaded = (current.interceptionsPage as? RemoteResource.Loaded)?.value ?: return
+        val cursorId = loaded.items.lastOrNull()?.interceptionId() ?: return
+        if (!current.networkAvailable || current.interceptionsEndReached || current.interceptionsLoadingMore) return
+        val expected = sessions.snapshot().also { if (it.session == null) return }
+        val token = interceptionsMoreRequests.next(expected.epoch, "")
+        _state.update { it.copy(interceptionsLoadingMore = true) }
+        viewModelScope.launch {
+            val more = runCatching {
+                withContext(Dispatchers.IO) { clientApi.interceptionsPage(RecordsPagingPolicy.nextPage(loaded.items.size)) }
+            }.getOrNull()
+            if (!interceptionsMoreRequests.accepts(token, sessions.snapshot().epoch, "")) return@launch
+            _state.update { clientStateWithMoreInterceptions(it, cursorId, more) }
+        }
+    }
 
     // ---- S21 §E AI 对话 ---------------------------------------------------------------------
 
@@ -3170,7 +3293,7 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     /** Settings foreground ticks keep one request in flight instead of cancelling it every 5 s. */
     fun loadVoiceProviders() {
         val expected = sessions.snapshot().also { if (it.session == null) return }
-        if (_state.value.voiceProviderPending.isNotEmpty()) return
+        if (_state.value.voiceProviderPending.isNotEmpty() || _state.value.contactInstantAiPending) return
         if (voiceProviderJob?.isActive == true) return
         val generation = ++voiceProviderGeneration
         _state.update {
@@ -3206,7 +3329,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     /** 携带 GET 快照版本提交；冲突时保留用户选择并重读服务器值，不自动用新版本重发旧选择。 */
     fun selectVoiceProvider(providerId: String) {
         val id = providerId.trim()
-        if (id.isEmpty() || _state.value.voiceProviderPending.isNotEmpty() || _state.value.voiceProviderConflict) return
+        if (id.isEmpty() || _state.value.voiceProviderPending.isNotEmpty() || _state.value.voiceProviderConflict ||
+            _state.value.contactInstantAiPending
+        ) return
         val loaded = (_state.value.voiceProviders as? RemoteResource.Loaded)?.value ?: return
         val provider = loaded.items.firstOrNull { it.id == id } ?: return
         if (!voiceProviderShouldSubmit(provider, loaded.selected)) {
@@ -3246,6 +3371,40 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
                             voiceProviderConflict = error.isVoiceProviderVersionConflict(),
                             voiceProviderConflictVersion = error.voiceProviderConflictVersion()
                                 ?: if (error.isVoiceProviderVersionConflict()) loaded.configVersion + 1L else null,
+                        )
+                    },
+                )
+            }
+            if (result.isFailure) loadVoiceProviders()
+        }
+    }
+
+    /** S137：乐观翻转后 PUT；失败先回到翻转前的值，再重读服务器值。 */
+    fun setContactInstantAi(enabled: Boolean) {
+        val current = _state.value
+        if (current.contactInstantAiPending || current.voiceProviderPending.isNotEmpty() || current.voiceProviderConflict) return
+        val loaded = (current.voiceProviders as? RemoteResource.Loaded)?.value ?: return
+        if (loaded.contactInstantAi == null || loaded.contactInstantAi == enabled) return
+        val expected = sessions.snapshot().also { if (it.session == null) return }
+        val generation = ++voiceProviderGeneration
+        _state.update {
+            it.copy(
+                contactInstantAiPending = true,
+                voiceProviderMessage = "",
+                voiceProviders = RemoteResource.Loaded(loaded.copy(contactInstantAi = enabled)),
+            )
+        }
+        viewModelScope.launch {
+            val result = runCatching { withContext(Dispatchers.IO) { clientApi.setContactInstantAi(enabled) } }
+            if (!sessions.isCurrent(expected.epoch) || generation != voiceProviderGeneration) return@launch
+            _state.update { state ->
+                result.fold(
+                    onSuccess = { state.copy(contactInstantAiPending = false, voiceProviders = RemoteResource.Loaded(it)) },
+                    onFailure = { error ->
+                        state.copy(
+                            contactInstantAiPending = false,
+                            voiceProviderMessage = "设置失败：${error.userMessage()}",
+                            voiceProviders = RemoteResource.Loaded(loaded),
                         )
                     },
                 )

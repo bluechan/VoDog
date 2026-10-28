@@ -22,6 +22,8 @@ struct VoDogLiveCall: Decodable, Identifiable, Equatable {
     var peerSimLabel: String?
     /// S81: called SIM display (label, else number); only present when non-empty.
     var simLabel: String?
+    /// S96: home location of `remoteNumber` (server string, absent when unknown).
+    var remoteLocation: String?
 
     /// S72 ring title argument for "%@（内部）": the calling SIM's label, nil for an external call.
     var internalPeerLabel: String? {
@@ -53,9 +55,18 @@ struct VoDogSMSMessage: Decodable, Identifiable, Equatable {
     var contactName: String?
     /// S67c: incoming and not yet read on the server (missing → false).
     var unread: Bool?
+    /// S96: home location of `remoteNumber`.
+    var remoteLocation: String?
 
     /// iOS `statusDate`: the latest known moment of this message.
     var statusDateString: String? { deliveredAt ?? sentAt ?? receivedAt ?? createdAt }
+}
+
+/// S96 `GET /contacts/lookup?number=` → `{item, location?}` (only what the dialer hint needs).
+struct VoDogContactLookup: Decodable {
+    struct Item: Decodable { var displayName: String? }
+    var item: Item?
+    var location: String?
 }
 
 /// One thread on one SIM (iOS `MessageConversation`).
@@ -68,6 +79,8 @@ struct VoDogConversation: Identifiable, Equatable {
     var messages: [VoDogSMSMessage]   // ascending
 
     var latest: VoDogSMSMessage? { messages.last }
+    /// S96: the thread's location is the newest message's.
+    var location: String? { latest?.remoteLocation }
 
     /// S67c row dot: any message still unread that this session has not marked read yet.
     func hasUnread(excluding read: Set<String>) -> Bool {
@@ -90,6 +103,52 @@ struct VoDogConversation: Identifiable, Equatable {
     }
 }
 
+/// S89 `GET /sms?limit=500[&before=&beforeId=]` → `{items, nextCursor}`; an old server omits `nextCursor` (= nil).
+struct VoDogSMSPage: Decodable {
+    struct Cursor: Decodable, Equatable { let before: String; let beforeId: String }
+    var items: [VoDogSMSMessage]
+    var nextCursor: Cursor?
+}
+
+/// S89: the full SMS list, page by page. Any page error throws so the caller keeps its previous list
+/// (S32/S88 "missing from the poll = deleted" needs a complete list for the full replace).
+enum VoDogSMSPaging {
+    static let pageLimit = 500
+    static let maximumPages = 20
+
+    static func query(_ cursor: VoDogSMSPage.Cursor?) -> [String: String] {
+        var query = ["limit": String(pageLimit)]
+        if let cursor {
+            query["before"] = cursor.before
+            query["beforeId"] = cursor.beforeId
+        }
+        return query
+    }
+
+    /// Pages concatenated in order, deduped by id (first wins). `capped` = stopped at `maximumPages`.
+    // ponytail: every poll pulls everything (≤ 20 × 500); at 2000–3000 messages or ~500 KB per response,
+    // switch to a thread-summary endpoint + per-thread paging (or tombstone deltas).
+    static func fetchAll(_ fetchPage: ([String: String]) async throws -> VoDogSMSPage) async throws
+        -> (items: [VoDogSMSMessage], capped: Bool) {
+        var items: [VoDogSMSMessage] = []
+        var seen = Set<String>()
+        var cursor: VoDogSMSPage.Cursor?
+        for index in 0..<maximumPages {
+            let page: VoDogSMSPage
+            do {
+                page = try await fetchPage(query(cursor))
+            } catch let error as VoDogAPIError where index == 0 && error.status == 400 {
+                // Rollback safety: a pre-S89 Control rejects limit=500 → its old single 100-row list, no paging.
+                return (try await fetchPage(["limit": "100"]).items, false)
+            }
+            for item in page.items where seen.insert(item.id).inserted { items.append(item) }
+            guard let next = page.nextCursor else { return (items, false) }
+            cursor = next
+        }
+        return (items, true)
+    }
+}
+
 /// S66 SMS deletion (iOS `MessageSelectionPolicy` / `ThreadDeleteResultPolicy`): `POST /sms/delete` takes
 /// 1–500 ids; both delete endpoints answer `{deleted, skipped:[{id, reason}]}`.
 enum VoDogSMSDeletePolicy {
@@ -105,6 +164,17 @@ enum VoDogSMSDeletePolicy {
     }
 
     static func canDelete(_ ids: [String]) -> Bool { !ids.isEmpty && ids.count <= maximumBatch }
+
+    /// S88 bubble right-click menu, fixed order 复制 · 多选 · 删除: no copy for an empty body, no select/delete
+    /// without a server id.
+    enum BubbleMenuItem: Equatable { case copy, select, delete }
+
+    static func bubbleMenu(body: String?, id: String) -> [BubbleMenuItem] {
+        (body?.isEmpty == false ? [.copy] : []) + (id.isEmpty ? [] : [.select, .delete])
+    }
+
+    /// S88 single delete goes through the same `POST /sms/delete {ids}` as 删除所选.
+    static func singleDeleteIDs(_ id: String) -> [String] { id.isEmpty ? [] : [id] }
 
     static func skippedCount(_ response: [String: Any]) -> Int { (response["skipped"] as? [Any])?.count ?? 0 }
 

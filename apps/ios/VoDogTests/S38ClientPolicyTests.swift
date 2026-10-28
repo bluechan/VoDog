@@ -51,6 +51,12 @@ final class S38ClientPolicyTests: XCTestCase {
         """#)
         XCTAssertEqual(both.s38BadgeTitle, "忙线 AI 代接")
 
+        // S136：筛查拦截后交给 AI 的联系人来电。
+        let screened = try decodeCall(#"""
+        {"id":"c6s","originatingPlatform":"pixel","conflictDisposition":"screened_ai"}
+        """#)
+        XCTAssertEqual(screened.s38BadgeTitle, "拦截转 AI 接听")
+
         // 老字段齐、新字段缺：failureReason 单独出现时也算拒接。
         let reasonOnly = try decodeCall(#"{"id":"c7","state":"failed","failureReason":"busy_auto_rejected"}"#)
         XCTAssertEqual(reasonOnly.s38BadgeTitle, "忙线自动拒接")
@@ -104,7 +110,7 @@ final class S38ClientPolicyTests: XCTestCase {
         XCTAssertTrue(stillBlocked.showsBlockedMark)
     }
 
-    /// 全部通话的每一条请求——普通、分页、按线路筛——都要带 `includeBlocked=true`，
+    /// 全部通话的每一条请求——普通、下一批、按线路筛——都要带 `includeBlocked=true`，
     /// 否则服务端默认把 `number_blocked` 的行藏起来，列表里就什么都看不到。
     func testEveryCallsListRequestAsksForBlockedRows() {
         func includeBlocked(_ items: [URLQueryItem]) -> String? {
@@ -112,9 +118,10 @@ final class S38ClientPolicyTests: XCTestCase {
         }
         XCTAssertEqual(includeBlocked(RecordSearchPolicy.callsQuery(query: "")), "true")
         XCTAssertEqual(includeBlocked(RecordSearchPolicy.callsQuery(query: "张三")), "true")
-        XCTAssertEqual(includeBlocked(RecordSearchPolicy.callsQuery(query: "", page: 2, pageSize: 50)), "true")
+        let cursor = SMSPageCursor(before: "2026-09-12T01:00:00.000Z", beforeId: "c50")
+        XCTAssertEqual(includeBlocked(RecordSearchPolicy.callsQuery(query: "", cursor: cursor)), "true")
         XCTAssertEqual(
-            includeBlocked(RecordSearchPolicy.callsQuery(query: "", simId: "sim-1", page: 1, pageSize: 50)), "true"
+            includeBlocked(RecordSearchPolicy.callsQuery(query: "", simId: "sim-1", cursor: cursor)), "true"
         )
     }
 

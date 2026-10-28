@@ -579,7 +579,7 @@ final class ContractTests: XCTestCase {
             let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
             let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) })
             XCTAssertEqual(query["query"], "张三")
-            XCTAssertEqual(query["limit"], "100")
+            XCTAssertEqual(query["limit"], "50")
             return (200, #"{"items":[]}"#)
         }
         let response: ItemEnvelope<CallRecord> = try await APIClient(token: "access", session: mockSession()).request(
@@ -598,7 +598,9 @@ final class ContractTests: XCTestCase {
             XCTAssertEqual(query["from"], "2026-09-05")
             XCTAssertEqual(query["to"], "2026-09-11")
             XCTAssertEqual(query["timeZone"], "Asia/Shanghai")
-            XCTAssertEqual(query["limit"], "200")
+            XCTAssertEqual(query["page"], "1")
+            XCTAssertEqual(query["pageSize"], "50")
+            XCTAssertNil(query["limit"] ?? nil)
             XCTAssertEqual(query["query"], "保险")
             // S22 sends an explicit calendar window; `period` is only kept alive server-side for old clients.
             XCTAssertFalse(query.keys.contains("period"))
@@ -607,7 +609,7 @@ final class ContractTests: XCTestCase {
         let response: CallReportEnvelope = try await APIClient(token: "access", session: mockSession()).request(
             "reports/calls",
             queryItems: RecordSearchPolicy.reportQuery(
-                from: "2026-09-05", to: "2026-09-11", timeZone: "Asia/Shanghai", query: "保险"
+                from: "2026-09-05", to: "2026-09-11", timeZone: "Asia/Shanghai", query: "保险", page: 1
             )
         )
         // A window built from `from`/`to` has no period at all, which must not fail decoding.
@@ -617,19 +619,10 @@ final class ContractTests: XCTestCase {
 
     // MARK: - S26 决策：记录分页
 
-    func testPagedCallsResponseCarriesTotalsWhileALegacyEnvelopeDecodesAsUnpaged() async throws {
-        MockURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.path, "/api/v1/calls")
-            let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
-            let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
-            XCTAssertEqual(query["page"], "2")
-            XCTAssertEqual(query["pageSize"], "50")
-            XCTAssertNil(query["limit"], "分页请求不再发 limit")
-            return (200, #"{"items":[{"id":"c1","simId":"s1","direction":"incoming","remoteNumber":"2025550101","state":"completed","startedAt":"2026-09-12T01:00:00Z"}],"page":2,"pageSize":50,"total":187,"totalPages":4}"#)
-        }
-        let paged: PagedEnvelope<CallRecord> = try await APIClient(token: "access", session: mockSession()).request(
-            "calls", queryItems: RecordSearchPolicy.callsQuery(query: "", page: 2, pageSize: 50)
-        )
+    func testPagedCallsResponseCarriesTotalsWhileABareEnvelopeDecodesAsUnpaged() async throws {
+        // The paged form of `GET calls` is what Web and CellDock still ask for; the envelope keeps decoding it.
+        let pagedBody = #"{"items":[{"id":"c1","simId":"s1","direction":"incoming","remoteNumber":"2025550101","state":"completed","startedAt":"2026-09-12T01:00:00Z"}],"page":2,"pageSize":50,"total":187,"totalPages":4}"#
+        let paged = try JSONDecoder().decode(PagedEnvelope<CallRecord>.self, from: Data(pagedBody.utf8))
         XCTAssertEqual(paged.items.map(\.id), ["c1"])
         XCTAssertEqual(paged.page, 2)
         XCTAssertEqual(paged.pageSize, 50)
@@ -637,36 +630,58 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(paged.totalPages, 4)
         XCTAssertTrue(paged.supported)
 
-        // A Control that predates the contract answers the bare `{items}` it always did: one page, no pager.
-        MockURLProtocol.handler = { _ in
-            (200, #"{"items":[{"id":"c1","simId":"s1","direction":"incoming","remoteNumber":"2025550101","state":"completed","startedAt":"2026-09-12T01:00:00Z"}]}"#)
+        // S133: iOS 的全部通话走游标路径——请求里没有 page / pageSize，答复是不带计数的 `{items}`。
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/api/v1/calls")
+            let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+            let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+            XCTAssertEqual(query["limit"], "50")
+            XCTAssertEqual(query["includeBlocked"], "true")
+            XCTAssertEqual(query["before"], "2026-09-12T01:00:00.000Z")
+            XCTAssertEqual(query["beforeId"], "c0")
+            XCTAssertNil(query["page"], "page 与 before 同发会被服务端 400")
+            XCTAssertNil(query["pageSize"])
+            return (200, #"{"items":[{"id":"c1","simId":"s1","direction":"incoming","remoteNumber":"2025550101","state":"completed","startedAt":"2026-09-12T00:59:00.000Z"}]}"#)
         }
-        let legacy: PagedEnvelope<CallRecord> = try await APIClient(token: "access", session: mockSession()).request(
-            "calls", queryItems: RecordSearchPolicy.callsQuery(query: "", page: 2, pageSize: 50)
-        )
-        XCTAssertEqual(legacy.items.count, 1)
-        XCTAssertNil(legacy.totalPages)
-        XCTAssertFalse(legacy.supported)
-        XCTAssertFalse(
-            RecordsPagingPolicy.showsPager(
-                supported: legacy.supported, totalPages: legacy.totalPages,
-                total: legacy.total, pageSize: 50
+        let bare: PagedEnvelope<CallRecord> = try await APIClient(token: "access", session: mockSession()).request(
+            "calls",
+            queryItems: RecordSearchPolicy.callsQuery(
+                query: "", cursor: SMSPageCursor(before: "2026-09-12T01:00:00.000Z", beforeId: "c0")
             )
         )
+        XCTAssertEqual(bare.items.map(\.id), ["c1"])
+        XCTAssertEqual(bare.items.first?.startedAt, "2026-09-12T00:59:00.000Z", "startedAt 原样保留，才能原样当游标")
+        XCTAssertNil(bare.total)
+        XCTAssertNil(bare.totalPages)
+        XCTAssertFalse(bare.supported)
 
-        // The report route carries the same four fields next to its window.
-        MockURLProtocol.handler = { _ in
-            (200, #"{"window":{"timeZone":"Asia/Shanghai","fromInclusive":"2026-09-04T16:00:00Z","toExclusive":"2026-09-11T16:00:00Z"},"items":[],"page":1,"pageSize":200,"total":401,"totalPages":3}"#)
+        // The report route carries the same four fields next to its window; `total` is what ends the scroll.
+        MockURLProtocol.handler = { request in
+            let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+            let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+            XCTAssertEqual(query["page"], "2")
+            XCTAssertEqual(query["pageSize"], "50")
+            return (200, #"{"window":{"timeZone":"Asia/Shanghai","fromInclusive":"2026-09-04T16:00:00Z","toExclusive":"2026-09-11T16:00:00Z"},"items":[],"page":2,"pageSize":50,"total":101,"totalPages":3}"#)
         }
         let report: CallReportEnvelope = try await APIClient(token: "access", session: mockSession()).request(
             "reports/calls",
             queryItems: RecordSearchPolicy.reportQuery(
-                from: "2026-09-05", to: "2026-09-11", timeZone: "Asia/Shanghai", query: "", page: 1, pageSize: 200
+                from: "2026-09-05", to: "2026-09-11", timeZone: "Asia/Shanghai", query: "",
+                page: RecordsScrollPolicy.nextPage(loadedCount: 50)
             )
         )
         XCTAssertEqual(report.totalPages, 3)
-        XCTAssertEqual(report.total, 401)
+        XCTAssertEqual(report.total, 101)
         XCTAssertTrue(report.supported)
+        XCTAssertFalse(RecordsScrollPolicy.reachedEnd(loadedCount: 100, total: report.total, answered: 50))
+
+        // 旧 Control 的 `{window, items}`：没有计数，它答的那一页就是全部。
+        let legacyBody = #"{"window":{"timeZone":"Asia/Shanghai","fromInclusive":"2026-09-04T16:00:00Z","toExclusive":"2026-09-11T16:00:00Z"},"items":[]}"#
+        let legacy = try JSONDecoder().decode(CallReportEnvelope.self, from: Data(legacyBody.utf8))
+        XCTAssertFalse(legacy.supported)
+        XCTAssertTrue(RecordsScrollPolicy.reachedEnd(
+            loadedCount: 80, total: legacy.supported ? legacy.total : nil, answered: 80
+        ))
     }
 
     func testCallRecordDecodesS22AnswerModeFieldsAndFailsClosedWithoutThem() throws {

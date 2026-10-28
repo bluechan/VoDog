@@ -39,6 +39,7 @@ const PLATFORM_LABELS:Record<string,string>={ios:'iPhone 端',watchos:'手表端
 function platformLabel(p?:string|null){return p?PLATFORM_LABELS[p]:undefined;}
 /** S38：忙线冲突的两种结局；自动拒接的记录同时带 `conflictDisposition='rejected'`，所以先看 failureReason。 */
 export function busyConflictLabel(c:Pick<Call,'failureReason'|'conflictDisposition'>):string|null{
+ if(c.conflictDisposition==='screened_ai')return '拦截转 AI 接听';
  if(c.failureReason==='busy_auto_rejected')return '忙线未接';
  if(c.conflictDisposition==='ai_answered')return '忙线 AI 代接';
  return null;
@@ -63,7 +64,7 @@ export function interceptedCallLabel(c:Pick<Call,'failureReason'|'blockedSource'
 
 /** Only an AI-answered call can have an AI 对话; the old Control that predates both fields never ran the AI at all. */
 export function aiAnsweredCall(c:Pick<Call,'answeredByPlatform'|'conflictDisposition'>):boolean{
- return c.answeredByPlatform==='ai'||c.conflictDisposition==='ai_answered';
+ return c.answeredByPlatform==='ai'||c.conflictDisposition==='ai_answered'||c.conflictDisposition==='screened_ai';
 }
 
 export type CallKind='blocked'|'ai'|'missed'|'outgoing'|'incoming';

@@ -18,7 +18,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -130,25 +132,24 @@ internal fun HistoryPage(state: ClientUiState, model: ClientViewModel, onDetailV
                 state.reportTimeZone != reportZone ||
                 state.reportSimId != selectedId)
         ) {
-            model.loadReports(timeZone = reportZone, simId = selectedId, page = 1)
+            model.loadReports(timeZone = reportZone, simId = selectedId)
         }
     }
-    // S28: 全部通话不再读拨号页轮询的 `state.calls`，而是自己拿一页（SIM 过滤也交给服务端）。第一次
-    // 进来或换了 SIM 才请求，来回切底部 Tab 不会每次都重拉。
+    // S28: 全部通话不再读拨号页轮询的 `state.calls`，而是自己拿最新的一段（SIM 过滤也交给服务端）。
+    // 第一次进来或换了 SIM 才请求，来回切底部 Tab 不会每次都重拉。
     LaunchedEffect(state.session?.username, callsFilterId, state.networkAvailable) {
         if (state.networkAvailable && state.session != null &&
             (state.callsPage is RemoteResource.NotLoaded || state.callsSimId != callsFilterId)
         ) {
-            model.loadCallsPage(simId = callsFilterId, page = 1)
+            model.loadCallsPage(simId = callsFilterId)
         }
     }
     val detail = state.callDetail
-    val callsPage = (state.callsPage as? RemoteResource.Loaded)?.value
-    // 旧 Control 忽略 `simId` 并回没有信封的老结果，这时退回 S22 的客户端过滤，换 SIM 才不会没反应。
-    val calls = hideMergedInternalLegs(callsPage?.let { page ->
-        if (page.supported) page.items
-        else page.items.filter { callsFilterId.isBlank() || it.optString("simId") == callsFilterId }
-    }.orEmpty())
+    val calls = hideMergedInternalLegs((state.callsPage as? RemoteResource.Loaded)?.value.orEmpty())
+    // 放在下面「打开详情就提前 return」之前：滚到第 200 行点开一通再返回，还在第 200 行。
+    val callsListState = rememberLazyListState()
+    val reportsListState = rememberLazyListState()
+    val interceptionsListState = rememberLazyListState()
     var view by rememberSaveable { mutableStateOf(HistoryView.ALL_CALLS) }
     val refreshScope = when (view) {
         HistoryView.ALL_CALLS -> ClientRefreshScope.HISTORY_CALLS
@@ -220,20 +221,21 @@ internal fun HistoryPage(state: ClientUiState, model: ClientViewModel, onDetailV
             HistoryView.ALL_CALLS -> AllCallsList(
                 callsPage = state.callsPage,
                 refreshing = state.callsPageRefreshing,
+                loadingMore = state.callsLoadingMore,
                 query = state.callQuery,
                 calls = calls,
                 simJsonById = simJsonById,
                 onQueryChange = model::setCallQuery,
-                // 下拉刷新连 SIM 和短信一起重读（和 S22 一样），其中也包含当前这一页。
-                onRefresh = model::refreshAll,
-                onPage = model::setCallsPage,
-                onPageSize = model::setCallsPageSize,
+                // 下拉刷新连 SIM 和短信一起重读（和 S22 一样），列表本身回到最新的一段。
+                onRefresh = model::refreshCallsFromHead,
+                onLoadMore = model::loadMoreCalls,
                 onOpen = { callId -> calls.firstOrNull { it.optString("id") == callId }?.let(model::openHistoryRecord) },
                 onDelete = model::deleteCall,
                 seenCallIds = state.seenCallIds,
+                listState = callsListState,
             )
-            HistoryView.REPORTS -> ReportList(state, model, selectedId, reportZone, model::openAiTranscript)
-            HistoryView.INTERCEPTIONS -> InterceptionList(state, model)
+            HistoryView.REPORTS -> ReportList(state, model, selectedId, reportZone, reportsListState, model::openAiTranscript)
+            HistoryView.INTERCEPTIONS -> InterceptionList(state, model, interceptionsListState)
         }
     }
     if (detail?.viewer == HistoryViewerKind.TRANSCRIPT) {
@@ -272,35 +274,37 @@ private fun HistorySearchField(value: String, onValueChange: (String) -> Unit) {
 }
 
 /**
- * 全部通话. S28: 这一页是服务端切的 —— 搜索词、SIM 过滤和页码都在 `GET /calls` 的 WHERE 里，所以
- * 「第 3 页」显示的就是第 3 页，而不是把一页结果再筛一遍。列表下面钉着 [PagerBar]，行本身还是 S21 §F
- * 的样子：屏蔽图标 + `号码 · 姓名` + 行尾 "i"。
+ * 全部通话. 搜索词和 SIM 过滤都在 `GET /calls` 的 WHERE 里。没有分页条：和系统电话 App 一样先显示
+ * 最新 50 条，滚到接近末尾自动接下一段（[onLoadMore]），正在读时列表末尾有一个小转圈。行本身还是
+ * S21 §F 的样子：屏蔽图标 + `号码 · 姓名` + 行尾 "i"。
  *
  * 这个 composable 不认识 ViewModel（只收数据和回调），所以 [AllCallsListPreview] 不用登录就能渲染。
  */
 @Composable
 private fun AllCallsList(
-    callsPage: RemoteResource<Page<JSONObject>>,
+    callsPage: RemoteResource<List<JSONObject>>,
     refreshing: Boolean,
+    loadingMore: Boolean,
     query: String,
     calls: List<JSONObject>,
     simJsonById: Map<String, JSONObject>,
     onQueryChange: (String) -> Unit,
     onRefresh: () -> Unit,
-    onPage: (Int) -> Unit,
-    onPageSize: (Int) -> Unit,
+    onLoadMore: () -> Unit,
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
     seenCallIds: Set<String> = emptySet(),
+    listState: LazyListState = rememberLazyListState(),
 ) {
-    val loaded = (callsPage as? RemoteResource.Loaded)?.value
+    LoadMoreOnNearEnd(listState, calls.size, onLoadMore)
     Column(Modifier.fillMaxSize()) {
         HistorySearchField(query, onQueryChange)
-        // 转圈直接读 state：重读当前页时列表不会打回 Loading，请求失败也有一个明确的落点。屏幕上还
-        // 没有行的时候（首次加载 / 翻页 / 改搜索词）列表里已经有一个「正在读」，不再叠一个下拉转圈。
-        PullToRefresh(refreshing && loaded != null, onRefresh, Modifier.fillMaxWidth().weight(1f)) {
+        // 转圈直接读 state：重读最新一段时列表不会打回 Loading，请求失败也有一个明确的落点。屏幕上还
+        // 没有行的时候（首次加载 / 改搜索词）列表里已经有一个「正在读」，不再叠一个下拉转圈。
+        PullToRefresh(refreshing && callsPage is RemoteResource.Loaded, onRefresh, Modifier.fillMaxWidth().weight(1f)) {
             LazyColumn(
                 Modifier.fillMaxSize(),
+                state = listState,
                 contentPadding = PaddingValues(ScreenPadding),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
@@ -328,12 +332,11 @@ private fun AllCallsList(
                                 AllCallsRow(call, simJsonById[call.optString("simId")], allSims, callShowsUnseenDot(call, seenCallIds), onOpen, onDelete)
                             }
                         }
+                        // 一直在的一项，见 [LoadMoreOnNearEnd]。
+                        item(key = "loading-more") { if (loadingMore) LoadingRow("正在加载更多…") }
                     }
                 }
             }
-        }
-        if (loaded != null && RecordsPagingPolicy.pagerVisible(loaded)) {
-            PagerBar(loaded.page, loaded.pageSize, loaded.total, loaded.totalPages, onPage, onPageSize)
         }
     }
 }
@@ -448,7 +451,7 @@ internal fun CallRecordRow(
 ) {
     val signal = LocalSignal.current
     val missedLabel = missedCallLabel(call)
-    val ai = item.answeredByPlatform == "ai" || call.optString("conflictDisposition") == "ai_answered"
+    val ai = item.answeredByPlatform == "ai" || call.optString("conflictDisposition") in setOf("ai_answered", "screened_ai")
     val (rowName, rowNumber) = callRowLines(call)
     val large = isLargeFontScale(LocalDensity.current.fontScale)
     val clientSim = allSims.firstOrNull { it.id == call.optString("simId") }
@@ -520,6 +523,7 @@ private fun ReportList(
     model: ClientViewModel,
     selectedId: String,
     reportZone: String,
+    listState: LazyListState,
     onOpenAiTranscript: (String) -> Unit,
 ) {
     var pickingRange by remember { mutableStateOf(false) }
@@ -531,6 +535,8 @@ private fun ReportList(
     // `loadReports` publishes Loading synchronously, so clearing on any change would hide the
     // indicator on the very frame the pull started it.
     LaunchedEffect(state.reports) { if (state.reports !is RemoteResource.Loading) refreshing = false }
+    // 行数取 ViewModel 里的原始行（下一段的页码按它算），不是下面可能按 SIM 筛过的那一份。
+    LoadMoreOnNearEnd(listState, (state.reports as? RemoteResource.Loaded)?.value?.items?.size ?: 0, model::loadMoreReports)
     Column(Modifier.fillMaxSize()) {
         SingleChoiceSegmentedButtonRow(
             Modifier.fillMaxWidth().padding(horizontal = ScreenPadding).heightIn(min = TouchTarget),
@@ -576,11 +582,12 @@ private fun ReportList(
         }
         PullToRefresh(
             refreshing,
-            { refreshing = true; model.loadReports(timeZone = reportZone) },
+            { refreshing = true; model.refreshReportsFromHead(reportZone) },
             Modifier.fillMaxWidth().weight(1f),
         ) {
             LazyColumn(
                 Modifier.fillMaxSize(),
+                state = listState,
                 contentPadding = PaddingValues(ScreenPadding),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
@@ -593,7 +600,7 @@ private fun ReportList(
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             MessageCard("报告读取失败：${reports.message}")
                             OutlinedButton(
-                                onClick = { model.loadReports(timeZone = reportZone) },
+                                onClick = { model.refreshReportsFromHead(reportZone) },
                                 enabled = state.networkAvailable,
                                 modifier = Modifier.heightIn(min = TouchTarget),
                             ) { Text("重试") }
@@ -614,22 +621,12 @@ private fun ReportList(
                         items(reportItems, key = { reportHistoryRowKey(it.callId) }) { report ->
                             ReportCard(report, state, model, onOpenAiTranscript)
                         }
+                        // 一直在的一项，见 [LoadMoreOnNearEnd]。
+                        item(key = "loading-more") { if (state.reportsLoadingMore) LoadingRow("正在加载更多…") }
                     }
                 }
             }
         }
-        (state.reports as? RemoteResource.Loaded)?.value?.paging
-            ?.takeIf(RecordsPagingPolicy::pagerVisible)
-            ?.let { paging ->
-                PagerBar(
-                    page = paging.page,
-                    pageSize = paging.pageSize,
-                    total = paging.total,
-                    totalPages = paging.totalPages,
-                    onPage = model::setReportsPage,
-                    onPageSize = model::setReportsPageSize,
-                )
-            }
     }
     if (pickingRange) ReportRangeDialog(
         current = range,
@@ -1474,10 +1471,10 @@ private fun RecordingTrackControl(
 }
 
 /**
- * 不用登录也能渲染的「全部通话」：60 行假数据，停在第 2 页（共 2 页、160 条），底部是 [PagerBar]。
+ * 不用登录也能渲染的「全部通话」：60 行假数据，正在读下一段（滚到末尾能看到那个小转圈）。
  * [AllCallsList] 只收数据和回调，没有 ViewModel，所以 Android Studio 的预览能直接画出来。
  */
-@Preview(name = "全部通话 第 2 页", showBackground = true, heightDp = 900)
+@Preview(name = "全部通话 滚动加载", showBackground = true, heightDp = 900)
 @Composable
 private fun AllCallsListPreview() {
     val sim = JSONObject()
@@ -1499,15 +1496,15 @@ private fun AllCallsListPreview() {
     }
     VoDogTheme {
         AllCallsList(
-            callsPage = RemoteResource.Loaded(Page(calls, page = 2, pageSize = 100, total = 160, totalPages = 2)),
+            callsPage = RemoteResource.Loaded(calls),
             refreshing = false,
+            loadingMore = true,
             query = "",
             calls = calls,
             simJsonById = mapOf("sim-1" to sim),
             onQueryChange = {},
             onRefresh = {},
-            onPage = {},
-            onPageSize = {},
+            onLoadMore = {},
             onOpen = {},
             onDelete = {},
         )

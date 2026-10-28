@@ -10,6 +10,17 @@ import java.time.Instant
 import java.util.UUID
 import kotlin.concurrent.thread
 
+/** S136: the body of POST /gateway/calls/incoming for a ringing call. `screened` is only ever emitted as true. */
+internal fun incomingReportPayload(record: DeviceCallRecord, generation: Long, simId: String, screened: Boolean): JSONObject =
+    JSONObject()
+        .put("eventId", record.incomingEventId)
+        .put("generation", generation)
+        .put("deviceCallId", record.deviceCallId)
+        .put("simId", simId)
+        .put("observedAt", record.observedAt)
+        .also { body -> record.remoteNumber?.let { body.put("remoteNumber", it) } }
+        .also { body -> if (screened) body.put("screened", true) }
+
 data class GatewayTelecomSyncResult(
     val simsSynced: Int,
     val incomingReported: Int,
@@ -83,18 +94,20 @@ class GatewayTelecomSync(
                 }
                 return@forEach
             }
-            val payload = record.incomingPayload?.let(::JSONObject) ?: JSONObject()
-                .put("eventId", record.incomingEventId)
-                .put("generation", runtime.deviceEpoch)
-                .put("deviceCallId", record.deviceCallId)
-                .put("simId", binding.simId)
-                .put("observedAt", record.observedAt)
-                .also { body -> record.remoteNumber?.let { body.put("remoteNumber", it) } }
-                .let { journal.persistIncomingPayload(record.deviceCallId, it)?.incomingPayload?.let(::JSONObject) ?: it }
+            // S136: a screening app silenced (not rejected) this call. A dead Binder or a lost registry
+            // entry after a restart reads as false, i.e. a normal ring.
+            val screened = runCatching {
+                GatewayTelecomCallRegistry.call(record.deviceCallId)?.details?.extras
+                    ?.getBoolean(android.telecom.Call.EXTRA_SILENT_RINGING_REQUESTED, false) == true
+            }.getOrDefault(false)
+            val payload = record.incomingPayload?.let(::JSONObject)
+                ?: incomingReportPayload(record, runtime.deviceEpoch, binding.simId, screened)
+                    .let { journal.persistIncomingPayload(record.deviceCallId, it)?.incomingPayload?.let(::JSONObject) ?: it }
             val response = api.reportIncoming(payload)
             check(response.accepted) { "incoming observation not accepted" }
             journal.markIncomingReported(record.deviceCallId, response.callId)
             logTelephonyBound(record.deviceCallId, response.callId)
+            if (screened) GatewayDiag.log("telephony.screened", mapOf("deviceCallId" to record.deviceCallId), callId = response.callId)
             if (shouldSilenceNativeRinger(response.disposition, record.state)) silenceNativeRinger(context, record.deviceCallId, response.callId)
             // S123 决策 9: Control will hand this call to a client or AI; open the media signaling TLS now.
             if (response.disposition != "local_only") {

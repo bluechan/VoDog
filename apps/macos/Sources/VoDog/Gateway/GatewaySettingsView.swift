@@ -1,14 +1,14 @@
 import SwiftUI
 
-/// "VoDog 网关" card in Settings › 蜂窝与通信 (S53, S54 一机多模组): the per-Mac master
-/// switch plus one row per attached module.
+/// 「这台 Mac」 card in 设置 › 网关设备 (S53, S54 一机多模组; S139): the per-Mac master
+/// switch plus one row per attached module. Works signed out (pairing code).
 struct GatewaySettingsSection: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var gateway: GatewayAgent
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(L10n.tr("VoDog 网关"))
+            Text(L10n.tr("这台 Mac"))
                 .font(.headline)
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
@@ -26,12 +26,14 @@ struct GatewaySettingsSection: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 16)
-                    Toggle(L10n.tr("启用网关"), isOn: Binding(
+                    // The glass style draws its label itself, so the title above stays the only visible one.
+                    Toggle(isOn: Binding(
                         get: { gateway.isEnabled },
                         set: { gateway.setEnabled($0) }
-                    ))
-                    .labelsHidden()
+                    )) { EmptyView() }
                     .toggleStyle(.adaptiveGlass)
+                    .fixedSize()
+                    .accessibilityLabel(L10n.tr("启用网关"))
                 }
 
                 LabeledContent(L10n.tr("服务器地址")) {
@@ -65,7 +67,10 @@ private struct GatewayModuleRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(verbatim: title).font(.subheadline.weight(.semibold))
-                    Text(stateText).font(.caption.weight(.semibold)).foregroundStyle(stateColor)
+                    HStack(spacing: 5) {
+                        LineStatusShape(status: runtime.isOnline ? .online : .offline)
+                        Text(stateText).font(.caption.weight(.semibold)).foregroundStyle(stateColor)
+                    }
                     Spacer(minLength: 8)
                     if runtime.credentials != nil {
                         Toggle(L10n.tr("暂停"), isOn: Binding(
@@ -84,7 +89,7 @@ private struct GatewayModuleRow: View {
                 if let error = runtime.lastError {
                     line(L10n.tr("最近错误"), error, color: .orange)
                 }
-                if runtime.credentials == nil { unpairedControls }
+                if runtime.needsPairing { unpairedControls }
                 if let provision = runtime.provision, runtime.isProvisioning || provision.isFailed {
                     line(L10n.tr("加入账号"), provisionText(provision), color: provision.isFailed ? .orange : .secondary)
                 }
@@ -133,7 +138,7 @@ private struct GatewayModuleRow: View {
     }
 
     private var stateColor: Color {
-        if runtime.isOnline { return .green }
+        if runtime.isOnline { return Signal.call }
         return runtime.lastError != nil && runtime.credentials != nil ? .orange : .secondary
     }
 

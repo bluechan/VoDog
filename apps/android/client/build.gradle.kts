@@ -54,8 +54,8 @@ android {
         applicationId = "org.vodog"
         minSdk = 29
         targetSdk = 36
-        versionCode = 72
-        versionName = "0.72.0-s95b-signal-ui"
+        versionCode = 88
+        versionName = "0.88.0-s143-blocked-state"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "API_BASE_URL", endpointLiteral(productionApiBaseUrl))
         // S72b/S98：可选国内中转，仅中国蜂窝（MCC 460）或学到的失败时使用；为空则禁用。
